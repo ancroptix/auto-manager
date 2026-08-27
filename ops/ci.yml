@@ -1,0 +1,85 @@
+# GitHub Actions workflow. To enable it, copy this file to
+# .github/workflows/ci.yml in your repo (Arena's agent token is not allowed to
+# write into .github/workflows, which is why it lives here instead):
+#
+#     mkdir -p .github/workflows && git mv ops/ci.yml .github/workflows/ci.yml
+#     git commit -m "Enable CI" && git push
+#
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # Dev set includes the runtime requirements plus pgserver, which
+          # bundles a real PostgreSQL so the Supabase migrations are executed
+          # and their functions tested, not merely parsed.
+          pip install -r requirements-dev.txt
+
+      - name: Verify the SQL parses under PostgreSQL's grammar
+        run: |
+          python - <<'PY'
+          import pathlib, pglast, sys
+          files = sorted(pathlib.Path("supabase/migrations").glob("*.sql"))
+          assert files, "no migrations found"
+          for path in files:
+              try:
+                  pglast.parse_sql(path.read_text())
+              except Exception as exc:
+                  print(f"::error file={path}::{path.name}: {exc}", file=sys.stderr)
+                  raise SystemExit(1)
+              print(f"parsed {path.name}")
+          PY
+
+      - name: Scan for committed credentials
+        run: python scripts/check_secrets.py
+
+      - name: Run the test suite
+        env:
+          # No .env and no real secrets in CI: shadow mode with no database must
+          # boot and serve /health, and the Postgres tests start their own
+          # disposable cluster.
+          APP_MODE: shadow
+        run: python -m pytest -q
+
+      - name: Confirm the service boots with no database at all
+        run: |
+          python - <<'PY'
+          import threading, time, urllib.request, uvicorn
+          from app.main import create_app
+
+          config = uvicorn.Config(create_app(), host="127.0.0.1", port=8123, log_level="error")
+          server = uvicorn.Server(config)
+          threading.Thread(target=server.run, daemon=True).start()
+          for _ in range(60):
+              time.sleep(0.25)
+              try:
+                  with urllib.request.urlopen("http://127.0.0.1:8123/health", timeout=2) as r:
+                      body = r.read().decode()
+              except Exception:
+                  continue
+              assert r.status == 200, body
+              assert '"status": "ok"' in body or '"status":"ok"' in body, body
+              print("booted and served /health with no database:", body)
+              break
+          else:
+              raise SystemExit("service never became healthy")
+          server.should_exit = True
+          PY

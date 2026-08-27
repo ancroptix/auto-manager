@@ -1,0 +1,48 @@
+# Render Blueprint for Auto Manager.
+# Docs: https://render.com/docs/blueprint-spec
+#
+# Why these specific choices:
+#   * plan: free        — the operator's stated budget. Free web services spin
+#                         down after ~15 min without inbound traffic, restart in
+#                         ~1 min, have an ephemeral filesystem, and share a
+#                         750 instance-hour/month workspace allowance. The app
+#                         is therefore checkpoint-driven and restart-safe.
+#   * healthCheckPath   — Render holds a deploy until /health passes; the app
+#                         implements it, and UptimeRobot pings the same route to
+#                         reduce idle spin-downs.
+#   * no `databases:`   — persistence is Supabase, not Render Postgres, because
+#                         Render's free Postgres expires after 30 days.
+#   * --workers 1       — one process, so exactly one queue loop runs. The DB
+#                         lease protects correctness if this ever changes.
+#   * sync: false       — secrets are entered in the dashboard, never committed.
+services:
+  - type: web
+    name: auto-manager
+    runtime: python
+    plan: free
+    region: oregon
+    autoDeployTrigger: commit
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port ${PORT} --workers 1 --proxy-headers
+    healthCheckPath: /health
+    envVars:
+      - key: APP_MODE
+        value: shadow
+      - key: LOG_LEVEL
+        value: info
+      - key: DATABASE_URL
+        sync: false
+      - key: DB_SSL
+        value: require
+      - key: CONTROL_TOKEN
+        sync: false
+      - key: TELEGRAM_API_ID
+        sync: false
+      - key: TELEGRAM_API_HASH
+        sync: false
+      - key: TELEGRAM_SESSION_STRING
+        sync: false
+      - key: TELEGRAM_OWNER_USER_IDS
+        sync: false
+      - key: TELEGRAM_MAIN_ADMIN_USER_ID
+        sync: false

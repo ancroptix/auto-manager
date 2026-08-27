@@ -187,6 +187,12 @@ Choose the button below to get the complete season.
 
 Button: `📥 Get Complete Season {season} - {storage_link}`
 
+These blocks show one state of a post, not a template that is appended to. When
+a quality arrives later the whole message is re-rendered from the manifest and
+the existing post is **edited in place** (see §13) — no second "Episode 1"
+message, and no line silently added out of order. The button list is therefore
+generated from the manifest every time, in `quality_rank` order.
+
 ## 13. Missing-quality updates
 
 - Maintain an ordered manifest per episode:
@@ -285,4 +291,16 @@ Button: `📥 Get Complete Season {season} - {storage_link}`
 
 ## 19. Repository status
 
-Requirements and architecture planning only; implementation has not started. See `README.md` for the component list.
+Requirements are agreed. The **runtime skeleton is now built and tested**:
+Supabase schema and queue functions, the checkpoint/resume worker loop, the
+health/status/kill-switch HTTP surface, config with fail-closed live-mode
+validation, and Render deployment as code. 150 tests pass, including the
+migrations executed against a real PostgreSQL cluster.
+
+What is **not** built: all Telegram I/O — source scanning, thumbnail screening,
+archive copies, the storage-bot and Channel Help adapters, sticker mapping, and
+campaign sending. Each unimplemented job kind fails loudly into a `blocked`
+state that `/status` reports, so no feature can pretend to have run.
+
+See [`architecture.md`](architecture.md) for where each promise above is
+enforced and which test proves it.
