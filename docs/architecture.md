@@ -22,6 +22,7 @@ scripts/
   check_secrets.py     refuses to let a credential be committed
   devdb.py             disposable local Postgres that applies the migrations
 tests/                 150 tests, including the migrations executed on real Postgres
+ops/ci.yml             the CI job; copy into .github/workflows/ to activate it
 docs/                  requirements-draft.md (the spec), setup guides, this file
 render.yaml            the whole deployment, as code
 ```
