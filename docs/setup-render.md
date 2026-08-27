@@ -114,3 +114,29 @@ render logs --service auto-manager --tail
 
 Lines worth grepping for: `reclaimed`, `blocked:`, `flood wait`, `database
 unavailable`.
+
+## Discovering the bot protocols (one switch)
+
+The storage bot's menu flow and Channel Help's publishing handshake cannot be
+read from documentation, and they cannot be probed from a laptop behind a network
+that filters MTProto. So the service probes itself, once, from inside Render:
+
+1. Set `PROBE_ON_BOOT` to `1` in Environment and **Save** (it redeploys).
+2. Watch **Logs** for `running read-only protocol discovery once`.
+3. The spare account's owner (`TELEGRAM_MAIN_ADMIN_USER_ID`) receives one message
+   from yourself containing: each bot's opening text, every button with whether
+   it is a callback or a URL, what the safe buttons lead to, and the bots'
+   command lists.
+4. Paste that message to whoever is building the handlers, then set
+   `PROBE_ON_BOOT` back to `0`.
+
+The same run is available on demand with `POST /control/probe` (bearer token), and
+it is safe by construction: only `/start`-class text to the two bots and the
+owner, no uploads, no forwards, no channel posts, no permission changes, and a
+hard message budget. A guard in `app/probe.py` rejects anything else — including
+anything a future edit of this file might try — and a test asserts that exactly
+two functions in the module can send at all.
+
+If `APP_MODE` is still `shadow`, the probe refuses to run and says so: discovery
+is a real action on a real account and should be a deliberate one.
+

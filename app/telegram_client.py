@@ -20,7 +20,7 @@ from .config import Settings
 
 log = logging.getLogger("auto_manager.telegram")
 
-__all__ = ["TelegramUserClient", "TelegramNotConfigured"]
+__all__ = ["TelegramUserClient", "TelegramNotConfigured", "probe_once"]
 
 # Flood-wait courtesy ceiling: exceeding this pauses the whole service rather
 # than pushing on. Telegram restricts unwanted messaging; the account, not the
@@ -75,6 +75,28 @@ class TelegramUserClient:
         log.info("telegram user client online as %s (id=%s)", getattr(me, "username", "?"), getattr(me, "id", "?"))
         return self._client
 
+    @property
+    def client(self) -> Any:
+        """The live Telethon client, or None.
+
+        Exposed for :mod:`app.probe`, which brings its own guard: giving the probe
+        a raw client is safer than wrapping every method, because the guard is one
+        function to audit instead of a facade to remember.
+        """
+        return self._client if self._connected else None
+
+    async def probe(self, *, db: Any = None, send: bool = True) -> dict[str, Any]:
+        """Discover the storage bot and Channel Help protocols. Read-only."""
+        from .probe import ProbePolicy, run_probe
+
+        client = self.client
+        if client is None:
+            raise TelegramNotConfigured("cannot probe: the user client is not connected")
+        policy = ProbePolicy(
+            owner_user_id=self.settings.telegram_main_admin_user_id,
+        )
+        return await run_probe(client, policy=policy, db=db, send=send)
+
     async def stop(self) -> None:
         if self._client is not None:
             with_suppress = getattr(self._client, "disconnect", None)
@@ -123,3 +145,19 @@ class TelegramUserClient:
             log.error("flood wait exceeds %ss; leaving service paused", MAX_FLOOD_WAIT_SECONDS)
         await asyncio.sleep(min(seconds, MAX_FLOOD_WAIT_SECONDS))
         return True
+
+
+async def probe_once(settings: Settings, db: Any = None, *, send: bool = True) -> dict[str, Any]:
+    """Connect, discover, disconnect — the entrypoint for ``PROBE_ON_BOOT`` and
+    ``POST /control/probe``.
+
+    It builds its own client on purpose. Reusing the worker's connection would
+    mean a probe failure could take the queue loop down with it, and the probe is
+    by design the riskiest thing this service does with a user session.
+    """
+    client = TelegramUserClient(settings=settings)
+    await client.start()
+    try:
+        return await client.probe(db=db, send=send)
+    finally:
+        await client.stop()

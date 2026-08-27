@@ -95,6 +95,16 @@ def create_app(settings: Settings | None = None, *, start_worker: bool | None = 
             )
         if run_worker and app.state.worker:
             app.state.worker.start()
+        if settings.probe_on_boot:
+            # Deliberately not awaited: a probe talks to two third-party bots and
+            # waits for their replies, and health checks must not queue behind it.
+            if settings.outbound_enabled:
+                from .telegram_client import probe_once
+
+                log.warning("PROBE_ON_BOOT is set: running read-only protocol discovery once")
+                app.state.probe_task = asyncio.create_task(probe_once(settings, db))
+            else:
+                log.warning("PROBE_ON_BOOT is set but outbound Telegram is unavailable; nothing to probe")
         try:
             yield
         finally:

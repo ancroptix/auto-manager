@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hmac
 import logging
+import asyncio
 import time
 from typing import Any
 
@@ -157,6 +158,46 @@ async def resume(request: Request) -> dict[str, Any]:
     row = await request.app.state.db.set_paused(False, None)
     log.warning("service RESUMED")
     return {"paused": False, "state": row}
+
+
+@router.post("/control/probe", dependencies=[Depends(control_dependency())])
+async def probe(request: Request) -> dict[str, Any]:
+    """Run read-only protocol discovery against the storage bot and Channel Help.
+
+    Started in the background and never awaited: the probe deliberately waits on
+    two bots' replies, which can take a minute, and a request that times out would
+    read as a failure while the probe was still running. The report is delivered to
+    the owner as a DM, so nothing sensitive has to travel through an HTTP response.
+    """
+    settings = request.app.state.settings
+    if not settings.outbound_enabled:
+        raise HTTPException(
+            status_code=503,
+            detail="probe needs a live Telegram session (APP_MODE=live + TELEGRAM_* set)",
+        )
+    from .telegram_client import probe_once
+
+    task = asyncio.create_task(probe_once(settings, request.app.state.db))
+    request.app.state.probe_task = task
+    task.add_done_callback(lambda t: _log_probe_result(t))
+    return {
+        "started": True,
+        "delivery": "the report arrives as a DM to the configured owner id",
+        "guard": "read-only: only /start-style menu commands, never media or channel posts",
+    }
+
+
+def _log_probe_result(task: "asyncio.Task[None]") -> None:
+    """A probe that dies with an exception must still be visible in the logs."""
+    try:
+        result = task.result()
+    except asyncio.CancelledError:
+        return
+    except Exception as exc:  # noqa: BLE001
+        log.error("probe task failed: %s: %s", type(exc).__name__, exc)
+        return
+    log.info("probe finished: sent=%s elapsed=%ss delivery=%s",
+             result.get("messages_sent"), result.get("elapsed_seconds"), result.get("delivery"))
 
 
 @router.post("/control/reconcile", dependencies=[Depends(control_dependency())])

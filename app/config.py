@@ -128,6 +128,11 @@ class Settings(BaseSettings):
     # deployment needs no manual SQL step. Only runs when app.job does not
     # exist, and the SQL itself is idempotent.
     migrate_on_boot: bool = True
+    # Run the read-only protocol probe (app/probe.py) once after boot and DM the
+    # report to the owner. Exists because protocol discovery cannot happen from a
+    # development machine whose network filters Telegram, only from the deployed
+    # service. Off by default: it talks to two bots on the operator's account.
+    probe_on_boot: bool = False
     campaign_rate_per_hour: int = Field(default=20, ge=1, le=500)
 
     # ------------------------------------------------------------------ validators

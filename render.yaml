@@ -46,3 +46,9 @@ services:
         sync: false
       - key: TELEGRAM_MAIN_ADMIN_USER_ID
         sync: false
+      # One-shot protocol discovery (app/probe.py): set to "true" in the
+      # dashboard, let it boot once, read the DM it sends the owner, then set it
+      # back to "false". sync: false keeps the operator's value across redeploys.
+      - key: PROBE_ON_BOOT
+        value: "false"
+        sync: false
