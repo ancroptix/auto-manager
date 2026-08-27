@@ -9,8 +9,10 @@ through it. That is why the free tier is enough.
 1. Go to <https://supabase.com/dashboard> → **New project**.
 2. Name: `auto-manager`. Database password: generate one and **save it now** —
    it is not shown again.
-3. Region: pick the one closest to your users (for India, `ap-south-1` Mumbai is
-   usually the best choice).
+3. Region: pick the one closest to your users. This project lives in
+   `ap-northeast-1` (Tokyo) — worth knowing, because the pooler hostname carries
+   that region (`aws-0-ap-northeast-1.pooler.supabase.com`) and because it sets
+   the round-trip latency your Render instance will pay on every checkpoint.
 4. Wait for provisioning (1–2 minutes).
 
 ## 2. Apply the schema
@@ -48,8 +50,12 @@ templates and rules the operator can change later without a code deploy.
 2. Under **Connection pooling**, copy the **session** or **transaction** string:
 
    ```text
-   postgresql://postgres.<project-ref>:<your-db-password>@aws-0-ap-south-1.pooler.supabase.com:6543/postgres
+   postgresql://postgres.<project-ref>:<your-db-password>@aws-0-<region>.pooler.supabase.com:5432/postgres
    ```
+
+   Use **Session** pooling (port 5432) here: this service is one long-lived
+   worker, so it does not need transaction multiplexing, and session mode
+   behaves like a normal connection.
 
 3. Use port **6543** (the pooler). The direct 5432 connection is not reachable
    from Render's free instances in many regions.
