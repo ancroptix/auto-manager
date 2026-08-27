@@ -244,6 +244,19 @@ class Database:
 
         return await self._run("fetchrow", _fn)
 
+    async def execute(self, sql: str, *args: Any) -> str | None:
+        """Statement with no result rows (update / insert / delete).
+
+        Kept beside fetch/fetchrow so a handler never has to pick between them by
+        accident: asyncpg raises if a *multi-statement* string is sent with
+        arguments, which is easy to do when a DML helper is reused for migrations.
+        """
+
+        async def _fn(conn: Any) -> str | None:
+            return await conn.execute(sql, *args)
+
+        return await self._run("execute", _fn)
+
     async def fetchval(self, sql: str, *args: Any) -> Any:
         async def _fn(conn: Any) -> Any:
             return await conn.fetchval(sql, *args)

@@ -21,8 +21,10 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
+from . import thumbnails
 from .db import Database
-from .stages import JobKind
+from .keys import archive_key
+from .stages import JobKind, JobStage
 
 log = logging.getLogger("auto_manager.handlers")
 
@@ -49,8 +51,10 @@ class Context:
 # --- feature modules that land next -----------------------------------------
 
 DEPENDENCIES: dict[str, str] = {
-    JobKind.INGEST_MEDIA.value: "source-channel scanner + metadata parser (filename/caption patterns)",
-    JobKind.THUMBNAIL_SCREEN.value: "thumbnail fetch + handle detection against @ycanime / @india_crunchyroll allowlist",
+    JobKind.INGEST_MEDIA.value: (
+        "Telethon event wiring only — parsing and eligibility are implemented in app.normalize; "
+        "this job needs a logged-in session to read source messages"
+    ),
     JobKind.ARCHIVE_MEDIA.value: "server-side copy into the private master archive channel",
     JobKind.STORAGE_UPLOAD.value: "@anime_hindifilesbot menu protocol (needs one authenticated test run)",
     JobKind.LINK_VERIFY.value: "link liveness probe",
@@ -87,9 +91,145 @@ async def reconciliation(job: dict[str, Any], ctx: Context) -> dict[str, Any]:
     return {"reclaimed_locks": reclaimed, "queue": {k: int(v or 0) for k, v in health.items()}}
 
 
+async def thumbnail_screen(job: dict[str, Any], ctx: Context) -> dict[str, Any]:
+    """Judge one source candidate's thumbnail and act on the verdict.
+
+    This is the first handler that does real work end-to-end, and it is written
+    to be honest about its own evidence: until the Telegram media layer can open
+    the image, a candidate with nothing wrong in its text is *parked* for review
+    rather than passed. A hard publish gate that quietly degrades into "we found
+    no evidence of a problem" is not a gate.
+
+    What it does:
+
+    1. read the candidate row,
+    2. screen it with the operator's policy from ``app.config``,
+    3. persist ``thumbnail_status`` + ``disposition`` + the reason,
+    4. queue an owner review when the verdict needs one,
+    5. on a publishable verdict, queue the archive step for each variant that
+       came from this candidate — the only place the ladder may move forward.
+    """
+    payload = job.get("payload") or {}
+    candidate_id = job.get("candidate_id") or payload.get("candidate_id")
+    if candidate_id is None:
+        raise ValueError("thumbnail_screen job carries no candidate_id")
+
+    row = await ctx.db.fetchrow("select * from app.source_candidate where id = $1", candidate_id)
+    if row is None:
+        return {"candidate_id": candidate_id, "skipped": "candidate row no longer exists"}
+
+    primary = tuple(
+        await ctx.db.config("branding.primary_handles", list(thumbnails.PRIMARY_HANDLES))
+        or list(thumbnails.PRIMARY_HANDLES)
+    )
+    strict = bool(await ctx.db.config("thumbnail.strict_mode", True))
+    handles = tuple(row.get("detected_handles") or ()) or tuple(
+        thumbnails.handles_from(row.get("file_name") or "", row.get("raw_caption") or "")
+    )
+    media_type = str(row.get("media_type") or "").casefold()
+    verdict = thumbnails.screen(
+        image_present=media_type in {"photo", "video", "document", "animation", "gif", "round_video"},
+        handles=handles,
+        primary=primary,
+        strict=strict,
+        evidence="caption_only",
+    )
+
+    await ctx.db.execute(
+        """
+        update app.source_candidate
+           set thumbnail_status = $2::app.thumbnail_status,
+               disposition      = $3::app.candidate_disposition,
+               detected_handles = $4::text[],
+               reason           = $5
+         where id = $1
+        """,
+        candidate_id,
+        verdict.status,
+        verdict.disposition,
+        list(verdict.foreign_handles + verdict.primary_handles),
+        verdict.reason[:400],
+    )
+
+    if verdict.needs_review:
+        await ctx.db.execute(
+            """
+            insert into app.thumbnail_review (candidate_id, detected_handles, status)
+            values ($1, $2::text[], 'pending')
+            on conflict (candidate_id) do update
+               set detected_handles = excluded.detected_handles,
+                   status          = 'pending',
+                   decided_at      = null
+            """,
+            candidate_id,
+            list(verdict.foreign_handles or handles),
+        )
+    else:
+        # A previously parked candidate that now passes must not stay in the queue.
+        await ctx.db.execute(
+            "delete from app.thumbnail_review where candidate_id = $1 and status = 'pending'",
+            candidate_id,
+        )
+
+    variants = await ctx.db.fetch(
+        """
+        select id, episode_id, quality, status
+          from app.media_variant
+         where source_candidate_id = $1
+        """,
+        candidate_id,
+    )
+    queued: list[int] = []
+    if verdict.publishable:
+        for variant in variants:
+            await ctx.db.execute(
+                "update app.media_variant set thumbnail_status = $2::app.thumbnail_status, updated_at = now() where id = $1",
+                variant["id"],
+                verdict.status,
+            )
+            job_row = await ctx.db.enqueue(
+                JobKind.ARCHIVE_MEDIA.value,
+                archive_key(int(variant["id"])),
+                stage=JobStage.THUMBNAIL_CHECKED,
+                payload={"candidate_id": candidate_id, "thumbnail_status": verdict.status},
+                variant_id=int(variant["id"]),
+                episode_id=variant.get("episode_id"),
+            )
+            if job_row:
+                queued.append(int(variant["id"]))
+    else:
+        for variant in variants:
+            await ctx.db.execute(
+                "update app.media_variant set thumbnail_status = $2::app.thumbnail_status, status = 'review', updated_at = now() where id = $1",
+                variant["id"],
+                verdict.status,
+            )
+        policy = await ctx.db.config("thumbnail.on_no_clean_candidate", "ask_owner")
+        return {
+            "candidate_id": candidate_id,
+            "status": verdict.status,
+            "disposition": verdict.disposition,
+            "reason": verdict.reason,
+            "foreign_handles": list(verdict.foreign_handles),
+            "variants_parked": len(variants),
+            "no_clean_action": thumbnails.no_clean_action(str(policy)),
+        }
+
+    return {
+        "candidate_id": candidate_id,
+        "status": verdict.status,
+        "disposition": verdict.disposition,
+        "reason": verdict.reason,
+        "archive_jobs_queued": queued,
+    }
+
+
 def build_registry() -> dict[str, Handler]:
     """Job kind -> handler. The keys are the whole supported vocabulary."""
-    registry: dict[str, Handler] = {JobKind.RECONCILIATION.value: reconciliation}
+    registry: dict[str, Handler] = {
+        JobKind.RECONCILIATION.value: reconciliation,
+        JobKind.THUMBNAIL_SCREEN.value: thumbnail_screen,
+    }
     for kind in JobKind:
         if kind.value not in registry:
             registry[kind.value] = _stub(kind.value)

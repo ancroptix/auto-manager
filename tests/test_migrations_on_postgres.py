@@ -827,3 +827,123 @@ def test_first_boot_installs_the_schema_into_an_empty_database(conn):
     finally:
         with conn.cursor() as cur:
             cur.execute(f"drop database if exists {dbname} with (force)")
+
+
+def test_thumbnail_screen_handler_rejects_parks_and_advances(conn, seed, episode):
+    """Run the first real handler against the installed schema.
+
+    SQL-level tests cannot catch this layer: it is the handler that decides what
+    gets written, which review rows appear, and whether the ladder is allowed to
+    move. Three cases in one job, because the interesting part is how they
+    differ:
+
+    * a foreign handle in the text -> rejected, review queued, **no** archive job
+    * clean text but strict mode and no image analysis -> parked for review
+    * same candidate with strict mode off -> passed, archive job queued
+    """
+    import asyncio
+
+    from app.config import Settings
+    from app.db import Database
+    from app.handlers import Context, thumbnail_screen
+
+    with conn.cursor() as cur:
+        cur.execute("select id from app.source_channel where series_id = %s", (seed["series_id"],))
+        channel_id = cur.fetchone()[0]
+
+        cur.execute(
+            """insert into app.source_candidate
+                   (source_channel_id, message_id, media_idx, media_type, file_name, raw_caption)
+               values (%s, 700101, 0, 'document', 'Bleach S01E99 720p Hindi.mkv',
+                       'reposted by @some_leech_group')
+               returning id""",
+            (channel_id,),
+        )
+        foreign_candidate = cur.fetchone()[0]
+        cur.execute(
+            """insert into app.media_variant (episode_id, quality, quality_rank, source_candidate_id)
+               values (%s, '720p', 3, %s) returning id""",
+            (episode, foreign_candidate),
+        )
+        foreign_variant = cur.fetchone()[0]
+
+        cur.execute(
+            """insert into app.source_candidate
+                   (source_channel_id, message_id, media_idx, media_type, file_name, raw_caption)
+               values (%s, 700102, 0, 'document', 'Bleach S01E99 1080p Hindi.mkv', '@ycanime')
+               returning id""",
+            (channel_id,),
+        )
+        clean_candidate = cur.fetchone()[0]
+        cur.execute(
+            """insert into app.media_variant (episode_id, quality, quality_rank, source_candidate_id)
+               values (%s, '1080p', 4, %s) returning id""",
+            (episode, clean_candidate),
+        )
+        clean_variant = cur.fetchone()[0]
+
+    settings = Settings(_env_file=None, database_url=pg_uri, db_ssl="disable", worker_enabled=False)
+    db = Database(settings)
+
+    async def scenario() -> dict:
+        assert await db.connect(), await db.last_error
+        ctx = Context(db=db, settings=settings)
+
+        rejected = await thumbnail_screen({"candidate_id": foreign_candidate, "payload": {}}, ctx)
+        parked = await thumbnail_screen({"candidate_id": clean_candidate, "payload": {}}, ctx)
+        assert rejected["status"] == "watermarked" and rejected["disposition"] == "rejected"
+        assert parked["status"] == "review_required" and parked["variants_parked"] == 1
+        assert "no_clean_action" in parked and "owner review" in parked["no_clean_action"]
+
+        row = await db.fetchrow(
+            "select thumbnail_status, disposition, reason from app.source_candidate where id = $1",
+            foreign_candidate,
+        )
+        assert row["thumbnail_status"] == "watermarked" and row["disposition"] == "rejected"
+        assert "leech" in row["reason"]
+
+        review = await db.fetchrow(
+            "select status, detected_handles from app.thumbnail_review where candidate_id = $1",
+            foreign_candidate,
+        )
+        assert review["status"] == "pending" and "some_leech_group" in review["detected_handles"]
+
+        variant = await db.fetchrow(
+            "select thumbnail_status, status from app.media_variant where id = $1", foreign_variant
+        )
+        assert variant["thumbnail_status"] == "watermarked" and variant["status"] == "review"
+
+        # The rejected candidate must not have started the next stage.
+        assert await db.fetchval("select count(*) from app.job where kind = 'archive_media'") == 0
+
+        # Same handler, policy relaxed: caption-only evidence now counts, and the
+        # ladder may move for the clean candidate only.
+        await db.execute("update app.config set value = 'false' where key = 'thumbnail.strict_mode'")
+        passed = await thumbnail_screen({"candidate_id": clean_candidate, "payload": {}}, ctx)
+        assert passed["status"] == "clean" and passed["disposition"] == "accepted"
+        assert passed["archive_jobs_queued"] == [clean_variant]
+
+        job = await db.fetchrow(
+            "select stage, episode_id, payload->>'candidate_id' as cand from app.job where dedup_key = $1",
+            f"archive:{clean_variant}",
+        )
+        assert job["stage"] == "thumbnail_checked" and int(job["cand"]) == clean_candidate
+        assert int(job["episode_id"]) == int(episode)
+
+        # Re-screening the clean candidate again must not queue a second archive
+        # job (dedup collapses it) — that is the whole point of the unique key.
+        again = await thumbnail_screen({"candidate_id": clean_candidate, "payload": {}}, ctx)
+        assert again["archive_jobs_queued"] == []
+        assert await db.fetchval("select count(*) from app.job where kind = 'archive_media'") == 1
+
+        await db.close()
+        return {"rejected": rejected["reason"], "parked": parked["status"]}
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        conn.execute("update app.config set value = 'true' where key = 'thumbnail.strict_mode'")
+        for variant_id in (foreign_variant, clean_variant):
+            conn.execute("delete from app.media_variant where id = %s", (variant_id,))
+        for candidate_id in (foreign_candidate, clean_candidate):
+            conn.execute("delete from app.source_candidate where id = %s", (candidate_id,))
