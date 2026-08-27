@@ -61,6 +61,10 @@ def create_app(settings: Settings | None = None, *, start_worker: bool | None = 
             settings.mode.value,
             settings.outbound_enabled,
         )
+        for note in settings.boot_audit():
+            # Names what is missing and to which effect, without ever printing a
+            # value: this is the line an operator pastes when "nothing happens".
+            log.warning("startup check: %s", note) if "NOT set" in note else log.info("startup check: %s", note)
         db: Database = app.state.db
         connected = await db.connect()
         if connected:

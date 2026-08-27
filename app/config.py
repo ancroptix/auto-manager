@@ -16,6 +16,7 @@ from __future__ import annotations
 import re
 from enum import Enum
 from typing import Any
+from urllib.parse import urlparse
 
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -220,6 +221,52 @@ class Settings(BaseSettings):
         return self
 
     # ------------------------------------------------------------------ helpers
+    def boot_audit(self) -> list[str]:
+        """Human-readable startup report, used to diagnose a misconfigured deploy.
+
+        Never echoes a secret *value*. Each line names what is missing and what
+        that means, because the first real Render deploy reported "live 🎉" while
+        persisting nothing — the connection string had never been saved, and the
+        only clue was a one-word warning. This is the text an operator pastes.
+        """
+        lines: list[str] = []
+
+        if self.database_url is not None:
+            host = urlparse(self.database_url.get_secret_value()).hostname or "unparseable"
+            lines.append(f"DATABASE_URL set (host {host}, ssl={self.db_ssl})")
+        else:
+            lines.append(
+                "DATABASE_URL is NOT set: no persistence, no queue, nothing gets "
+                "processed. Render -> your service -> Environment -> add DATABASE_URL "
+                "with the Supabase session-pooler connection string -> Saved Changes"
+            )
+
+        lines.append(
+            "CONTROL_TOKEN set"
+            if self.control_token is not None
+            else "CONTROL_TOKEN is NOT set: the /control kill switch and manual reconcile stay disabled"
+        )
+        lines.append(
+            f"APP_MODE={self.mode.value}"
+            + ("" if self.mode is AppMode.LIVE else " (no Telegram sending)")
+        )
+
+        missing = [
+            name
+            for name, value in (
+                ("TELEGRAM_API_ID", self.telegram_api_id),
+                ("TELEGRAM_API_HASH", self.telegram_api_hash),
+                ("TELEGRAM_SESSION_STRING", self.telegram_session_string),
+            )
+            if value is None
+        ]
+        lines.append(
+            "Telegram client configured"
+            if not missing
+            else "Telegram client not configured yet: " + ", ".join(missing)
+        )
+        return lines
+
     @property
     def uses_transaction_pooler(self) -> bool:
         """True for Supabase's port-6543 pooler, which needs prepared

@@ -107,3 +107,52 @@ def test_settings_repr_does_not_leak(monkeypatch) -> None:
     settings = Settings(_env_file=None)
     assert "leak-me-please" not in repr(settings)
     assert "0123456789abcdef" not in repr(settings)
+
+
+class TestBootAudit:
+    """A misconfigured deploy has to say so in one line instead of idling.
+
+    The first real Render deploy came up "live 🎉" while persisting nothing,
+    because the connection string was never saved; these lines are what the
+    operator then pastes into chat, so they must name the cause and the fix.
+    """
+
+    def test_missing_database_url_is_named_as_the_cause(self) -> None:
+        notes = Settings(app_name="auto-manager", database_url=None, control_token=None).boot_audit()
+        problem = next(n for n in notes if n.startswith("DATABASE_URL"))
+        assert "NOT set" in problem
+        assert "no persistence" in problem and "Environment" in problem
+
+    def test_configured_deploy_reports_no_problems(self) -> None:
+        settings = Settings(
+            app_name="auto-manager",
+            database_url="postgresql://postgres:<pw>@host:5432/postgres",
+            control_token="three random words",
+        )
+        notes = settings.boot_audit()
+        assert not any("NOT set" in n for n in notes)
+        assert any("host host" in n for n in notes)
+
+    def test_audit_never_echoes_a_secret_value(self) -> None:
+        settings = Settings(
+            app_name="auto-manager",
+            database_url="postgresql://postgres:<the-password>@db.example:5432/postgres",
+            control_token="<the-kill-switch-phrase>",
+            telegram_api_hash="<the-api-hash>",
+            telegram_session_string="<the-session>",
+        )
+        joined = " | ".join(settings.boot_audit())
+        for secret in ("the-password", "the-kill-switch-phrase", "the-api-hash", "the-session"):
+            assert secret not in joined
+        assert "db.example" in joined  # host is useful and safe to show
+
+    def test_shadow_mode_is_reported_as_not_sending(self) -> None:
+        notes = Settings(app_name="auto-manager", mode="shadow").boot_audit()
+        assert any("no Telegram sending" in n for n in notes)
+
+    def test_missing_telegram_fields_are_listed(self) -> None:
+        # Shadow mode: the audit still lists what is absent, because the operator
+        # needs to know before flipping the mode and wondering why nothing sent.
+        notes = Settings(app_name="auto-manager").boot_audit()
+        listed = next(n for n in notes if n.startswith("Telegram client"))
+        assert "TELEGRAM_API_ID" in listed and "TELEGRAM_SESSION_STRING" in listed
