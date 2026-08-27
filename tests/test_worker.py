@@ -99,7 +99,9 @@ async def test_reconciliation_runs_on_boot(make_settings) -> None:
     worker = make_worker(make_settings(), db)
     await run_briefly(worker)
     assert db.enqueued and db.enqueued[0][0] == JobKind.RECONCILIATION.value
-    assert db.enqueued[0][1].startswith("reconciliation:boot:")
+    from app.keys import reconciliation_key
+
+    assert db.enqueued[0][1] == reconciliation_key()
 
 
 @pytest.mark.asyncio

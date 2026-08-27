@@ -294,7 +294,7 @@ generated from the manifest every time, in `quality_rank` order.
 Requirements are agreed. The **runtime skeleton is now built and tested**:
 Supabase schema and queue functions, the checkpoint/resume worker loop, the
 health/status/kill-switch HTTP surface, config with fail-closed live-mode
-validation, and Render deployment as code. 150 tests pass, including the
+validation, and Render deployment as code. 166 tests pass, including the
 migrations executed against a real PostgreSQL cluster.
 
 What is **not** built: all Telegram I/O — source scanning, thumbnail screening,

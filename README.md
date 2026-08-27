@@ -3,7 +3,7 @@
 A modular Telegram media-management system for content the operator owns or is
 authorized to distribute.
 
-**Status:** runtime skeleton is built and tested (150 tests). The Telegram
+**Status:** runtime skeleton is built and tested (166 tests). The Telegram
 feature modules are not implemented yet — they fail loudly into a `blocked`
 queue state rather than pretending to run.
 
@@ -69,7 +69,7 @@ To prove a migration change before touching Supabase, apply the two files in
 ## Tests
 
 ```bash
-python -m pytest              # 150 tests; Postgres integration included
+python -m pytest              # 166 tests; Postgres integration included
 python -m pytest -m "" --ignore=tests/test_migrations_on_postgres.py   # fast set only
 ```
 

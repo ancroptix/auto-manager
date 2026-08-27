@@ -24,6 +24,7 @@ from typing import Any
 
 from .config import Settings
 from .db import Database, DatabaseUnavailable
+from .keys import reconciliation_key
 from .handlers import FeatureNotImplemented, Context, Handler
 from .stages import JobKind
 
@@ -156,10 +157,11 @@ class Worker:
         if self._boot_reconciled or not self.settings.reconcile_on_boot:
             return
         self._boot_reconciled = True
-        day = time.strftime("%Y%m%d")
+        # Key comes from app.keys so a boot from any path (this hook or the HTTP
+        # startup) collapses to one job per hour instead of one per restart.
         await self.db.enqueue(
             JobKind.RECONCILIATION.value,
-            f"reconciliation:boot:{day}",
+            reconciliation_key(),
             payload={"trigger": "boot"},
             priority=10,
         )

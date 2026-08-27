@@ -26,7 +26,7 @@ from fastapi.responses import JSONResponse
 from .api import PauseBody, control_dependency, router
 from .config import Settings, load_settings
 from .db import Database
-from .stages import LADDER, JobKind, stage_labels
+from .stages import LADDER, stage_labels
 from .worker import Worker
 
 log = logging.getLogger("auto_manager")
@@ -68,14 +68,9 @@ def create_app(settings: Settings | None = None, *, start_worker: bool | None = 
                 reclaimed = await db.release_expired_locks()
                 if reclaimed:
                     log.warning("reclaimed %s stale job lease(s) from a previous instance", reclaimed)
-            if settings.reconcile_on_boot and run_worker and app.state.worker:
-                with contextlib.suppress(Exception):
-                    await db.enqueue(
-                        JobKind.RECONCILIATION.value,
-                        f"reconciliation:boot:{os.getpid()}",
-                        payload={"trigger": "startup"},
-                        priority=5,
-                    )
+            # No boot job is enqueued here: the worker's own boot hook does it
+            # with the shared key. Enqueuing from both places once created two
+            # reconciliation jobs per start, because the keys differed.
         else:
             log.warning(
                 "running without a database connection; /ready reports 503 until "

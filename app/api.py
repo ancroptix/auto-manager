@@ -162,11 +162,14 @@ async def resume(request: Request) -> dict[str, Any]:
 @router.post("/control/reconcile", dependencies=[Depends(control_dependency())])
 async def reconcile(request: Request) -> dict[str, Any]:
     reclaimed = await request.app.state.db.release_expired_locks()
+    from .keys import reconciliation_key
     from .stages import JobKind
 
+    # A manual /control/reconcile must actually run, so it is not collapsed into
+    # the hourly boot key.
     job = await request.app.state.db.enqueue(
         JobKind.RECONCILIATION.value,
-        f"reconciliation:manual:{int(time.time())}",
+        f"{reconciliation_key()}:manual:{int(time.time())}",
         payload={"trigger": "manual"},
         priority=5,
     )
