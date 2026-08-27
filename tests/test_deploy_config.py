@@ -183,3 +183,31 @@ def test_transaction_pooler_gets_statement_cache_disabled(make_settings) -> None
     direct = Database(make_settings(database_url="postgresql://u:p@h:5432/db")).pool_kwargs()
     assert pooled["statement_cache_size"] == 0
     assert "statement_cache_size" not in direct
+
+
+def test_apply_all_installer_is_in_sync_with_migrations() -> None:
+    """ops/apply-all.sql is what an operator pastes by hand, so a stale copy
+    would silently install the previous version of the schema."""
+    import subprocess
+    import sys
+
+    result = subprocess.run(
+        [sys.executable, "ops/build_apply_all.py", "--check"],
+        cwd=ROOT, capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_migration_bundle_ships_both_files_in_order() -> None:
+    """ops/apply-all.sql is what first boot executes, so it must contain both
+    migrations, functions after tables, and it must parse."""
+    import pglast
+
+    from app.db import MIGRATION_BUNDLE, REPO_ROOT
+
+    text = MIGRATION_BUNDLE.read_text()
+    assert "0001_init.sql" in text and "0002_functions.sql" in text
+    assert text.index("create schema if not exists app") < text.index("create or replace function app.claim_next_job")
+    pglast.parse_sql(text)
+    # The migrations stay in the repo too, for `supabase db push`.
+    assert len(list((REPO_ROOT / "supabase" / "migrations").glob("*.sql"))) == 2

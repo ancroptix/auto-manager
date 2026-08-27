@@ -510,14 +510,40 @@ create or replace view app.v_campaign_progress as
 -- ---------------------------------------------------------------------------
 -- Grants: service_role may operate the queue; API roles get nothing.
 -- ---------------------------------------------------------------------------
--- Note: PostgreSQL has no "ALL VIEWS" grant target; ALL TABLES already covers
--- views, so the view grants below are intentionally folded into it.
-grant usage on schema app to service_role;
-grant select, insert, update, delete on all tables in schema app to service_role;
-grant usage, select on all sequences in schema app to service_role;
-revoke all on all tables in schema app from anon, authenticated;
-grant execute on all functions in schema app to service_role;
-revoke execute on all functions in schema app from public, anon, authenticated;
+-- Supabase's API roles (anon, authenticated, service_role) do not exist on a
+-- generic PostgreSQL server, and a GRANT naming an absent role aborts the whole
+-- installer. So each grant is applied only where the role is present: on
+-- Supabase everything below runs; on Render's own Postgres or a bare cluster
+-- the schema still installs, and the connecting role works through ownership.
+-- (PostgreSQL has no "ALL VIEWS" grant target; ALL TABLES already covers views.)
+do $grants$
+declare
+  rname text;
+  roles text[];
+begin
+  select coalesce(array_agg(rolname), '{}'::text[]) into roles
+    from pg_roles
+   where rolname in ('anon','authenticated','service_role');
+
+  foreach rname in array roles loop
+    if rname = 'service_role' then
+      execute 'grant usage on schema app to service_role';
+      execute 'grant select, insert, update, delete on all tables in schema app to service_role';
+      execute 'grant usage, select on all sequences in schema app to service_role';
+      execute 'grant execute on all functions in schema app to service_role';
+    else
+      execute format('revoke all on all tables in schema app from %I', rname);
+      execute format('revoke all on all sequences in schema app from %I', rname);
+      execute format('revoke execute on all functions in schema app from %I', rname);
+      execute format('revoke usage on schema app from %I', rname);
+    end if;
+  end loop;
+
+  -- Belt and braces for the public role, which always exists.
+  execute 'revoke all on all tables in schema app from public';
+  execute 'revoke execute on all functions in schema app from public';
+end
+$grants$;
 
 -- ---------------------------------------------------------------------------
 -- Default configuration. Editable in the dashboard; no migration needed.

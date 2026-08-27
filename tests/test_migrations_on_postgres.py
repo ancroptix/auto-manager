@@ -773,3 +773,57 @@ def test_database_layer_reports_schema_state(conn):
     assert info["schema"] == "ok", info
     assert "queue" in info
     assert "password" not in str(info)
+
+
+def test_first_boot_installs_the_schema_into_an_empty_database(conn):
+    """The exact path a Render deploy takes when DATABASE_URL points at a brand
+    new Supabase project — on a database that has nothing in it."""
+    import asyncio
+
+    from app.config import Settings
+    from app.db import Database
+
+    dbname = "fresh_boot_check"
+    with conn.cursor() as cur:
+        # FORCE: the app's own pool may still be attached from a previous run,
+        # and Postgres refuses to drop a database with an open session.
+        cur.execute(f"drop database if exists {dbname} with (force)")
+        cur.execute(f"create database {dbname}")
+    # Swap only the database in the path: pg_uri carries the socket directory
+    # in its query string, so naive string surgery would drop it.
+    from urllib.parse import urlsplit, urlunsplit
+
+    fresh_uri = urlunsplit(urlsplit(pg_uri)._replace(path="/" + dbname))
+
+    settings = Settings(_env_file=None, database_url=fresh_uri, db_ssl="disable", worker_enabled=False)
+    db = Database(settings)
+
+    async def scenario():
+        assert await db.connect()
+        assert await db.schema_missing() is True, "empty database should look uninstalled"
+        assert (await db.schema_ready())[0] is False
+        assert await db.migrate() == "applied"
+        assert await db.schema_missing() is False
+        ready, detail = await db.schema_ready()
+        assert ready, detail
+        counts = await db.fetchrow(
+            """
+            select (select count(*) from information_schema.tables where table_schema='app') as rel,
+                   (select count(*) from pg_proc p join pg_namespace n on n.oid=p.pronamespace
+                     where n.nspname='app') as fn,
+                   (select count(*) from app.config) as cfg
+            """
+        )
+        assert (counts["rel"], counts["fn"], counts["cfg"]) == (26, 14, 28)
+        # A second boot must be a no-op, never a re-run that fights live data.
+        assert await db.schema_missing() is False
+        # And the installer is itself replayable.
+        assert await db.migrate() == "applied"
+        await db.close()
+        return counts
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        with conn.cursor() as cur:
+            cur.execute(f"drop database if exists {dbname} with (force)")

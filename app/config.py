@@ -123,6 +123,10 @@ class Settings(BaseSettings):
     job_timeout_seconds: float = Field(default=900.0, ge=1, le=7200)
     graceful_shutdown_seconds: float = Field(default=25.0, ge=0.1, le=120)
     reconcile_on_boot: bool = True
+    # Applies supabase/migrations on first boot when the schema is absent, so a
+    # deployment needs no manual SQL step. Only runs when app.job does not
+    # exist, and the SQL itself is idempotent.
+    migrate_on_boot: bool = True
     campaign_rate_per_hour: int = Field(default=20, ge=1, le=500)
 
     # ------------------------------------------------------------------ validators

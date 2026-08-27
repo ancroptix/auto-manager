@@ -64,6 +64,19 @@ def create_app(settings: Settings | None = None, *, start_worker: bool | None = 
         db: Database = app.state.db
         connected = await db.connect()
         if connected:
+            if settings.migrate_on_boot:
+                try:
+                    if await db.schema_missing():
+                        log.warning("schema not found; applying migrations on first boot")
+                        outcome = await db.migrate()
+                        log.info("first-boot migration: %s", outcome)
+                    else:
+                        log.info("schema already present; skipping migrations")
+                except Exception as exc:  # noqa: BLE001 - boot must still serve /health
+                    log.error(
+                        "first-boot migration failed (%s); /ready will report the "
+                        "schema problem until it is resolved", exc,
+                    )
             with contextlib.suppress(Exception):
                 reclaimed = await db.release_expired_locks()
                 if reclaimed:

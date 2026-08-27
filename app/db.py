@@ -22,6 +22,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from .config import Settings
@@ -32,6 +33,9 @@ log = logging.getLogger("auto_manager.db")
 __all__ = ["Database", "DatabaseUnavailable", "DatabaseState"]
 
 _MAX_ERROR_LEN = 400
+REPO_ROOT = Path(__file__).resolve().parents[1]
+#: One-file installer generated from supabase/migrations/*.sql
+MIGRATION_BUNDLE = REPO_ROOT / "ops" / "apply-all.sql"
 
 
 class DatabaseUnavailable(RuntimeError):
@@ -256,20 +260,60 @@ class Database:
         except Exception as exc:  # noqa: BLE001
             return False, str(exc)[:_MAX_ERROR_LEN]
 
+    def migration_sql(self) -> str | None:
+        bundle = Path(MIGRATION_BUNDLE)
+        if bundle.exists():
+            return bundle.read_text(encoding="utf-8")
+        # A source checkout always ships it; a slimmed image might not.
+        files = sorted((REPO_ROOT / "supabase" / "migrations").glob("*.sql"))
+        if not files:
+            return None
+        return "\n\n".join(f.read_text(encoding="utf-8") for f in files)
+
+    async def schema_missing(self) -> bool:
+        """True only when the tables have never been created.
+
+        Deciding this in SQL (rather than, say, "did a migration file run") is
+        what makes auto-migration safe: an existing project is never touched.
+        """
+        row = await self.fetchrow("select to_regclass('app.job') as t")
+        return not (row and row.get("t"))
+
+    async def migrate(self) -> str:
+        """Apply the migration bundle. Called on first boot only."""
+        sql = self.migration_sql()
+        if sql is None:
+            return "no_migration_files"
+        async def _apply(conn: Any) -> str:
+            async with conn.transaction():
+                await conn.execute(sql)
+            return "applied"
+
+        return await self._run("migrate", _apply)
+
     async def schema_ready(self) -> tuple[bool, str]:
+        """Report installation state without ever erroring on absent tables.
+
+        Presence is probed with to_regclass/to_regproc rather than querying the
+        tables: a fresh database is a *normal* first-boot state (and the state
+        /ready must describe), not a 500.
+        """
         row = await self.fetchrow(
             """
             select
-              to_regclass('app.job')            is not null as has_job,
-              to_regproc('app.claim_next_job')  is not null as has_queue_functions,
-              (select count(*) from app.config) as config_rows
+              to_regclass('app.job')              is not null as has_job,
+              to_regclass('app.config')           is not null as has_config,
+              to_regproc('app.claim_next_job')    is not null as has_queue_functions
             """
         )
         if not row or not row.get("has_job"):
             return False, "migrations_not_applied"
         if not row.get("has_queue_functions"):
             return False, "functions_missing"
-        return True, f"config_rows={row.get('config_rows')}"
+        if not row.get("has_config"):
+            return False, "config_table_missing"
+        count = await self.fetchval("select count(*) from app.config")
+        return True, f"config_rows={count}"
 
     # ------------------------------------------------------------ queue API
     async def heartbeat(self, worker_id: str) -> bool:
