@@ -593,7 +593,10 @@ def _classify_file_kind(combined: str, file_name: str | None, episodes: tuple[in
         return "batch"
     if re.search(r"\bcomplete\b.{0,20}\bseason\b|\bseason\b.{0,20}\bcomplete\b", flat):
         return "batch"
-    if _ARCHIVE_EXT.search((file_name or "").casefold()) and not episodes:
+    if _ARCHIVE_EXT.search((file_name or "").casefold()) and (not episodes or len(episodes) > 1):
+        # An archive is never one playable episode: with no number it is a whole
+        # season, with a range it is several files. A single-episode .rar stays an
+        # episode, because people do pack one file and that must still ingest.
         return "batch"
     if any(marker in flat for marker in _MOVIE_TOKENS):
         return "movie"

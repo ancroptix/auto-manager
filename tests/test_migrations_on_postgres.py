@@ -947,3 +947,242 @@ def test_thumbnail_screen_handler_rejects_parks_and_advances(conn, seed, episode
             conn.execute("delete from app.media_variant where id = %s", (variant_id,))
         for candidate_id in (foreign_candidate, clean_candidate):
             conn.execute("delete from app.source_candidate where id = %s", (candidate_id,))
+
+
+def _ingest_channel(conn, username: str, telegram_id: int, title: str, *, link_series: bool = True) -> tuple[int, int]:
+    """A source channel with its own series row, so tests do not share state."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "insert into app.series (title, normalized_title) values (%s, %s) "
+            "on conflict (normalized_title) do update set title = excluded.title returning id",
+            (title, f"ingest {username}"),
+        )
+        series_id = cur.fetchone()[0]
+        cur.execute(
+            "insert into app.source_channel (series_id, telegram_channel_id, username, title, priority, mode) "
+            "values (%s, %s, %s, %s, 100, 'full') "
+            "on conflict (telegram_channel_id) do update set title = excluded.title returning id",
+            (series_id if link_series else None, telegram_id, username, title),
+        )
+        return cur.fetchone()[0], series_id
+
+
+def test_ingest_writes_the_rows_the_ladder_reads(conn):
+    """The ingest layer, against the installed schema.
+
+    Each assertion is a promise the architecture document makes, checked where it
+    can actually break: re-scanning must not double-queue, a second quality must
+    widen the same episode row rather than creating a parallel episode, a repeated
+    file must be recognised by fingerprint instead of filename, subbed-only must
+    create nothing, and a batch archive must not fabricate one variant per
+    episode.
+    """
+    import asyncio
+
+    from app.config import Settings
+    from app.db import Database
+    from app.handlers import Context, ingest_media
+    from app.ingest import record_message
+
+    channel_id, _series_id = _ingest_channel(conn, "@yc_ingest", -100700001, "Bleach Ingest")
+    settings = Settings(_env_file=None, database_url=pg_uri, db_ssl="disable", worker_enabled=False)
+    db = Database(settings)
+
+    async def scenario() -> dict:
+        assert await db.connect(), await db.last_error
+
+        first = await record_message(
+            db,
+            source_channel_id=channel_id,
+            message_id=9001,
+            media_type="document",
+            file_name="Bleach Ingest S01E01 720p Hindi.mkv",
+            raw_caption="t.me/ycanime",
+            file_size_bytes=100,
+            fingerprint="fp-720",
+        )
+        assert first["disposition"] == "accepted", first
+        assert len(first["variants"]) == 1 and first["queued"] == "thumbnail_screen"
+
+        # --- idempotent re-scan: same message -> no new rows, no new job
+        again = await record_message(
+            db,
+            source_channel_id=channel_id,
+            message_id=9001,
+            media_type="document",
+            file_name="Bleach Ingest S01E01 720p Hindi.mkv",
+            raw_caption="t.me/ycanime",
+            fingerprint="fp-720",
+        )
+        assert again["skipped"].startswith("already ingested")
+        assert again["candidate_id"] == first["candidate_id"]
+        jobs = await db.fetchval("select count(*) from app.job where candidate_id = $1", first["candidate_id"])
+        assert int(jobs) == 1, "a re-scan must not double-queue the same file"
+
+        episode = await db.fetchrow(
+            "select id, episode_number, canonical_key, languages from app.episode where id = $1",
+            first["episodes"][0],
+        )
+        assert int(episode["episode_number"]) == 1 and episode["languages"] == ["hindi"]
+
+        # --- a second quality widens the same episode, it is not a new episode
+        second = await record_message(
+            db,
+            source_channel_id=channel_id,
+            message_id=9002,
+            media_type="document",
+            file_name="Bleach Ingest S01E01 1080p Hindi.mkv",
+            fingerprint="fp-1080",
+        )
+        assert second["episodes"] == first["episodes"], "1080p of ep 1 is still ep 1"
+        assert len(second["variants"]) == 1
+        variants = await db.fetch(
+            "select quality from app.media_variant where episode_id = $1 order by quality", episode["id"]
+        )
+        assert [v["quality"] for v in variants] == ["1080p", "720p"]
+
+        # --- case-only differences must not look like a new quality
+        same_quality = await record_message(
+            db,
+            source_channel_id=channel_id,
+            message_id=9006,
+            media_type="document",
+            file_name="Bleach Ingest S01E01 1080P Hindi.mkv",
+            fingerprint="fp-1080-upper",
+        )
+        assert same_quality["variants"] == [], "1080P is the 1080p variant that already exists"
+
+        # --- duplicate media by fingerprint, not by filename
+        dup = await record_message(
+            db,
+            source_channel_id=channel_id,
+            message_id=9003,
+            media_type="document",
+            file_name="Re.Na.Med.Bleach.Ingest.S01E01.720p.Hindi.mkv",
+            fingerprint="fp-720",
+        )
+        assert dup["disposition"] == "superseded" and dup["variants"] == []
+
+        # --- subbed-only creates a rejected row and nothing else
+        sub = await record_message(
+            db,
+            source_channel_id=channel_id,
+            message_id=9004,
+            media_type="document",
+            file_name="Bleach Ingest S01E02 English Subtitle 1080p.mkv",
+        )
+        assert sub["disposition"] == "rejected" and "out of scope" in sub["reason"]
+        assert sub.get("episodes", []) == []
+        episodes_after = await db.fetchval(
+            "select count(*) from app.episode where season_id = (select id from app.season where series_id = (select series_id from app.source_channel where id = $1) and season_number = 1)",
+            channel_id,
+        )
+        assert int(episodes_after) == 1, "a rejected file must not open an episode row"
+
+        # --- a batch records its episodes without inventing per-episode variants
+        batch = await record_message(
+            db,
+            source_channel_id=channel_id,
+            message_id=9005,
+            media_type="document",
+            file_name="Bleach Ingest S02 [01-03] Hindi.zip",
+        )
+        assert batch["file_kind"] == "batch" and batch["needs_batch_handling"] is True
+        assert len(batch["episodes"]) == 3 and batch["variants"] == []
+        season = await db.fetchrow(
+            "select first_episode, last_episode from app.season where series_id = (select series_id from app.source_channel where id = $1) and season_number = 2",
+            channel_id,
+        )
+        assert (season["first_episode"], season["last_episode"]) == (1, 3)
+
+        # --- the series row is created from the file name when the channel has none
+        loose_channel, loose_series = _ingest_channel(
+            conn, "@loose_ingest", -100700002, "Unlinked Ingest", link_series=False
+        )
+        await db.execute("update app.source_channel set series_id = null where id = $1", loose_channel)
+        loose = await record_message(
+            db,
+            source_channel_id=loose_channel,
+            message_id=9100,
+            media_type="document",
+            file_name="Unlinked Ingest S01E07 720p Hindi.mkv",
+        )
+        assert loose["disposition"] == "accepted"
+        created_series = await db.fetchrow(
+            "select title, normalized_title from app.series where id = $1", loose["series_id"]
+        )
+        assert created_series["title"] == "Unlinked Ingest"
+
+        # --- ignored channels are skipped before any parsing happens
+        await db.execute("update app.source_channel set mode = 'ignore' where id = $1", loose_channel)
+        ignored = await record_message(
+            db, source_channel_id=loose_channel, message_id=9101, file_name="Unlinked Ingest S01E08 Hindi.mkv"
+        )
+        assert "ignore" in ignored["skipped"]
+        await db.execute("update app.source_channel set mode = 'full' where id = $1", loose_channel)
+
+        # --- an unconfigured channel says so instead of raising
+        missing = await record_message(db, source_channel_id=99999999, message_id=1, file_name="x.mkv")
+        assert "not configured" in missing["skipped"]
+
+        # --- the job handler passes the payload through to the same function
+        report = await ingest_media(
+            {
+                "payload": {
+                    "source_channel_id": channel_id,
+                    "message_id": 9200,
+                    "media_type": "document",
+                    "file_name": "Bleach Ingest S01E09 480p Hindi.mkv",
+                }
+            },
+            Context(db=db, settings=settings),
+        )
+        assert report["disposition"] == "accepted" and len(report["variants"]) == 1
+
+        try:
+            await ingest_media({"payload": {}}, Context(db=db, settings=settings))
+        except ValueError as exc:
+            assert "source_channel_id" in str(exc)
+        else:  # pragma: no cover - the guard must fire
+            raise AssertionError("a payload without ids must fail loudly, not ingest nothing silently")
+
+        # --- and screening a candidate that ingest queued moves the ladder on
+        await db.execute("update app.config set value = 'false' where key = 'thumbnail.strict_mode'")
+        from app.handlers import thumbnail_screen
+
+        screened = await thumbnail_screen({"candidate_id": first["candidate_id"], "payload": {}}, Context(db=db, settings=settings))
+        assert screened["status"] == "clean", screened
+        assert screened["archive_jobs_queued"] == first["variants"]
+        stages = await db.fetch(
+            "select kind, stage from app.job where dedup_key = any($1) order by id",
+            [f"screen:candidate:{first['candidate_id']}", f"archive:{first['variants'][0]}"],
+        )
+        assert [s["kind"] for s in stages] == ["thumbnail_screen", "archive_media"]
+        await db.close()
+        return {"episode_key": episode["canonical_key"], "stages": stages}
+
+    try:
+        info = asyncio.run(scenario())
+    finally:
+        conn.execute("update app.config set value = 'true' where key = 'thumbnail.strict_mode'")
+        with conn.cursor() as cur:
+            cur.execute("delete from app.job where dedup_key like 'screen:candidate%' or dedup_key like 'archive:%'")
+            cur.execute(
+                "delete from app.source_candidate where source_channel_id in "
+                "(select id from app.source_channel where telegram_channel_id in (-100700001, -100700002))"
+            )
+            cur.execute("delete from app.processed_message where source_channel_id in (select id from app.source_channel where telegram_channel_id in (-100700001, -100700002))")
+            cur.execute("delete from app.dupe_fingerprint")
+            cur.execute(
+                "delete from app.media_variant where episode_id in (select e.id from app.episode e "
+                "join app.season s on s.id = e.season_id where s.series_id in "
+                "(select id from app.series where normalized_title like 'ingest %'))"
+            )
+            cur.execute(
+                "delete from app.episode where season_id in (select id from app.season where series_id in "
+                "(select id from app.series where normalized_title like 'ingest %'))"
+            )
+            cur.execute("delete from app.season where series_id in (select id from app.series where normalized_title like 'ingest %')")
+            cur.execute("delete from app.source_channel where telegram_channel_id in (-100700001, -100700002)")
+            cur.execute("delete from app.series where normalized_title like 'ingest %'")
+    assert info["episode_key"].count("|") >= 3

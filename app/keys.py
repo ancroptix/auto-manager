@@ -26,6 +26,7 @@ __all__ = [
     "storage_key",
     "publish_key",
     "sticker_key",
+    "screening_key",
     "reconciliation_key",
     "campaign_key",
 ]
@@ -106,6 +107,13 @@ def reconciliation_key(when: dt.datetime | None = None) -> str:
 
 def discovery_key(source_channel_id: int, message_id: int, media_idx: int = 0) -> str:
     return f"discover:{int(source_channel_id)}:{int(message_id)}:{int(media_idx)}"
+
+
+def screening_key(candidate_id: int) -> str:
+    """Screening is keyed to the candidate row, so re-running it after a policy
+    change (or a restart mid-scan) reuses the same job instead of queueing a
+    second verdict for one file."""
+    return f"screen:candidate:{int(candidate_id)}"
 
 
 def archive_key(variant_id: int) -> str:

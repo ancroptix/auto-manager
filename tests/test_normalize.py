@@ -142,6 +142,14 @@ class TestFileKind:
     def test_kinds(self, name: str, kind: str) -> None:
         assert parse_episode(file_name=name).file_kind == kind
 
+    def test_an_archive_with_a_range_is_a_batch(self) -> None:
+        parsed = parse_episode(file_name="Bleach S01 [01-12] Hindi.zip", source_series="Bleach")
+        assert parsed.file_kind == "batch" and parsed.episodes == tuple(range(1, 13))
+
+    def test_a_single_packed_file_is_still_an_episode(self) -> None:
+        parsed = parse_episode(file_name="Bleach S01E05 Hindi.rar", source_series="Bleach")
+        assert parsed.file_kind == "episode" and parsed.episode == 5
+
     def test_archive_without_a_number_is_a_batch_not_a_stuck_episode(self) -> None:
         parsed = parse_episode(file_name="Bleach S01 Hindi.zip", source_series="Bleach")
         assert parsed.file_kind == "batch" and parsed.accepted

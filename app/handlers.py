@@ -19,9 +19,9 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Mapping
 
-from . import thumbnails
+from . import ingest, thumbnails
 from .db import Database
 from .keys import archive_key
 from .stages import JobKind, JobStage
@@ -51,10 +51,6 @@ class Context:
 # --- feature modules that land next -----------------------------------------
 
 DEPENDENCIES: dict[str, str] = {
-    JobKind.INGEST_MEDIA.value: (
-        "Telethon event wiring only — parsing and eligibility are implemented in app.normalize; "
-        "this job needs a logged-in session to read source messages"
-    ),
     JobKind.ARCHIVE_MEDIA.value: "server-side copy into the private master archive channel",
     JobKind.STORAGE_UPLOAD.value: "@anime_hindifilesbot menu protocol (needs one authenticated test run)",
     JobKind.LINK_VERIFY.value: "link liveness probe",
@@ -89,6 +85,37 @@ async def reconciliation(job: dict[str, Any], ctx: Context) -> dict[str, Any]:
     health = await ctx.db.queue_health() or {}
     log.info("reconciliation: reclaimed %s stale lease(s), queue=%s", reclaimed, health)
     return {"reclaimed_locks": reclaimed, "queue": {k: int(v or 0) for k, v in health.items()}}
+
+
+async def ingest_media(job: dict[str, Any], ctx: Context) -> dict[str, Any]:
+    """Write the rows one source message implies: candidate, episode, variant.
+
+    The *scanning* half of ingest still needs a logged-in session — that is the
+    Telethon event loop, not a decision — but everything downstream of a message
+    lives here and is verified against the real schema. When the scanner exists it
+    will call the same :func:`app.ingest.record_message` with the same payload
+    shape, so nothing about this handler is throwaway.
+    """
+    payload: Mapping[str, Any] = {**(job.get("payload") or {})}
+    channel_id = job.get("source_channel_id") or payload.get("source_channel_id")
+    message_id = job.get("message_id") or payload.get("message_id")
+    if channel_id is None or message_id is None:
+        raise ValueError(
+            "ingest_media needs source_channel_id and message_id in its payload; "
+            "the source-channel scanner is what supplies them"
+        )
+    return await ingest.record_message(
+        ctx.db,
+        source_channel_id=int(channel_id),
+        message_id=int(message_id),
+        media_idx=int(payload.get("media_idx", job.get("media_idx", 0)) or 0),
+        media_type=payload.get("media_type"),
+        file_name=payload.get("file_name"),
+        raw_caption=payload.get("caption") or payload.get("raw_caption"),
+        file_size_bytes=payload.get("file_size_bytes"),
+        fingerprint=payload.get("fingerprint"),
+        quality_order=await ctx.db.config("quality.order", None),
+    )
 
 
 async def thumbnail_screen(job: dict[str, Any], ctx: Context) -> dict[str, Any]:
@@ -194,6 +221,9 @@ async def thumbnail_screen(job: dict[str, Any], ctx: Context) -> dict[str, Any]:
                 payload={"candidate_id": candidate_id, "thumbnail_status": verdict.status},
                 variant_id=int(variant["id"]),
                 episode_id=variant.get("episode_id"),
+                # candidate_id too, so "which jobs came from this message" is one
+                # query when something has to be traced by hand at 2am.
+                candidate_id=candidate_id,
             )
             if job_row:
                 queued.append(int(variant["id"]))
@@ -228,6 +258,7 @@ def build_registry() -> dict[str, Handler]:
     """Job kind -> handler. The keys are the whole supported vocabulary."""
     registry: dict[str, Handler] = {
         JobKind.RECONCILIATION.value: reconciliation,
+        JobKind.INGEST_MEDIA.value: ingest_media,
         JobKind.THUMBNAIL_SCREEN.value: thumbnail_screen,
     }
     for kind in JobKind:

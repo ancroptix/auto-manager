@@ -3,8 +3,11 @@
 A modular Telegram media-management system for content the operator owns or is
 authorized to distribute.
 
-**Status:** runtime skeleton is built and tested (166 tests). The Telegram
-feature modules are not implemented yet — they fail loudly into a `blocked`
+**Status:** the runtime skeleton and the whole decision layer are built and
+tested (287 tests): parsing, the Hindi-scope rule, thumbnail screening, manifest
+order, the create-vs-edit choice, and destination-channel setup. Source scanning,
+archive copies, storage-bot menus and Channel Help publishing are **not**
+implemented — they need a logged-in session and fail loudly into a `blocked`
 queue state rather than pretending to run.
 
 * Spec and agreed decisions: [`docs/requirements-draft.md`](docs/requirements-draft.md)
