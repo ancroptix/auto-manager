@@ -145,6 +145,19 @@ def test_no_doc_promise_a_credential_in_chat(path: str) -> None:
         assert phrase not in text, f"{path} says: {phrase!r}"
 
 
+def test_the_approved_captions_are_reachable_from_the_readme_and_spec() -> None:
+    """A page nobody links to is a page nobody re-reads.
+
+    The captions are the only part of this system the audience ever sees, so both the
+    front page and the requirements document point at the rendered examples.
+    """
+    for rel in ("README.md", "docs/requirements-draft.md"):
+        assert "captions-approved.md" in read(rel), f"{rel} lost the pointer to the approved captions"
+    spec = read("docs/requirements-draft.md")
+    assert "approved by the operator" in spec.lower()
+    assert "Temporary default" not in spec, "the spec still advertises placeholder captions"
+
+
 def test_architecture_lists_the_new_modules() -> None:
     doc = read("docs/architecture.md")
     for name in ("botapi.py", "controlbot.py", "sessions.py", "mtproto_login.py", "0003_control_bot.sql"):

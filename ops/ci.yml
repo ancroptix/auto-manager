@@ -33,6 +33,14 @@ jobs:
           # and their functions tested, not merely parsed.
           pip install -r requirements-dev.txt
 
+      # Both generated artifacts must match what they are generated from: the
+      # one-file installer the operator pastes, and the caption migration whose
+      # strings have to be the ones the renderer uses.
+      - name: Verify the generated SQL has not drifted
+        run: |
+          python ops/build_apply_all.py --check
+          python ops/build_caption_migration.py --check
+
       - name: Verify the SQL parses under PostgreSQL's grammar
         run: |
           python - <<'PY'

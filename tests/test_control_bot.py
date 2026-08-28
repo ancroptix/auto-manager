@@ -102,7 +102,12 @@ class FakeDb:
                 rows = [row for row in rows if row["name"] == args[0]]
             return rows
         if "from app.config" in sql:
-            return [{"key": "thumbnail.strict_mode", "value": "true"}]
+            return [
+                {"key": "caption.button_rows", "value": "one_per_line"},
+                {"key": "caption.total_episodes_unknown", "value": "TBA"},
+                {"key": "ingest.require_hindi_audio", "value": "true"},
+                {"key": "thumbnail.strict_mode", "value": "true"},
+            ]
         if "app.job" in sql:
             return list(self.blocked)
         return []
@@ -355,7 +360,7 @@ async def test_status_reports_mode_queue_and_settings_without_secrets() -> None:
     text = replies[0].text
     assert "shadow" in text and "queued=3" in text
     assert "storage_upload x7" in text and "thumbnails awaiting" in text
-    assert "thumbnail.strict_mode" in text
+    assert "thumbnail.strict_mode" in text and "caption.button_rows" in text
     assert TOKEN not in text and SESSION not in text and "session_string" not in text
 
 

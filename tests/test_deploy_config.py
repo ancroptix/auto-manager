@@ -203,9 +203,31 @@ def test_apply_all_installer_is_in_sync_with_migrations() -> None:
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-def test_migration_bundle_ships_both_files_in_order() -> None:
-    """ops/apply-all.sql is what first boot executes, so it must contain both
-    migrations, functions after tables, and it must parse."""
+def test_generated_sql_artifacts_are_all_in_sync() -> None:
+    """Every generated SQL file has a ``--check`` and CI runs all of them.
+
+    Two artefacts today: ops/apply-all.sql against supabase/migrations/, and
+    0004_approved_captions.sql against app/captions.APPROVED_TEMPLATES. A stale
+    caption migration would mean the text you approved is not the text that gets
+    published, and a stale bundle would mean the installer skips 0004 entirely.
+    """
+    import subprocess
+    import sys
+
+    for script in ("ops/build_caption_migration.py", "ops/build_apply_all.py"):
+        result = subprocess.run(
+            [sys.executable, script, "--check"], cwd=ROOT, capture_output=True, text=True
+        )
+        assert result.returncode == 0, f"{script} --check failed: {result.stdout}{result.stderr}"
+
+
+def test_migration_bundle_ships_every_migration_in_order() -> None:
+    """ops/apply-all.sql is what first boot executes, so it must contain every
+    migration, functions after tables, and it must parse.
+
+    The name used to say "both files"; the scan is directory-driven now, so a fifth
+    migration is covered the moment it exists instead of being quietly absent.
+    """
     import pglast
 
     from app.db import MIGRATION_BUNDLE, REPO_ROOT

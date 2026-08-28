@@ -140,52 +140,82 @@ Both handles are primary and always appear together.
 - The adapter is isolated as `ChannelHelpPublisher` because third-party menus can change. If it breaks, completed
   posts queue safely and the owner is notified — file processing continues regardless.
 
-## 12. Templates (current defaults, configurable)
+## 12. Templates (approved by the operator, 2026-08-28)
+
+The three captions below are the operator's own samples, adopted verbatim and stored
+in `app.config` (`templates.archive_caption`, `templates.episode_post`,
+`templates.season_post`, plus the two `templates.*_button` rows). `0004_approved_captions.sql`
+is the migration that replaced the placeholders; rendered examples and the
+placeholder table are in [captions-approved.md](captions-approved.md).
 
 Archive file caption:
 
 ```text
-🎬 {title}
-📺 Season {season} • Episode {episode}
-🎙 Audio: {languages}
-💾 Quality: {quality}
+‣ Dekin no mogura: The earthbound mole (S - 01)
 
-@ycanime | @india_crunchyroll
+╭────────────────────
+┣Quality: 480p
+┣Episode: 11
+┣Audio: Hindi #O𝖿𝖿𝗂𝖼𝗂𝖺𝗅
+╰────────────────────
 
-#{title_tag} #S01E01 #{quality_tag}
+‣ Powered By: @india_crunchyroll
+@YC_Anime
 ```
 
 Individual episode destination post:
 
 ```text
-🎬 {title}
+✦ Dekin no mogura: The earthbound mole ✦
 
-📺 Season {season} • Episode {episode}
-🎙 Available in Hindi
-💾 Qualities: {quality_list}
-
-Choose the button below to get this episode.
-
-@ycanime | @india_crunchyroll
+╔━━━━━━━━━━━━━━━━━━━━━╗
+⌲ 𝗦𝗲𝗮𝘀𝗼𝗻: 1
+❍ 𝗘𝗽𝗶𝘀𝗼𝗱𝗲: 01
+〄 𝗔𝘂𝗱𝗶𝗼: Hindi
+◎ 𝗧𝗼𝘁𝗮𝗹 𝗘𝗽𝗶𝘀𝗼𝗱𝗲𝘀: 12
+♡ 𝗣𝗼𝘄𝗲𝗿𝗲𝗱 𝗯𝘆: @YC_Anime , @India_crunchyroll
+╚━━━━━━━━━━━━━━━━━━━━━╝
 ```
 
-Button: `📥 Get Episode {episode} - {storage_link}`
-
-Complete-season destination post:
+Complete-season batch post:
 
 ```text
-🎬 {title} — Season {season} Complete
+✦ Dekin no mogura: The earthbound mole ✦
 
-📺 Episodes: {first_episode}–{last_episode}
-🎙 Available in Hindi
-💾 Qualities: {quality_summary}
-
-Choose the button below to get the complete season.
-
-@ycanime | @india_crunchyroll
+╔━━━━━━━━━━━━━━━━━━━━━╗
+⌲ 𝗦𝗲𝗮𝘀𝗼𝗻: 1
+❍ 𝗘𝗽𝗶𝘀𝗼𝗱𝗲: 01 - 12
+〄 𝗔𝘂𝗱𝗶𝗼: Hindi
+◎ 𝗧𝗼𝘁𝗮𝗹 𝗘𝗽𝗶𝘀𝗼𝗱𝗲𝘀: 12
+♡ 𝗣𝗼𝘄𝗲𝗿𝗲𝗱 𝗯𝘆: @YC_Anime , @India_crunchyroll
+╚━━━━━━━━━━━━━━━━━━━━━╝
 ```
 
-Button: `📥 Get Complete Season {season} - {storage_link}`
+Inline buttons, in Channel Help's `text - url` syntax (`&&` = same row, newline = new
+row), one per available quality in manifest order:
+
+```text
+❐ 𝗪𝗮𝘁𝗰𝗵/𝗗𝗼𝘄𝗻𝗹𝗼𝗮𝗱 ❐ - https://t.me/anime_hindifilesbot/111
+```
+
+```text
+❐ 𝗪𝗮𝘁𝗰𝗵/𝗗𝗼𝘄𝗻𝗹𝗼𝗮𝗱 480p ❐ - https://t.me/anime_hindifilesbot/1
+❐ 𝗪𝗮𝘁𝗰𝗵/𝗗𝗼𝘄𝗻𝗹𝗼𝗮𝗱 720p ❐ - https://t.me/anime_hindifilesbot/2
+❐ 𝗪𝗮𝘁𝗰𝗵/𝗗𝗼𝘄𝗻𝗹𝗼𝗮𝗱 1080p ❐ - https://t.me/anime_hindifilesbot/3
+```
+
+Rules that the formatting has to keep honourable:
+
+- `{title_full}` is a single stored value (`title` + optional `: subtitle`), used by
+  the archive and the destination alike, so the private record and the public post
+  can never disagree about a series name.
+- `{total_episodes}` and the batch's `{episode_range}` come from the season's
+  declared length only. An unknown length prints `TBA`; the highest episode number
+  seen is never treated as the total.
+- Every frame line is single-newline separated, because `╭ ┣ ┣ ╰` only reads as a box
+  when the strokes are adjacent.
+- A placeholder with no value is reported by name to the publishing job, and the job
+  does not post a caption containing a literal `{quality}`.
 
 These blocks show one state of a post, not a template that is appended to. When
 a quality arrives later the whole message is re-rendered from the manifest and
@@ -321,10 +351,12 @@ Rules agreed for the bot:
 1. Season → sticker mapping (auto-detect on first run, else owner picks once) — pending live account connection.
 2. Join-request message template — operator deferred this.
 3. Storage bot command protocol — requires authenticated integration testing.
-4. Template refinements beyond the §12 defaults, if desired. The three §12 captions are still marked
-   `Temporary default` in `app.config`: they are correct enough to run and wrong enough to need a read.
-   Editing them is a `update app.config set value = ...` away, so no migration is required to accept them —
-   but a reviewable migration is the safer record if the operator wants the wording in git.
+4. ~~Template refinements beyond the §12 defaults~~ — the operator dictated the three caption formats and
+   the button label on 2026-08-28; §12 and `0004_approved_captions.sql` carry them.
+5. **New:** whether `@YC_Anime` (in the approved footers) and `@ycanime` (in `branding.primary_handles`, the
+   thumbnail gate's allow-list) are the same channel. The underscore is significant to Telegram.
+6. **New:** hashtag policy. The old draft had `#S01E01`-style tags per caption; the approved samples carry none,
+   so no tags are emitted. If hashtags are wanted they belong in the template text, not in code.
 
 ## 19. Repository status
 

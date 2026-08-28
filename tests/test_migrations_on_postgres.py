@@ -11,6 +11,7 @@ Skipped automatically when pgserver/psycopg are unavailable.
 
 from __future__ import annotations
 
+import json
 import socket
 from pathlib import Path
 
@@ -815,8 +816,9 @@ def test_first_boot_installs_the_schema_into_an_empty_database(conn):
             """
         )
         # 0003 adds one table (app.telegram_session, which is what makes the
-        # control bot's /login possible) and four operator-tunable settings.
-        assert (counts["rel"], counts["fn"], counts["cfg"]) == (27, 14, 32)
+        # control bot's /login possible) and four operator-tunable settings; 0004
+        # adds three more keys for the approved captions (no new relation).
+        assert (counts["rel"], counts["fn"], counts["cfg"]) == (27, 14, 35)
         # A second boot must be a no-op, never a re-run that fights live data.
         assert await db.schema_missing() is False
         # And the installer is itself replayable.
@@ -1454,3 +1456,87 @@ def test_control_bot_login_writes_one_usable_row(conn) -> None:
 
     asyncio.run(scenario())
     _clear_sessions(conn)
+
+
+# ---------------------------------------------------------------------------
+# 0004_approved_captions.sql — published text, so it is pinned in the database too
+# ---------------------------------------------------------------------------
+
+
+def _config_value(conn, key: str):
+    with conn.cursor() as cur:
+        cur.execute("select value from app.config where key = %s", (key,))
+        row = cur.fetchone()
+    if row is None:
+        return None
+    # psycopg3 already decodes jsonb, so a JSON string value arrives as a str and a
+    # JSON array as a list. json.loads-ing it again would fail on any caption that
+    # does not begin with a quote, which is most of them.
+    return row[0]
+
+
+def test_the_approved_captions_are_what_the_database_holds(conn) -> None:
+    """The strings the operator dictated must be the strings a fresh deploy serves.
+
+    A migration that inserts a *different* caption than ``app/captions.py`` renders
+    would mean the database copy wins and nobody notices until a post looks wrong,
+    so both are compared here on a real cluster.
+    """
+    from app.captions import APPROVED_TEMPLATES, BUTTON_ROWS, TOTAL_UNKNOWN
+
+    for key, template in APPROVED_TEMPLATES.items():
+        assert _config_value(conn, key) == template, f"{key} in the database is not the approved text"
+    assert _config_value(conn, "caption.button_rows") == BUTTON_ROWS
+    assert _config_value(conn, "caption.total_episodes_unknown") == TOTAL_UNKNOWN
+    # the archive caption used to carry hashtags; the approved sample has none, and
+    # adding them back would be a policy change, not a formatting one
+    assert "#" in _config_value(conn, "templates.archive_caption"), "the Official tag is part of the sample"
+    assert "#S01E01" not in _config_value(conn, "templates.archive_caption")
+
+
+def test_reapplying_0004_never_overwrites_an_edited_caption(conn) -> None:
+    """`ops/apply-all.sql` gets pasted more than once in a real setup.
+
+    The guard has to cut both ways: an untouched placeholder is replaced on re-run,
+    and a row the operator has since tuned is left exactly as they left it. The
+    placeholder used to reset the row is copied out of 0002 rather than retyped,
+    because "close enough" is precisely what this guard is testing.
+    """
+    import re
+
+    from app.captions import APPROVED_TEMPLATES
+
+    sql = (ROOT / "supabase" / "migrations/0004_approved_captions.sql").read_text(encoding="utf-8")
+    seeded_sql = (ROOT / "supabase" / "migrations/0002_functions.sql").read_text(encoding="utf-8")
+    key = "templates.episode_post"
+    original = _config_value(conn, key)
+    edited = original + "\n\nEDITED BY THE OPERATOR"
+    try:
+        conn.execute("update app.config set value = %s::jsonb where key = %s", (json.dumps(edited), key))
+        conn.execute(sql)
+        assert _config_value(conn, key) == edited, "a re-apply overwrote an edited caption"
+
+        literal = re.search(
+            r"\('" + re.escape(key) + r"',\s*\n?\s*('(?:[^']|\'\')*')", seeded_sql
+        ).group(1)
+        placeholder = literal[1:-1].replace("''", "'")
+        conn.execute("update app.config set value = %s::jsonb where key = %s", (placeholder, key))
+        assert _config_value(conn, key) != original, "the reset did not actually restore the placeholder"
+        conn.execute(sql)
+        assert _config_value(conn, key) == APPROVED_TEMPLATES[key], "the placeholder was not replaced"
+    finally:
+        conn.execute("update app.config set value = %s::jsonb where key = %s", (json.dumps(original), key))
+
+
+def test_series_subtitle_column_exists_and_is_optional(conn) -> None:
+    """Nothing may require the alternate title: most source channels never state one."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            select is_nullable from information_schema.columns
+             where table_schema = 'app' and table_name = 'series' and column_name = 'subtitle'
+            """
+        )
+        row = cur.fetchone()
+    assert row is not None, "app.series.subtitle was not added"
+    assert row[0] == "YES"

@@ -287,7 +287,9 @@ class ControlBot:
             # one screen the operator reads.
             settings = await self.db.fetch(
                 "select key, value::text as value from app.config "
-                "where key in ('thumbnail.strict_mode','caption.handles_allowed','caption.template_episode','publish.enabled') "
+                "where key in ('thumbnail.strict_mode','thumbnail.on_no_clean_candidate',"
+                "'ingest.require_hindi_audio','ingest.include_subbed_only','caption.button_rows',"
+                "'caption.total_episodes_unknown') "
                 "order by key"
             )
             if settings:
