@@ -13,7 +13,8 @@ queue state rather than pretending to run.
 * Spec and agreed decisions: [`docs/requirements-draft.md`](docs/requirements-draft.md)
 * What exists and where each rule is enforced: [`docs/architecture.md`](docs/architecture.md)
 * Setup: [`docs/setup-supabase.md`](docs/setup-supabase.md) · [`docs/setup-render.md`](docs/setup-render.md)
-* From your phone: [`docs/control-bot.md`](docs/control-bot.md) — and the published wording
+* Starting out, in order, click by click: [`docs/launch-checklist.md`](docs/launch-checklist.md)
+  From your phone: [`docs/control-bot.md`](docs/control-bot.md) — and the published wording
   you approved, rendered: [`docs/captions-approved.md`](docs/captions-approved.md)
 
 ## Pipeline

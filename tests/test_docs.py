@@ -167,6 +167,82 @@ def test_the_approved_captions_are_reachable_from_the_readme_and_spec() -> None:
     assert "Temporary default" not in spec, "the spec still advertises placeholder captions"
 
 
+def test_the_checklist_env_block_is_the_real_settings() -> None:
+    """A setup guide that names a variable the app does not read wastes an operator's evening.
+
+    The checklist is the one document the operator follows top to bottom without
+    understanding it, so it is checked like a config file: every key in its env block
+    must exist in :class:`app.config.Settings`, must be a key ``render.yaml`` sets, and
+    the keys that gate live mode must be present at all.
+    """
+    import sys
+
+    sys.path.insert(0, str(ROOT))
+    from app.config import Settings
+
+    doc = read("docs/launch-checklist.md")
+    block = re.search(r"```env\n(.*?)\n```", doc, re.S)
+    assert block, "the checklist lost its ```env block"
+    lines = [ln.strip() for ln in block.group(1).splitlines() if ln.strip()]
+    # `KEY: value`, not `KEY=value`, because Render asks for the two separately — and
+    # because scripts/check_secrets.py deliberately rejects `DATABASE_URL=<literal>`
+    # anywhere in the tree. A setup guide must not need a scanner exemption to exist.
+    row = re.compile(r"^([A-Z][A-Z0-9_]{2,}):\s")
+    keys = [m.group(1) for ln in lines if (m := row.match(ln))]
+    assert keys, "no `KEY: value` rows in the env block"
+    unparsed = [ln for ln in lines if not row.match(ln)]
+    assert not unparsed, f"rows without a recognisable key: {unparsed}"
+
+    # The guide speaks environment variables, the model speaks field names, and they
+    # are not always the same string: `APP_MODE` is the *alias* on field `mode`. So the
+    # legal set is every field name uppercased plus every alias, or a correctly written
+    # guide would fail for naming the variable Render actually sets.
+    settings = {name.upper() for name in Settings.model_fields} | {
+        str(info.alias).upper() for info in Settings.model_fields.values() if info.alias
+    }
+    assert set(keys) <= settings, f"checklist invents settings: {sorted(set(keys) - settings)}"
+    blueprint = set(blueprint_env_keys())
+    assert set(keys) <= blueprint, f"checklist keys the blueprint never sets: {sorted(set(keys) - blueprint)}"
+
+    live_critical = {
+        "APP_MODE",
+        "DATABASE_URL",
+        "DB_SSL",
+        "CONTROL_TOKEN",
+        "TELEGRAM_API_ID",
+        "TELEGRAM_API_HASH",
+        "TELEGRAM_BOT_TOKEN",
+        "TELEGRAM_OWNER_USER_IDS",
+        "TELEGRAM_MAIN_ADMIN_USER_ID",
+        "TELEGRAM_SESSION_SOURCE",
+        "BOT_ALLOW_LOGIN",
+        "PROBE_ON_BOOT",
+    }
+    missing = live_critical - set(keys)
+    assert not missing, f"checklist omits {sorted(missing)}"
+    assert len(keys) == len(set(keys)), "a key is listed twice with different values"
+
+
+def test_the_checklist_only_names_files_that_exist() -> None:
+    """Every repository path in the guide must resolve, or the operator hunts for it.
+
+    This is how a renamed migration or a moved script turns into "the docs are wrong,
+    so I will guess" — and guessing is how a database gets half a schema.
+    """
+    doc = read("docs/launch-checklist.md")
+    paths = set(
+        re.findall(
+            r"`((?:docs|ops|app|tests|scripts|supabase)/[A-Za-z0-9_./-]+\.(?:md|py|sql|ya?ml|txt))`"
+            r"|`(render\.yaml)`",
+            doc,
+        )
+    )
+    flat = {a or b for a, b in paths}
+    assert flat, "the checklist no longer names any files, which is suspicious by itself"
+    for rel in sorted(flat):
+        assert (ROOT / rel).exists(), f"checklist names {rel}, which is not in the repo"
+
+
 def test_architecture_lists_the_new_modules() -> None:
     doc = read("docs/architecture.md")
     for name in ("botapi.py", "controlbot.py", "sessions.py", "mtproto_login.py", "0003_control_bot.sql"):
