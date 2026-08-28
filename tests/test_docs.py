@@ -75,10 +75,19 @@ def test_the_manual_web_service_form_matches_the_blueprint() -> None:
 
 
 def test_session_string_is_documented_as_optional() -> None:
-    """The point of the control bot is that no session string is pasted anywhere."""
+    """The point of the control bot is that no session string is pasted anywhere.
+
+    Checked against every line that names the variable, because the guide mentions it
+    twice — once in the "what you need for live mode" table and once where it says
+    the variable is deliberately absent. Both have to read as optional, or the
+    operator pastes one and wonders why an older session won.
+    """
     doc = read("docs/setup-render.md")
-    line = next(line for line in doc.splitlines() if "`TELEGRAM_SESSION_STRING`" in line)
-    assert "not" in line.lower() or "absent" in line.lower() or "win" in line.lower(), line
+    lines = [line for line in doc.splitlines() if "`TELEGRAM_SESSION_STRING`" in line]
+    assert lines, "the guide stopped mentioning the variable at all"
+    for line in lines:
+        lowered = line.lower()
+        assert any(word in lowered for word in ("optional", "not", "absent", "win")), line
     assert "scripts/login.py" in doc and "fallback" in read("scripts/login.py")
 
 

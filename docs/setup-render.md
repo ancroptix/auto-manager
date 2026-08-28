@@ -46,14 +46,14 @@ and the start command in sync automatically.
    | `BOT_ALLOW_LOGIN` | `true` while setting up |
    | `PROBE_ON_BOOT` | `0` (flip to `1` once, later — see the last section) |
 
-   Of the 26 settings the app reads (`python -c "from app.config import Settings; print('\n'.join(Settings.model_fields))"` lists them), only these matter on day one:
+   The app reads 33 settings (`python -c "from app.config import Settings; print('\n'.join(Settings.model_fields))"` lists them). Only these matter on day one:
 
    | You need it for | These keys |
    | --- | --- |
    | booting at all | nothing — `shadow` starts with zero configuration and does no harm |
    | persisting anything | `DATABASE_URL` (+ `DB_SSL=require`) |
    | the HTTP kill switch | `CONTROL_TOKEN` |
-   | sending to Telegram (`APP_MODE=live`) | `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, `TELEGRAM_OWNER_USER_IDS`, a session (stored by `/login` or in `TELEGRAM_SESSION_STRING`), `DATABASE_URL` |
+   | sending to Telegram (`APP_MODE=live`) | `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, `TELEGRAM_OWNER_USER_IDS`, a session (`TELEGRAM_SESSION_STRING` is the optional way to provide one; `/login` is the normal way), `DATABASE_URL` |
    | the control bot answering you | `TELEGRAM_BOT_TOKEN` **and** an owner id — with no owner list it refuses to start |
    | never needed | `PORT` (Render sets it), `LOG_LEVEL`, the 11 `WORKER_*`/queue/lease tunables, `DB_POOL_*`, `DB_SEARCH_PATH`, `RECONCILE_ON_BOOT`, `MIGRATE_ON_BOOT`, `CAMPAIGN_RATE_PER_HOUR`, `BOT_ENABLED` |
 
