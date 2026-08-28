@@ -46,6 +46,21 @@ and the start command in sync automatically.
    | `BOT_ALLOW_LOGIN` | `true` while setting up |
    | `PROBE_ON_BOOT` | `0` (flip to `1` once, later — see the last section) |
 
+   Of the 26 settings the app reads (`python -c "from app.config import Settings; print('\n'.join(Settings.model_fields))"` lists them), only these matter on day one:
+
+   | You need it for | These keys |
+   | --- | --- |
+   | booting at all | nothing — `shadow` starts with zero configuration and does no harm |
+   | persisting anything | `DATABASE_URL` (+ `DB_SSL=require`) |
+   | the HTTP kill switch | `CONTROL_TOKEN` |
+   | sending to Telegram (`APP_MODE=live`) | `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, `TELEGRAM_OWNER_USER_IDS`, a session (stored by `/login` or in `TELEGRAM_SESSION_STRING`), `DATABASE_URL` |
+   | the control bot answering you | `TELEGRAM_BOT_TOKEN` **and** an owner id — with no owner list it refuses to start |
+   | never needed | `PORT` (Render sets it), `LOG_LEVEL`, the 11 `WORKER_*`/queue/lease tunables, `DB_POOL_*`, `DB_SEARCH_PATH`, `RECONCILE_ON_BOOT`, `MIGRATE_ON_BOOT`, `CAMPAIGN_RATE_PER_HOUR`, `BOT_ENABLED` |
+
+   The live-mode list is enforced, not documented: `APP_MODE=live` refuses to boot
+   without those five and prints the exact missing names, so "I forgot one" shows up
+   as a red deploy instead of a service that quietly does nothing.
+
    `TELEGRAM_SESSION_STRING` is **not** in that list on purpose. You do not need it:
    `/login` on the control bot puts the session in the database instead. Leave the
    variable absent — an env value always wins over a stored one, so a stale copy
