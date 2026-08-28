@@ -164,6 +164,11 @@ class ParsedEpisode:
     quality: str | None = None
     quality_rank_value: int | None = None
     release_variant: str | None = None
+    #: Where ``season`` came from: ``"caption"`` (a stated season), ``"hint"`` (the
+    #: channel's configured default) or ``"none"`` (this module filled in 1 so the row
+    #: can exist). Last, not in the middle: this dataclass is built positionally in
+    #: places, and a new field must not shift anyone's arguments.
+    season_source: str = "none"
     file_name: str | None = None
     file_size_bytes: int | None = None
     detected_handles: tuple[str, ...] = ()
@@ -177,6 +182,18 @@ class ParsedEpisode:
         return self.disposition == Disposition.PENDING
 
     @property
+    def season_declared(self) -> bool:
+        """True only when the source itself wrote a season number.
+
+        This is what :func:`app.season.classify` is fed as ``labelled_season``. Passing
+        ``.season`` instead would be a quiet bug with loud consequences: an accepted
+        file with no label gets ``season = 1`` here, so comparing against it would look
+        like "the caption says season 1" and, the moment we were filing season 2, would
+        read as a rewind.
+        """
+        return self.season_source == "caption"
+
+    @property
     def is_multi(self) -> bool:
         return len(self.episodes) > 1
 
@@ -185,14 +202,21 @@ class ParsedEpisode:
             return self.episodes
         return (self.episode,) if self.episode is not None else ()
 
-    def canonical_key(self, episode: int | None = None) -> str:
+    def canonical_key(self, episode: int | None = None, *, season: int | None = None) -> str:
         """Identity for one episode of one release: series + season + episode +
         languages + variant (see :mod:`app.keys`). Quality is deliberately not in
         the episode key — it lives on the variant, which is what makes a late
-        1080p an edit of the same post instead of a second episode."""
+        1080p an edit of the same post instead of a second episode.
+
+        ``season`` overrides the parsed number, and on a season boundary it *must*: the
+        parse of an unlabelled ``Episode 1`` carries the defaulted ``1``, so keying off
+        it alone would give season 2's first episode the same canonical key as season
+        1's — and the dedup that protects a channel from duplicate posts would file the
+        new season's opening episode as a second copy of an old one.
+        """
         return canonical_episode_key(
             self.series or "unknown",
-            self.season if self.season is not None else 1,
+            season if season is not None else (self.season if self.season is not None else 1),
             self.episode if episode is None else episode,
             list(self.languages),
             self.release_variant,
@@ -206,6 +230,8 @@ class ParsedEpisode:
             "series": self.series,
             "series_slug": self.series_slug,
             "season": self.season,
+            "season_source": self.season_source,
+            "season_declared": self.season_declared,
             "episode": self.episode,
             "episodes": list(self.episodes),
             "file_kind": self.file_kind,
@@ -349,6 +375,14 @@ def _expand(first: int, last: str | int | None) -> tuple[int, ...]:
 
 
 def _detect_season(text: str) -> int | None:
+    """The season the *text itself* states. ``None`` means it said nothing.
+
+    The distinction is not pedantry, it is the difference between evidence and a
+    default: :mod:`app.season` treats a season read off the caption as a declared
+    boundary signal, and everything else (channel config, the ``1`` this module fills
+    in for convenience) as no statement at all. A number we invented must never be able
+    to open a season.
+    """
     flat = _flatten(text)
     for pattern in (
         r"\bs(\d{1,2})[\s.]*e(?:p|pisode)?\.?\s*\d",  # S04E16: no boundary after the digits
@@ -539,6 +573,7 @@ def parse_episode(
         series=series,
         series_slug=normalize_title(series) if series else None,
         season=season if season is not None else (1 if accepted else None),
+        season_source=("caption" if _detect_season(combined) is not None else ("hint" if season_hint is not None else "none")),
         episode=episodes[0] if episodes else None,
         episodes=episodes,
         file_kind=file_kind,

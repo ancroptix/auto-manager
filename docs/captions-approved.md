@@ -52,6 +52,17 @@ The same box with `{episode}` swapped for the range `{episode_range}`, and the
 storage bot's **universal link** behind the button. Permanent: the individual
 episode posts are never deleted when this one appears.
 
+Two things have to be true before this text is published at all. Every episode in
+the declared span needs a file behind it, **and** somebody has to have said how long
+the season is — `app.v_season_coverage.season_complete` checks both. Nothing infers a
+finished season from the uploader going quiet for a week, so a weekly show mid-run
+never gets a permanent "Complete Season" post that is wrong. Say it once from the
+control bot and the batch post queues itself:
+
+```text
+/declare dekin no mogura 1 12
+```
+
 ```text
 ✦ Dekin no mogura: The earthbound mole ✦
 
@@ -72,7 +83,7 @@ episode posts are never deleted when this one appears.
 | `{season}` | bare in the destination box (`1`), zero-padded in the archive line (`01`) — as in the two samples |
 | `{episode}` | zero-padded, `01` |
 | `{episode_range}` | `01 - 12`, or `01 - TBA` when the season's length was never stated |
-| `{total_episodes}` | `12`, or `TBA` — never inferred from the highest episode seen |
+| `{total_episodes}` | `12`, or `TBA` — never inferred from the highest episode seen. The only writer of that number is `/declare` on the control bot, which lands in `app.season.first_episode` / `last_episode`; what the source has actually delivered is kept in `observed_first` / `observed_last` and is never printed as a promise |
 | `{audio}` | `Hindi`, or `Hindi + English` for dual/multi audio; `Unknown` if the file said nothing |
 | `{quality}` | the one quality this post/button is about |
 | `{storage_link}` | the link the storage bot returned for exactly this file |

@@ -129,7 +129,7 @@ Open <https://raw.githubusercontent.com/ancroptix/auto-manager/arena/01a04370-au
 → `Ctrl+A`, `Ctrl+C` (it is ~1,320 lines; do not retype any of it) → Supabase dashboard →
 **SQL Editor** → **New query** → paste → **Run**.
 
-One run, once. It creates 27 tables and views, 14 functions and 35 config rows,
+One run, once. It creates 27 tables and views, 14 functions and 38 config rows,
 including the caption text you approved. Re-running it is safe by design — every
 statement is `if not exists`, `or replace`, or guarded by "only if the value still
 equals the placeholder we shipped", which is why your caption edits survive a re-apply

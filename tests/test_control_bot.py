@@ -90,6 +90,10 @@ class FakeDb:
         self.queued: list[tuple[str, Any, int]] = []
         self.leases_released = 0
         self.review_count = 2
+        self.series = [
+            {"id": 7, "title": "Dekin no mogura", "normalized_title": "dekin no mogura"},
+        ]
+        self.writes: list[tuple[str, tuple]] = []
 
     @property
     def connected(self) -> bool:
@@ -108,6 +112,10 @@ class FakeDb:
                 {"key": "ingest.require_hindi_audio", "value": "true"},
                 {"key": "thumbnail.strict_mode", "value": "true"},
             ]
+        if "from app.series" in sql:
+            needle = str(args[0] or "")
+            hits = [row for row in self.series if needle and needle in row["normalized_title"]]
+            return hits or ([] if needle else [dict(row) for row in self.series])
         if "app.job" in sql:
             return list(self.blocked)
         return []
@@ -134,6 +142,10 @@ class FakeDb:
         return None
 
     async def execute(self, sql: str, *args: Any) -> int:
+        if "insert into app.season" in sql:
+            # /declare's write, asserted as (series id, season, count) by those tests.
+            self.writes.append((sql, args))
+            return 1
         if "insert into app.audit_log" in sql:
             self.audit.append((sql, args))
             return 1
@@ -845,6 +857,82 @@ async def test_every_command_the_help_text_advertises_is_routed(command: str) ->
     assert replies[0].text.strip()
 
 
+# ------------------------------------------------------------------ /declare
+async def test_declare_is_refused_before_any_query_without_a_database() -> None:
+    control = ControlBot(api=FakeApi(), db=None, settings=settings(), owner_ids=frozenset({OWNER}))  # type: ignore[arg-type]
+    texts = await say(control, "/declare bleach 1 12")
+    assert texts and "database" in texts[0].lower()
+
+
+async def test_declare_writes_the_number_and_does_not_invent_one() -> None:
+    """The whole point of the command: a season length enters the system by being said."""
+    db = FakeDb()
+    control, _api, _db = bot(db=db)
+    texts = await say(control, "/declare dekin no mogura 1 12")
+    assert "Dekin no mogura" in texts[0] and "12" in texts[0]
+    sql, args = db.writes[-1]
+    assert "first_episode" in sql and "last_episode" in sql
+    # series 7, season 1, and the span twelve episodes implies when nothing says otherwise
+    assert args == (7, 1, 1, 12), args
+
+
+async def test_declare_reads_the_numbers_from_the_end_because_titles_have_spaces() -> None:
+    """"/declare dekin no mogura 2 12" is season two, twelve episodes — the title is
+    whatever is left, which is the only parsing that survives ``No. 8``."""
+    db = FakeDb()
+    control, _api, _db = bot(db=db)
+    await say(control, "/declare dekin no mogura 2 12")
+    assert db.writes[-1][1] == (7, 2, 1, 12), db.writes[-1][1]
+
+
+async def test_declare_tba_clears_the_claim() -> None:
+    db = FakeDb()
+    control, _api, _db = bot(db=db)
+    texts = await say(control, "/declare dekin no mogura 1 tba")
+    assert db.writes[-1][1] == (7, 1, None, None), db.writes[-1][1]
+    assert "undeclared" in texts[0]
+
+
+async def test_declare_refuses_to_pick_between_two_series() -> None:
+    """A guessed series puts a wrong number on somebody else's season."""
+    db = FakeDb()
+    db.series = [
+        {"id": 7, "title": "Dekin no mogura", "normalized_title": "dekin no mogura"},
+        {"id": 8, "title": "Dekin no mogura movie", "normalized_title": "dekin no mogura movie"},
+    ]
+    control, _api, _db = bot(db=db)
+    texts = await say(control, "/declare dekin no mogura 1 12")
+    assert "more than one" in texts[0]
+    assert not db.writes, "it must ask, not write"
+
+
+async def test_declare_refuses_a_non_number_rather_than_guessing_one() -> None:
+    db = FakeDb()
+    control, _api, _db = bot(db=db)
+    texts = await say(control, "/declare dekin no mogura 1 twelve")
+    assert "not a number" in texts[0]
+    assert not db.writes
+
+
+async def test_declare_names_a_series_that_has_never_been_filed() -> None:
+    """Declaring a length for an unknown series would have to create the series row,
+    which is ingest's job; the answer says the row is missing instead."""
+    db = FakeDb()
+    db.series = []
+    control, _api, _db = bot(db=db)
+    texts = await say(control, "/declare unknown show 1 12")
+    assert "no series stored" in texts[0]
+    assert not db.writes
+
+
+async def test_declare_shows_usage_before_touching_the_database() -> None:
+    db = FakeDb()
+    control, _api, _db = bot(db=db)
+    texts = await say(control, "/declare")
+    assert "usage" in texts[0].lower() and "/declare" in texts[0]
+    assert not db.writes
+
+
 def test_the_help_text_advertises_exactly_the_routed_commands() -> None:
     """Guard against the router and the help text drifting apart in either
     direction: an undocumented command is undiscoverable, a documented non-command
@@ -860,6 +948,7 @@ def test_the_help_text_advertises_exactly_the_routed_commands() -> None:
         "/resume",
         "/reconcile",
         "/probe",
+        "/declare",
         "/sessions",
         "/use",
         "/forget",

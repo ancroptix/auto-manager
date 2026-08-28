@@ -61,6 +61,7 @@ HELP = """auto-manager control
 /resume      start claiming again
 /reconcile   reclaim stale leases + queue a reconciliation now
 /probe       ask the storage bot and Channel Help their questions (report arrives here)
+/declare     say how long a season is (Total Episodes, and the batch post)
 /sessions    stored Telegram sessions (never their contents)
 /use <name>  make one session the active account
 /forget <n>  delete a stored session from the database
@@ -76,6 +77,16 @@ command.
 
 This bot answers you and nobody else. It cannot read, post or delete anything in
 your channels — the user session it logs in does the pipeline work."""
+
+
+def _int_or_none(token: str | None) -> int | None:
+    """A positive episode/season count, or None. Deliberately strict: ``"12 eps"`` is a
+    human being casual, not a number to store, and a wrong season length is a public,
+    permanent claim about how much of a show exists."""
+    text = (token or "").strip()
+    if not text.isdigit():
+        return None
+    return int(text)
 
 
 class NeedsPassword(Exception):
@@ -216,6 +227,7 @@ class ControlBot:
             "resume": self._resume,
             "reconcile": self._reconcile,
             "probe": self._probe,
+            "declare": self._declare,
             "sessions": self._sessions,
             "use": self._use,
             "forget": self._forget,
@@ -393,6 +405,139 @@ class ControlBot:
                 "Devices → terminate that session (or all devices), then log in again."
             )
         ]
+
+    async def _declare(self, update: Update, args: list[str]) -> list[Reply]:
+        """``/declare <series> <season> <count|tba>`` — the owner states a season's length.
+
+        This command exists because of one line in the caption box: ``◎ Total Episodes``.
+        The database column is the only honest source for that number, and nothing can
+        learn it from a source channel — a show on a one-week break looks exactly like a
+        finished one from the inside. So the number is *said*, here, and until it is said
+        the caption prints the hedge and the season batch post does not fire.
+
+        Refuses to guess which series is meant, in both directions: a substring that
+        matches two rows gets listed instead of written, and a season with no episodes yet
+        is created rather than dropped, because declaring "25" before episode 1 arrives is
+        the useful direction for that number to travel in.
+        """
+        if self.db is None or not getattr(self.db, "connected", False):
+            return [Reply("the database is not reachable, so I cannot record a season length.")]
+        if len(args) < 2:
+            return [
+                Reply(
+                    "usage: /declare <series> <season> <episodes>\n"
+                    "  /declare dekin no mogura 1 12\n"
+                    "  /declare dekin no mogura 2 tba   (back to not claiming a length)\n\n"
+                    "Until a season is declared, the caption says TBA and the complete-season "
+                    "batch post stays held — I will not infer a total from the highest episode number."
+                )
+            ]
+        # Series titles contain spaces, so the two numbers are read from the *end*:
+        # count last, season before it, everything else is the title. `/declare bleach 13`
+        # is season 1 with thirteen episodes, because the alternative — refusing until the
+        # operator learns a separator — is a command nobody sends correctly on a phone.
+        count_token = args[-1]
+        season_number, series_words = 1, args[:-1]
+        if len(args) >= 3:
+            trailing = _int_or_none(args[-2])
+            if trailing is not None:
+                season_number, series_words = trailing, args[:-2]
+        series = " ".join(series_words).strip()
+        if not series:
+            return [Reply("which series? usage: /declare <series> <season> <episodes>")]
+        if season_number is None or season_number < 0:
+            return [Reply("the season has to be a number, e.g. /declare bleach 2 13")]
+        from .keys import normalize_title
+
+        slug = normalize_title(series.lstrip("@"))
+        rows = await self.db.fetch(
+            """
+            select id, title, normalized_title from app.series
+             where normalized_title = $1 or normalized_title like '%' || $2 || '%'
+             order by id limit 6
+            """,
+            slug,
+            slug,
+        )
+        if not rows:
+            return [
+                Reply(
+                    f"no series stored that matches {series!r}. I only declare against a series "
+                    "I have already filed episodes for; /status shows what exists."
+                )
+            ]
+        if len(rows) > 1:
+            names = "\n".join(f"  · {row['title']}" for row in rows)
+            return [Reply(f"that matches more than one series, so I am not picking:\n{names}")]
+        series_id = int(rows[0]["id"])
+        clear = count_token.strip().lower() in {"tba", "none", "clear", "-"}
+        count = None if clear else _int_or_none(count_token)
+        if count is not None and count <= 0:
+            count = None
+            clear = True
+        if count is None and not clear:
+            return [Reply(f"{count_token!r} is not a number of episodes. Use /declare {series} {season_number} 12")]
+        declared_first, declared_last = await self._declaration_bounds(series_id, season_number, count)
+        await self.db.execute(
+            """
+            insert into app.season (series_id, season_number, first_episode, last_episode, declared_by)
+            values ($1, $2, $3, $4, 'operator')
+            on conflict (series_id, season_number) do update
+               set first_episode = excluded.first_episode,
+                   last_episode  = excluded.last_episode,
+                   declared_by   = excluded.declared_by,
+                   declared_at   = now(),
+                   updated_at    = now()
+            """,
+            series_id,
+            season_number,
+            declared_first,
+            declared_last,
+        )
+        title = rows[0]["title"]
+        count_label = "tba" if clear else str(count)
+        if clear:
+            return [
+                Reply(
+                    f"{title} season {season_number}: length undeclared again. Captions print the "
+                    "TBA line and no batch post goes out for it."
+                )
+            ]
+        span = "" if clear else f" (season {season_number}, episodes {declared_first}-{declared_last})"
+        return [
+            Reply(
+                f"{title} season {season_number}: declared {count_label} episodes{span}.\n\n"
+                "◎ Total Episodes prints that from the next post, and the season now *counts as "
+                "complete* once every episode in the span has a file behind it. This command "
+                "publishes nothing by itself: turning that eligibility into the permanent batch "
+                "post is the publisher's job, and the publish layer is still unwired, so the post "
+                "will not appear silently ahead of the code that is meant to send it. If the source "
+                f"later delivers episode {count + 1}, I will tell you rather than quietly rewriting "
+                "your number."
+            )
+        ]
+
+    async def _declaration_bounds(
+        self, series_id: int, season_number: int, count: int | None
+    ) -> tuple[int | None, int | None]:
+        """Translate "twelve episodes" into the span the schema declares.
+
+        A season numbered 3..14 (a cour split, or a source that starts at 0) means the
+        count has to be added to whatever the season *starts* at, not to 1 — so the start
+        is read from the season row when one exists. If nothing has been filed yet, the
+        ordinary case holds and the season starts at 1.
+        """
+        if count is None:
+            return None, None
+        first = 1
+        rows = await self.db.fetch(
+            "select first_episode from app.season where series_id = $1 and season_number = $2",
+            series_id,
+            season_number,
+        )
+        if rows and rows[0].get("first_episode"):
+            first = int(rows[0]["first_episode"])
+        return first, first + count - 1
 
     # ------------------------------------------------------------------ login
     async def _login(self, update: Update, args: list[str]) -> list[Reply]:

@@ -229,8 +229,15 @@ def primary_footer(handles: Sequence[str] | tuple[str, ...] | list[str] | None =
 # ---------------------------------------------------------------------------
 
 #: What ``◎ Total Episodes`` shows when the season's length was never stated. The
-#: number is only known from ``season.last_episode``; inferring it from the highest
-#: episode seen so far would promise a completion we have not observed.
+#: number comes from the declared span, ``app.season.first_episode``..``last_episode`` — an
+#: owner's statement, written by /declare, never
+#: an observation. ``season.last_episode`` is the highest episode *filed*, and printing
+#: that as a total promises a completion nobody declared: a source that paused at 12 of
+#: 26 would publish "Total Episodes: 12" with a "complete season" claim behind it.
+#:
+#: The two lines in the box read from different places on purpose:
+#: ``❍ Episode: 01 - 12`` describes the archive we actually have (observed span), while
+#: ``◎ Total Episodes`` describes the season (declared length, or TBA).
 TOTAL_UNKNOWN = "TBA"
 
 APPROVED_TEMPLATES: dict[str, str] = {
@@ -390,6 +397,7 @@ def post_values(
     episode: int | str | None = None,
     first_episode: int | str | None = None,
     last_episode: int | str | None = None,
+    declared_episodes: int | str | None = None,
     audio_kind: str | None = None,
     languages: Sequence[str] | None = None,
     quality_list: Sequence[str] | None = None,
@@ -400,6 +408,15 @@ def post_values(
     Both templates use the same placeholder names on purpose: the batch differs
     only in ``{episode_range}``, so an operator editing one box's lines does not
     have to remember which keys the other one expects.
+
+    The caller's ``episode_range`` comes from the *observed* span
+    (``app.season.observed_first`` / ``observed_last``: what arrived). ``declared_episodes``
+    comes from the *declared* span (``app.season.first_episode`` / ``last_episode``, written
+    only by `/declare` on the control bot) and is the only thing that can fill
+    ``{total_episodes}``. Passing the observed number
+    there is not a shortcut, it is the bug: the highest episode filed says when the
+    source last posted, not how long the season is, and a weekly show on a one-week
+    break looks exactly like a finished one.
 
     ``unknown_label`` is the caller's hook for ``caption.total_episodes_unknown``:
     the value lives in ``app.config`` so the wording of a hedge is yours, and this
@@ -415,7 +432,7 @@ def post_values(
         "season": "" if season in (None, "") else str(season).strip(),
         "episode": pad_number(episode),
         "episode_range": episode_range(first_episode, last_episode, unknown_label=unknown_label),
-        "total_episodes": total_episodes(last_episode, unknown_label=unknown_label),
+        "total_episodes": total_episodes(declared_episodes, unknown_label=unknown_label),
         "audio": audio_label(audio_kind, languages),
         "quality_list": ", ".join(str(q) for q in (quality_list or ()) if str(q).strip()),
     }

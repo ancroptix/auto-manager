@@ -25,6 +25,16 @@ and deduplication rule below assumes the operator holds distribution rights to t
 - Title is derived by cross-checking the source channel name against captions and filenames in that channel. Both
   signals must agree before a name is generated (e.g. source `berserk` + episodes of *Berserk* → `Berserk Anime in Hindi`).
 - Destination channels are created automatically when both signals agree; no interactive confirmation is required.
+- The name is capped at Telegram's 128 characters by shortening the title and never the `Anime in Hindi` suffix.
+- **Profile, at creation, before anyone else is involved:** title, photo and bio are set as one ordered step
+  (`set_profile`) so a viewer never meets a half-built channel.
+  - Photo: an operator-chosen image wins; otherwise the cleanest cover already inside the master archive
+    (screened, poster before frame, highest quality, earliest episode); otherwise **nothing**, and the reason is
+    reported. The source channel's picture is never copied — that is a leech's branding, and a destination
+    wearing it is the exact look the screening gate exists to prevent. No image is ever downloaded or re-rendered.
+  - Bio: `templates.channel_about`, seeded empty. A bio describes the operator's channel, so the program leaves it
+    blank rather than inventing marketing copy; editing that config row is the only way text appears.
+  - No public `@username` is ever assigned: a private destination with a handle is a discoverable one.
 - Description template:
 
   ```text
@@ -35,6 +45,12 @@ and deduplication rule below assumes the operator holds distribution rights to t
 - On creation, add `@chelpbot` (Channel Help) as administrator with the permissions its documentation requires:
   post messages, edit messages, delete messages, invite/add users. If confirmation is not received, remove and
   re-add once, then alert the owner.
+  - **Unresolved tension, made configurable rather than decided for the operator:** the implementation's default
+    withholds `can_invite_users` (a publisher that can invite is a publisher that can be used to spam the channel).
+    `bots.channel_help_rights` in `app.config` lists the rights to grant, so following Channel Help's own setup
+    instructions is a config edit; `channels.setup_plan()` reads it and stamps the resulting permission dict onto
+    both admin steps, which is the only place the row is read. `can_add_admins` and `can_ban_users` are refused whatever that row says, and an
+    unrecognised right is an error rather than a silent no-op.
 - Create a short-lived, **one-use** invitation link and send it to the configured main Telegram account. Promote
   only the exact configured numeric `MAIN_ADMIN_USER_ID` with all supported channel admin rights, then revoke the
   invite immediately. An unexpected account using the link is never promoted and the owner is notified.
@@ -45,6 +61,9 @@ and deduplication rule below assumes the operator holds distribution rights to t
 - If only some episodes of a season are available, publish one post per episode.
 - When a complete season becomes available, additionally create one season batch/universal-link post covering the
   available episode range (for example, `Episode 1 - 24`).
+- Completeness is decided by `manifest.should_post_season_batch` over `v_season_coverage`, which needs a declared
+  span *and* a file per episode. The function is built and tested; the code that turns an eligible season into a
+  queued publish job belongs to the unwired publish layer, so no batch post can appear from a config edit alone.
 - **Both forms are retained permanently.** Individual episode posts are never deleted or replaced when the season
   batch post is created, so viewers can still retrieve a single episode.
 
@@ -115,6 +134,25 @@ Both handles are primary and always appear together.
   permanently. If a season has no configured sticker, that season's import pauses rather than posting a wrong sticker.
 - Duplicate season stickers are prevented across restarts and repeated scans.
 - When a channel is created it starts with the operator's sticker pack.
+- A season boundary is decided by `app/seasons.py::classify()`, which is given four facts: the episode number,
+  whether the caption itself named a season, the season being filed and its highest episode, and which seasons of
+  the series already exist. It returns one verdict and never reads the calendar.
+
+  | Verdict | Trigger | Action |
+  | --- | --- | --- |
+  | `first` | the series has no episodes | open season 1 |
+  | `continue` | number above the highest seen in the same season | file it (a gap is recorded, never used as an ending) |
+  | `declared` | the caption names a different season | open that season, and record `boundary_kind = 'declared'` with the evidence |
+  | `reset` | numbering restarts with no caption statement | hold: park the candidate and ask, unless `seasons.confirm_unlabelled_reset` is off, which files it as `boundary_kind = 'inferred'` |
+  | `backtrack` | an old number in the current season | same season; `app/manifest.py` edits the existing post |
+  | `retreat` | a caption naming an older season | never acted on; parked and asked |
+
+  A season number above `MAX_PLAUSIBLE_SEASON` (99) is treated as a typo or an attack, not a season.
+- At a confirmed boundary the closing sticker for the old season is queued **before** the opening sticker for the
+  new one, and the new season's first episode post is held (`publish_hold`) until both have run. Only a confirmed
+  boundary produces stickers, and a season with no content gets no farewell.
+- Stickers are `season_sticker` jobs rather than inline calls: the document id comes from the pack mapping, which is
+  a live-account question, and a job that cannot run yet shows up as blocked instead of failing the ingest.
 
 ## 10. Storage bot
 
@@ -211,7 +249,10 @@ Rules that the formatting has to keep honourable:
   can never disagree about a series name.
 - `{total_episodes}` and the batch's `{episode_range}` come from the season's
   declared length only. An unknown length prints `TBA`; the highest episode number
-  seen is never treated as the total.
+  seen is never treated as the total. The declared span is `app.season.first_episode` / `last_episode`,
+  written **only** by `/declare <series> <season> <count|tba>` on the control bot; ingest writes the
+  span it observed into `observed_first` / `observed_last` and never touches the declared pair.
+  `season_complete` in `app.v_season_coverage` therefore needs a declaration, not a pause in uploads.
 - Every frame line is single-newline separated, because `╭ ┣ ┣ ╰` only reads as a box
   when the strokes are adjacent.
 - A placeholder with no value is reported by name to the publishing job, and the job
@@ -358,21 +399,35 @@ Rules agreed for the bot:
    publish gate agree and the allowlist did not need widening. `@India_crunchyroll` differs from
    the stored `india_crunchyroll` in case only, which Telegram ignores; `branding.footer` was
    updated to the operator's casing in the same migration.
-6. **New:** hashtag policy. The old draft had `#S01E01`-style tags per caption; the approved samples carry none,
+6. ~~Whether a season that has stopped receiving files is a finished season~~ — **answered 2026-08-28, and it
+   turned out to be a bug rather than a decision.** Observed and declared spans are now separate columns, so a
+   weekly source taking a week off no longer satisfies `season_complete` and no "complete season" batch post can go
+   out on the strength of the uploader pausing.
+7. **New:** whether `@chelpbot` receives `can_invite_users`. The spec says Channel Help asks for it; the default
+   withholds it. Settled by `bots.channel_help_rights` rather than by preference — the operator edits one config row.
+8. **New:** hashtag policy. The old draft had `#S01E01`-style tags per caption; the approved samples carry none,
    so no tags are emitted. If hashtags are wanted they belong in the template text, not in code.
 
 ## 19. Repository status
 
-Requirements are agreed. The **runtime skeleton is now built and tested**:
-Supabase schema and queue functions, the checkpoint/resume worker loop, the
-health/status/kill-switch HTTP surface, config with fail-closed live-mode
-validation, and Render deployment as code. 376 tests pass, including the
-migrations executed against a real PostgreSQL cluster.
+Requirements are agreed. The **runtime is built and tested against a real PostgreSQL
+cluster**: the schema, queue and checkpoint functions; source ingest with series/season
+resolution; the thumbnail publish gate; manifest ordering and create-vs-edit; caption
+rendering from the approved templates; destination channel planning; the owner's control
+bot, including logging the spare account in from a chat; and the Render/Supabase deployment
+surface with docs and a CI job.
 
-What is **not** built: all Telegram I/O — source scanning, thumbnail screening,
-archive copies, the storage-bot and Channel Help adapters, sticker mapping, and
-campaign sending. Each unimplemented job kind fails loudly into a `blocked`
-state that `/status` reports, so no feature can pretend to have run.
+Eight job kinds remain **deliberately** unimplemented — `archive_media`, `storage_upload`,
+`link_verify`, `link_health_check`, `publish_post`, `edit_post`, `season_sticker` and
+`join_request_campaign`. Each raises `FeatureNotImplemented` and lands as `blocked`, which
+`/status` reports, because the protocols they depend on (the storage bot's menus, Channel
+Help's message shape, the copy-message call, the sticker pack's document ids, join-request
+delivery) have to be observed once against the real bots before they can be written
+honestly. `app/probe.py` is what obtains those observations from inside the deployment,
+where the network exists; screenshots of the menus work too.
+
+Nothing here is silently skipped: a feature that cannot run yet is a loud blocked job, not
+a green log line.
 
 See [`architecture.md`](architecture.md) for where each promise above is
 enforced and which test proves it.

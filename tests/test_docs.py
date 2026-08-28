@@ -109,6 +109,56 @@ def test_the_expected_schema_size_in_the_setup_doc_is_the_real_number() -> None:
     assert promised and int(promised.group(1)) == tables and int(promised.group(2)) == tables - 1, promised
 
 
+def test_every_test_the_architecture_doc_cites_actually_exists() -> None:
+    """The enforcement table is the doc that claims a promise is *proved* somewhere.
+
+    A citation to a test that was renamed three migrations ago is worse than no citation:
+    it reads like the promise is covered, and the reader has no way to check without
+    grepping. So the table is checked against the suite every run.
+    """
+    names = set()
+    for path in sorted((ROOT / "tests").glob("test_*.py")):
+        names.update(re.findall(r"^\s*(?:async )?def (test_[a-z0-9_]+)", path.read_text(encoding="utf-8"), re.M))
+    assert len(names) > 200, "the scan is not seeing the suite"
+    cited = set(re.findall(r"`(test_[a-z0-9_]+)`", read("docs/architecture.md")))
+    assert cited, "the table stopped citing tests at all"
+    missing = sorted(cited - names)
+    assert not missing, f"docs/architecture.md cites tests that do not exist: {missing}"
+
+
+def test_the_config_row_count_in_the_docs_is_the_real_number() -> None:
+    """`select count(*) from app.config` is the operator's second sanity check, so the
+    number the docs promise has to be the number the migrations actually seed."""
+    from conftest import config_row_count
+
+    count = config_row_count()
+    assert count >= 30, "the scan is not seeing the inserts"
+    setup = read("docs/setup-supabase.md")
+    claimed = re.search(r"\*\*(\d+)\*\* config keys", setup)
+    assert claimed, "setup-supabase.md stopped stating how many config keys to expect"
+    assert int(claimed.group(1)) == count, f"docs promise {claimed.group(1)}, migrations seed {count}"
+    checklist = re.search(r"(\d+) config rows", read("docs/launch-checklist.md"))
+    assert checklist and int(checklist.group(1)) == count, "the checklist disagrees with the setup doc"
+
+
+def test_the_season_and_channel_policies_describe_the_code_that_exists() -> None:
+    """The operator asked for these two mechanics in prose, so the prose lives in the
+    repository. It is checked against the code it documents: a doc that names a setup step
+    or a verdict the code no longer has is worse than no doc, because it gets trusted."""
+    from app.channels import SETUP_STEPS
+    from app.seasons import Verdict
+
+    doc = read("docs/seasons-and-channels.md")
+    assert doc.count("\n## ") >= 2, "the document lost one of its two halves"
+    for step in SETUP_STEPS:
+        assert f"`{step.name}`" in doc, f"{step.name} is a setup step nobody documented"
+    for verdict in Verdict:
+        assert f"`{verdict.value}`" in doc, f"{verdict.value} is a verdict nobody documented"
+    for claim in ("/declare", "observed_first", "can_invite_users"):
+        assert claim in doc, f"the policy document stopped naming {claim}"
+    assert "seasons-and-channels.md" in read("README.md"), "the answer is unreachable from the front page"
+
+
 def test_the_bundle_is_offered_as_the_recommended_path() -> None:
     doc = read("docs/setup-supabase.md")
     assert "ops/apply-all.sql" in doc and "recommended" in doc
@@ -245,6 +295,14 @@ def test_the_checklist_only_names_files_that_exist() -> None:
 
 def test_architecture_lists_the_new_modules() -> None:
     doc = read("docs/architecture.md")
-    for name in ("botapi.py", "controlbot.py", "sessions.py", "mtproto_login.py", "0003_control_bot.sql"):
+    for name in (
+        "botapi.py",
+        "controlbot.py",
+        "sessions.py",
+        "mtproto_login.py",
+        "0003_control_bot.sql",
+        "seasons.py",
+        "0005_seasons_and_profile.sql",
+    ):
         assert name in doc, f"{name} exists but is not in the layout map"
     assert "getUpdates" in doc and "webhook" in doc.lower(), "the polling choice needs its reason on record"

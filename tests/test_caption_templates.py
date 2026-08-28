@@ -94,7 +94,11 @@ def post(**overrides):
         "subtitle": "The earthbound mole",
         "season": 1,
         "episode": 1,
+        "first_episode": 1,
         "last_episode": 12,
+        # The operator declared twelve; the box's Total Episodes line prints that and
+        # nothing else. See test_total_episodes_ignores_the_observed_high_water_mark.
+        "declared_episodes": 12,
         "audio_kind": "hindi",
     }
     values.update(overrides)
@@ -120,6 +124,26 @@ def test_season_batch_is_the_sample_with_a_range() -> None:
     )
     assert text == BATCH_SAMPLE
     assert missing == ()
+
+
+def test_total_episodes_ignores_the_observed_high_water_mark() -> None:
+    """The one placeholder where being wrong is unrecoverable, so it is pinned twice.
+
+    A source that paused after episode 12 of 26 produces exactly the same rows as a
+    finished 12-episode season. ``last_episode`` therefore cannot answer ``◎ Total
+    Episodes`` — only the declared count can, and with no declaration the line says TBA
+    while the episode range still reports what we hold.
+    """
+    observed_only = render_caption(None, post(declared_episodes=None), key="templates.episode_post")[0]
+    assert "◎ 𝗧𝗼𝘁𝗮𝗹 𝗘𝗽𝗶𝘀𝗼𝗱𝗲𝘀: TBA" in observed_only, observed_only
+    assert "❍ 𝗘𝗽𝗶𝘀𝗼𝗱𝗲: 01" in observed_only  # the post itself is still complete
+
+    declared = render_caption(None, post(declared_episodes=26), key="templates.season_post")[0]
+    assert "◎ 𝗧𝗼𝘁𝗮𝗹 𝗘𝗽𝗶𝘀𝗼𝗱𝗲𝘀: 26" in declared, declared
+    # The batch line still describes the archive we have, not the season we hope for.
+    assert "❍ 𝗘𝗽𝗶𝘀𝗼𝗱𝗲: 01 - 12" in declared, declared
+    zero = render_caption(None, post(declared_episodes=0), key="templates.episode_post")[0]
+    assert "TBA" in zero, "a declared count of zero is no declaration, and 0 is a claim"
 
 
 def test_the_box_is_not_double_spaced() -> None:

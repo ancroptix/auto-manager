@@ -217,19 +217,20 @@ def season_coverage(
 ) -> Coverage:
     """Which episodes exist, and whether the season is finished.
 
-    ``expected`` prefers an explicit count, then ``last - first + 1``. Without
-    either, completeness is unknowable and the caller must not claim it.
+    ``expected`` is the *declared* length and nothing else — for a season row, that is
+    ``last_episode - first_episode + 1`` over the **declared** columns, which only
+    ``/declare`` writes. The observed span (``observed_first``/``observed_last``) says what
+    we hold and must never be passed in as a declaration. The reason is a bug that used to
+    live here and in
+    ``app.v_season_coverage``: ``last_episode`` was written as the highest episode filed,
+    and completeness was computed from it, so a source that paused after episode 12 of 26
+    produced a permanent "Season Complete" post. Deriving completeness from the highest
+    number we happen to have calls every airing show finished and is wrong by next Tuesday.
     """
     present = sort_episode_numbers(episode_numbers)
     low = first if first is not None else (present[0] if present else None)
     high = last if last is not None else (present[-1] if present else None)
     expected = expected_episodes
-    if expected is None and last is not None and low is not None and high is not None:
-        # Only an *explicit* last-episode (app.season.last_episode) declares a
-        # season's length. Deriving it from the highest number we happen to have
-        # would call every airing show complete and send out a "Season
-        # Complete" post that is wrong by next Tuesday.
-        expected = int(high) - int(low) + 1
     missing: tuple[int, ...] = ()
     if expected and low is not None:
         wanted = set(range(int(low), int(low) + int(expected)))

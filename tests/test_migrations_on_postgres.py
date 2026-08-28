@@ -15,6 +15,8 @@ import json
 import socket
 from pathlib import Path
 
+from conftest import config_row_count
+
 import pytest
 
 psycopg = pytest.importorskip("psycopg", reason="psycopg[binary] is a dev dependency")
@@ -656,9 +658,24 @@ def test_season_coverage_needs_files_not_just_row_counts(conn):
             "insert into app.media_variant (episode_id, quality, quality_rank) values (%s, '720p', 3)",
             (episode_ids[1],),
         )
+        # The phase 0005 added, and the whole point of it: the season row is dropped
+        # back to "undeclared" with the same two episodes and the same files, and now it
+        # must NOT read as finished. This is the pause bug — a source that stopped at 2 of
+        # 26 is indistinguishable from a 2-episode season by observation alone.
+        cur.execute(
+            "update app.season set first_episode = null, last_episode = null, "
+            "observed_first = 1, observed_last = 2 where id = %s",
+            (season_id,),
+        )
+        assert complete() is False, "what the source delivered is not what the season is"
+        cur.execute("update app.season set first_episode = 1, last_episode = 2 where id = %s", (season_id,))
         assert complete() is True, "2 of 2 declared episodes, each with a file"
         cur.execute("update app.season set last_episode = 3 where id = %s", (season_id,))
-        assert complete() is False, "a newly declared episode reopens the season"
+        assert complete() is False, "the owner raising the declared length reopens the season"
+        cur.execute("delete from app.media_variant where episode_id = any(%s::bigint[])", (episode_ids,))
+        cur.execute("delete from app.episode where season_id = %s", (season_id,))
+        cur.execute("delete from app.season where id = %s", (season_id,))
+        cur.execute("delete from app.series where id = %s", (series_id,))
 
 
 def test_updated_at_trigger_moves(conn, seed):
@@ -821,8 +838,16 @@ def test_first_boot_installs_the_schema_into_an_empty_database(conn):
         )
         # 0003 adds one table (app.telegram_session, which is what makes the
         # control bot's /login possible) and four operator-tunable settings; 0004
-        # adds three more keys for the approved captions (no new relation).
-        assert (counts["rel"], counts["fn"], counts["cfg"]) == (27, 14, 35)
+        # adds three more keys for the approved captions; 0005 adds two keys and no
+        # relation at all — it only widens existing tables, which is what keeps every
+        # file in this directory individually re-runnable.
+        # The config total is derived from the migration files (see conftest), because a
+        # typed number here went stale the same afternoon 0004 was written.
+        expected_config = config_row_count()
+        assert (counts["rel"], counts["fn"]) == (27, 14)
+        assert counts["cfg"] == expected_config, (
+            f"the database holds {counts['cfg']} config rows, the migrations seed {expected_config}"
+        )
         # A second boot must be a no-op, never a re-run that fights live data.
         assert await db.schema_missing() is False
         # And the installer is itself replayable.
@@ -1098,10 +1123,17 @@ def test_ingest_writes_the_rows_the_ladder_reads(conn):
         assert batch["file_kind"] == "batch" and batch["needs_batch_handling"] is True
         assert len(batch["episodes"]) == 3 and batch["variants"] == []
         season = await db.fetchrow(
-            "select first_episode, last_episode from app.season where series_id = (select series_id from app.source_channel where id = $1) and season_number = 2",
+            "select observed_first, observed_last, first_episode, last_episode, boundary_kind"
+            "  from app.season where series_id = (select series_id from app.source_channel where id = $1)"
+            "   and season_number = 2",
             channel_id,
         )
-        assert (season["first_episode"], season["last_episode"]) == (1, 3)
+        # The span ingest recorded is what arrived, in the *observed* columns. The
+        # declared pair stays empty: a filename saying [01-03] describes one archive,
+        # not a season of three episodes.
+        assert (season["observed_first"], season["observed_last"]) == (1, 3), dict(season)
+        assert (season["first_episode"], season["last_episode"]) == (None, None), dict(season)
+        assert season["boundary_kind"] == "declared", season
 
         # --- the series row is created from the file name when the channel has none
         loose_channel, loose_series = _ingest_channel(
@@ -1544,3 +1576,282 @@ def test_series_subtitle_column_exists_and_is_optional(conn) -> None:
         row = cur.fetchone()
     assert row is not None, "app.series.subtitle was not added"
     assert row[0] == "YES"
+
+
+# ------------------------------------------------------- season boundaries (0005)
+def _ingest_settings():
+    from app.config import Settings
+
+    return Settings(_env_file=None, database_url=pg_uri, db_ssl="disable", worker_enabled=False)
+
+
+def test_a_declared_season_boundary_files_into_the_new_season_and_queues_both_stickers(conn):
+    """The operator's own scenario, end to end, against the real schema.
+
+    Twelve episodes of season 1, then a caption that says S2 and restarts at 1. The
+    promised behaviour is: season 2 opens, the *closing* sticker goes first, then the
+    new season's sticker, then uploads continue. What must not happen is ep 1 of season 2
+    landing on top of ep 1 of season 1 — that collision is what the season row and the
+    canonical key exist to prevent, so it is asserted here rather than trusted.
+    """
+    import asyncio
+
+    from app.db import Database
+    from app.ingest import record_message
+
+    channel_id, series_id = _ingest_channel(conn, "@yc_boundary", -100700097, "Boundary Show")
+    db = Database(_ingest_settings())
+
+    async def scenario():
+        assert await db.connect(), await db.last_error
+        for number in range(1, 13):
+            report = await record_message(
+                db,
+                source_channel_id=channel_id,
+                message_id=7000 + number,
+                media_type="document",
+                file_name=f"Boundary Show S01E{number:02d} 720p Hindi.mkv",
+                raw_caption="t.me/ycanime",
+                fingerprint=f"b-s1-{number}",
+            )
+            assert report["disposition"] == "accepted", report
+        season_two = await record_message(
+            db,
+            source_channel_id=channel_id,
+            message_id=7101,
+            media_type="document",
+            file_name="Boundary Show S02E01 720p Hindi.mkv",
+            raw_caption="t.me/ycanime",
+            fingerprint="b-s2-1",
+        )
+        assert season_two["disposition"] == "accepted", season_two
+        assert season_two["season"]["verdict"] == "declared", season_two
+        rows = await db.fetch(
+            "select e.episode_number, s.season_number, e.canonical_key"
+            "  from app.episode e join app.season s on s.id = e.season_id"
+            " where s.series_id = $1 order by s.season_number, e.episode_number",
+            series_id,
+        )
+        keys = [f"{r['season_number']}:{r['episode_number']}" for r in rows]
+        assert keys == [f"1:{n}" for n in range(1, 13)] + ["2:1"], keys
+        assert len({r["canonical_key"] for r in rows}) == len(rows), "season 2 ep 1 must not equal season 1 ep 1"
+        jobs = await db.fetch(
+            "select payload->>'kind' as kind, payload->>'season' as season, status"
+            "  from app.job where kind = 'season_sticker' order by id"
+        )
+        return rows, jobs, season_two
+
+    _rows, jobs, season_two = asyncio.run(scenario())
+    assert [(job["kind"], job["season"]) for job in jobs] == [("closing", "1"), ("opening", "2")], jobs
+    assert [job["status"] for job in jobs] == ["queued", "queued"], "both stickers before any new post"
+    kinds = [step["kind"] for step in season_two["stickers"]]
+    assert kinds == ["closing", "opening"], "the report must show the same order the jobs have"
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "select season_number, boundary_kind, observed_first, observed_last, "
+            "       first_episode, last_episode from app.season"
+            " where series_id = %s order by season_number",
+            (series_id,),
+        )
+        rows = cur.fetchall()
+    assert [(r[0], r[1]) for r in rows] == [(1, None), (2, "declared")], rows
+    # Season 1's observed span must not have been inflated by season 2's episode 1:
+    # the numbers went back to 1, and that is a new season, not a shorter one.
+    assert rows[0][2] == 1 and rows[0][3] == 12, rows[0]
+    assert rows[1][2] == 1 and rows[1][3] == 1, rows[1]
+    # Neither season claims a length, because nothing was declared. The caption prints
+    # TBA and the batch post stays held — that is the correct answer to "twelve episodes
+    # arrived and then the source started over".
+    assert rows[0][4] is None and rows[0][5] is None, rows[0]
+    assert rows[1][4] is None and rows[1][5] is None, rows[1]
+    with conn.cursor() as cur:
+        cur.execute(
+            "select season_complete from app.v_season_coverage where season_id = ("
+            " select id from app.season where series_id = %s and season_number = 1)",
+            (series_id,),
+        )
+        (complete,) = cur.fetchone()
+    # Twelve of twelve filed, and the season is still not "complete": nobody said how
+    # long it is. The closing sticker goes out because the *source* ended the season; the
+    # batch post waits because completeness is a claim about the show, not a milestone.
+    assert complete is False
+
+
+def test_an_unlabelled_restart_is_held_and_files_nothing(conn):
+    """Same numbering reset, no ``S2`` in the caption: hold, ask, write nothing public.
+
+    The dangerous failure here is silent — season 2's episode 1 filed as a *duplicate of*
+    season 1's episode 1 would add a variant to a published post and stretch season 1's
+    span. So the assertion is that the episode count did not move at all.
+    """
+    import asyncio
+
+    from app.db import Database
+    from app.ingest import record_message
+
+    channel_id, series_id = _ingest_channel(conn, "@yc_reset", -100700096, "Reset Show")
+    db = Database(_ingest_settings())
+
+    async def scenario():
+        assert await db.connect(), await db.last_error
+        for number in (1, 2, 3, 11, 12):
+            await record_message(
+                db,
+                source_channel_id=channel_id,
+                message_id=6000 + number,
+                media_type="document",
+                file_name=f"Reset Show Episode {number:02d} 720p Hindi.mkv",
+                raw_caption="t.me/ycanime",
+                fingerprint=f"r-{number}",
+            )
+        held = await record_message(
+            db,
+            source_channel_id=channel_id,
+            message_id=6500,
+            media_type="document",
+            file_name="Reset Show Episode 01 720p Hindi.mkv",
+            raw_caption="t.me/ycanime",
+            fingerprint="r-restart",
+        )
+        count = await db.fetchval(
+            "select count(*) from app.episode e join app.season s on s.id = e.season_id where s.series_id = $1",
+            series_id,
+        )
+        variants = await db.fetchval(
+            "select count(*) from app.media_variant v where v.episode_id in"
+            " (select e.id from app.episode e join app.season s on s.id = e.season_id where s.series_id = $1)",
+            series_id,
+        )
+        candidate = await db.fetchrow(
+            "select disposition, reason from app.source_candidate where id = $1", held["candidate_id"]
+        )
+        stickers = await db.fetchval(
+            "select count(*) from app.job where kind = 'season_sticker' and"
+            " season_id in (select id from app.season where series_id = $1)",
+            series_id,
+        )
+        return held, int(count), int(variants), candidate, int(stickers)
+
+    held, episodes, variants, candidate, stickers = asyncio.run(scenario())
+    assert held["season"]["verdict"] == "reset", held
+    assert held.get("needs_review") is True and "confirmation" in held["held_reason"]
+    assert episodes == 5 and variants == 5, "a held episode must create nothing at all"
+    assert stickers == 0, "no farewell sticker on a season that may not have ended"
+    assert candidate["disposition"] == "pending"
+    assert "season boundary unconfirmed" in candidate["reason"]
+
+
+def test_the_confirm_knob_off_turns_a_reset_into_an_inferred_season(conn):
+    """``seasons.confirm_unlabelled_reset = false`` means "trust this channel's restarts".
+
+    The season still opens and its sticker still goes out — that is what the operator
+    asked for — but the row says *inferred*, so a season created from arithmetic can be
+    told apart from one the source stated, forever and after the logs have rotated.
+    """
+    import asyncio
+
+    from app.db import Database
+    from app.ingest import record_message
+
+    channel_id, series_id = _ingest_channel(conn, "@yc_trusted", -100700095, "Trusted Show")
+    conn.execute("update app.config set value = 'false'::jsonb where key = 'seasons.confirm_unlabelled_reset'")
+    db = Database(_ingest_settings())
+
+    async def scenario():
+        assert await db.connect(), await db.last_error
+        for number in range(1, 13):
+            await record_message(
+                db,
+                source_channel_id=channel_id,
+                message_id=5000 + number,
+                media_type="document",
+                file_name=f"Trusted Show Episode {number:02d} 720p Hindi.mkv",
+                raw_caption="t.me/ycanime",
+                fingerprint=f"t-{number}",
+            )
+        report = await record_message(
+            db,
+            source_channel_id=channel_id,
+            message_id=5101,
+            media_type="document",
+            file_name="Trusted Show Episode 01 720p Hindi.mkv",
+            raw_caption="t.me/ycanime",
+            fingerprint="t-restart",
+        )
+        jobs = await db.fetch(
+            "select payload->>'kind' as kind from app.job where kind = 'season_sticker' order by id"
+        )
+        return report, [job["kind"] for job in jobs]
+
+    try:
+        report, kinds = asyncio.run(scenario())
+        assert report["season"]["verdict"] == "declared" and report["disposition"] == "accepted", report
+        assert "inferred" in report["season"]["reason"], report["season"]
+        assert kinds == ["closing", "opening"], kinds
+        with conn.cursor() as cur:
+            cur.execute(
+                "select season_number, boundary_kind, declared_by, first_episode, last_episode "
+                "from app.season where series_id = %s order by season_number",
+                (series_id,),
+            )
+            rows = cur.fetchall()
+        assert [(r[0], r[1]) for r in rows] == [(1, None), (2, "inferred")], rows
+        # Inferred is a provenance, not a declaration: no length is claimed either way.
+        assert all(r[3] is None and r[4] is None for r in rows), rows
+    finally:
+        conn.execute("update app.config set value = 'true'::jsonb where key = 'seasons.confirm_unlabelled_reset'")
+
+
+def test_season_completeness_needs_a_declaration_not_a_pause(conn, seed):
+    """The bug 0005 kills, on the view the dashboard and the batch post both read.
+
+    ``last_episode`` is filled from what the source delivered, and the old view computed
+    ``season_complete`` from it. A season whose *observed* span happens to match its
+    episode count was therefore "complete" — and a permanent "complete season" post goes
+    out on the strength of the uploader stopping for the week.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "insert into app.series (title, normalized_title) values ('Paused Show', 'paused show') "
+            "on conflict (normalized_title) do nothing"
+        )
+        cur.execute("select id from app.series where normalized_title = 'paused show'")
+        paused_id = cur.fetchone()[0]
+        # Exactly what ingest leaves behind: the observed span filled in, the declared
+        # pair empty. Under 0001-0004 those two columns were the same pair, which is how
+        # a pause became a completion.
+        cur.execute(
+            "insert into app.season (series_id, season_number, observed_first, observed_last) "
+            "values (%s, 1, 1, 1) returning id",
+            (paused_id,),
+        )
+        season_id = cur.fetchone()[0]
+        cur.execute(
+            "insert into app.episode (season_id, episode_number, canonical_key) values (%s, 1, %s)",
+            (season_id, "paused|s01|e01|hindi"),
+        )
+        cur.execute(
+            "select episodes, season_complete from app.v_season_coverage where season_id = %s", (season_id,)
+        )
+        episodes, complete = cur.fetchone()
+        # One episode filed, and the *declared* span empty because ingest no longer fills
+        # it: not complete. This is the whole fix in one row.
+        assert episodes == 1 and complete is False, "an observed episode is not a declared season"
+        episode_id = cur.execute(
+            "select id from app.episode where season_id = %s", (season_id,)
+        ).fetchone()[0]
+        cur.execute(
+            "insert into app.media_variant (episode_id, quality, quality_rank, status) values (%s, '720p', 3, 'published')",
+            (episode_id,),
+        )
+        cur.execute("select season_complete from app.v_season_coverage where season_id = %s", (season_id,))
+        assert cur.fetchone()[0] is False, "a file and an episode still do not declare a length"
+        # The owner's /declare is the only thing that can flip it.
+        cur.execute("update app.season set first_episode = 1, last_episode = 1 where id = %s", (season_id,))
+        cur.execute("select season_complete from app.v_season_coverage where season_id = %s", (season_id,))
+        assert cur.fetchone()[0] is True, "declared span, the episode, and a file: now it is complete"
+        cur.execute("delete from app.media_variant where episode_id = %s", (episode_id,))
+        cur.execute("delete from app.episode where season_id = %s", (season_id,))
+        cur.execute("delete from app.season where id = %s", (season_id,))
+        cur.execute("delete from app.series where id = %s", (paused_id,))

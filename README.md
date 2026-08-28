@@ -3,12 +3,17 @@
 A modular Telegram media-management system for content the operator owns or is
 authorized to distribute.
 
-**Status:** the runtime skeleton and the whole decision layer are built and
-tested (376 tests): parsing, the Hindi-scope rule, thumbnail screening, manifest
-order, the create-vs-edit choice, and destination-channel setup. Source scanning,
-archive copies, storage-bot menus and Channel Help publishing are **not**
-implemented — they need a logged-in session and fail loudly into a `blocked`
-queue state rather than pretending to run.
+**Status:** the decision layer and the runtime around it are built and tested —
+parsing, the Hindi-scope rule, season boundaries, manifest order, the create-vs-edit
+choice, caption rendering from the formats you approved, the ordered destination-channel
+setup plan,
+scanning into the database, and the owner's control bot (including logging the spare
+account in from a chat). What is **not** implemented is the eight job kinds that need
+another bot's protocol observed once — archive copies, the storage bot's menus,
+Channel Help publishing, link checks, sticker posting, join-request campaigns. Each
+one fails loudly into a `blocked` queue state that `/status` reports, rather than
+pretending to run. [`docs/launch-checklist.md`](docs/launch-checklist.md) is the
+short list of what needs your accounts.
 
 * Spec and agreed decisions: [`docs/requirements-draft.md`](docs/requirements-draft.md)
 * What exists and where each rule is enforced: [`docs/architecture.md`](docs/architecture.md)
@@ -16,6 +21,8 @@ queue state rather than pretending to run.
 * Starting out, in order, click by click: [`docs/launch-checklist.md`](docs/launch-checklist.md)
   From your phone: [`docs/control-bot.md`](docs/control-bot.md) — and the published wording
   you approved, rendered: [`docs/captions-approved.md`](docs/captions-approved.md)
+* How a destination channel is created and furnished, and how a new season is recognised:
+  [`docs/seasons-and-channels.md`](docs/seasons-and-channels.md)
 
 ## Pipeline
 
@@ -41,19 +48,20 @@ Owner private Telegram chat  (control commands, review queues, approvals)
 
 | Component | State |
 | --- | --- |
-| Postgres schema: 23 tables + 4 views, constraints, RLS | built, executed against real Postgres in tests |
+| Postgres schema: 23 tables + 4 views, constraints, RLS, 38 seeded config keys | built, executed against real Postgres in tests |
 | Queue: lease-based claim, stage checkpoints, exponential retry, blocked state | built, tested |
 | Restart recovery (`release_expired_locks` + boot reconciliation) | built, tested, verified live |
 | HTTP surface: `/health` `/ready` `/status` `/control/pause\|resume\|reconcile\|shutdown` | built, tested, verified live |
 | Config: fail-closed live mode, masked secrets, pooler detection | built, tested |
 | Deployment: `render.yaml` Blueprint, UptimeRobot `/health`, Dockerfile deliberately absent | built, tested |
 | Credential guard (`scripts/check_secrets.py`) + CI (`ops/ci.yml`) | built, tested |
-| Control bot: `/status` `/pause` `/probe` `/login` `/sessions` (owner-only, [docs](docs/control-bot.md)) | built, 49 tests; Telegram-side behaviour unverified from this network |
+| Control bot: `/status` `/pause` `/probe` `/login` `/sessions` `/declare` (owner-only, [docs](docs/control-bot.md)) | built; tested against a fake transport, so Telegram-side behaviour is unverified from this network |
 | Local login helper (`scripts/login.py`) | kept as the offline fallback; the bot is the default path |
-| Source scanning / metadata parsing | **not built** — needs filename patterns |
-| Thumbnail screening (allowlist: `@ycanime`, `@india_crunchyroll`) | **not built** — the rule is agreed, the detector is not |
-| Archive copy, `@anime_hindifilesbot` adapter, Channel Help adapter | **not built** — needs one authenticated test run |
-| Season sticker mapping, join-request campaigns | **not built** — template and mapping still open |
+| Source scanning and metadata parsing (series, season, episode, language, quality) | built (`normalize.py`, `ingest.py`); the live listener that feeds it needs a session |
+| Season boundaries: declared vs inferred, sticker ordering, publish hold | built (`seasons.py`, [docs](docs/seasons-and-channels.md)) |
+| Thumbnail screening (allowlist: `@YCAnime`, `@india_crunchyroll`) | built as a gate (`thumbnails.py`); with no image evidence it parks for your review rather than guessing |
+| Archive copy, `@anime_hindifilesbot` adapter, Channel Help adapter | **not built** — needs one authenticated test run (`/probe`) |
+| Season sticker *posting*, join-request campaigns | **not built** — the pack's document ids and the request template are still open; the boundary logic above is not |
 
 ## Run it locally
 

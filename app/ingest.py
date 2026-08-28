@@ -24,9 +24,10 @@ Three properties matter more than the rest:
 
 from __future__ import annotations
 
+import json
 from typing import Any, Mapping
 
-from . import normalize
+from . import normalize, seasons
 from .keys import (
     discovery_key,
     normalize_title,
@@ -34,7 +35,7 @@ from .keys import (
 )
 from .stages import JobKind, JobStage
 
-__all__ = ["record_message", "SOURCE_MODE_IGNORED"]
+__all__ = ["record_message", "season_stream", "SOURCE_MODE_IGNORED"]
 
 SOURCE_MODE_IGNORED = "ignore"
 
@@ -156,14 +157,67 @@ async def record_message(
         return report
 
     series_id = await _resolve_series(db, channel["series_id"], parsed)
-    season_id = await _resolve_season(db, series_id, parsed)
-    report["series_id"], report["season_id"] = series_id, season_id
+
+    # Is this the start of a new season? Answered before any row is written, because
+    # the season number is part of every episode's canonical key: file one season-2
+    # episode 1 into season 1 and the damage is a duplicate post, not a typo.
+    stream = await season_stream(db, series_id)
+    boundary = seasons.classify(
+        episode=parsed.episode,
+        labelled_season=parsed.season if parsed.season_declared else None,
+        current_season=stream["current_season"],
+        highest=stream["highest"],
+        populated=stream["populated"],
+        file_kind=parsed.file_kind,
+    )
+    confirm_first = bool(await db.config("seasons.confirm_unlabelled_reset", True))
+    if not confirm_first:
+        # The operator has said this channel may be trusted: an unlabelled restart
+        # becomes an *inferred* boundary instead of a question. Everything downstream —
+        # stickers, the season row, the caption's Total Episodes — then behaves exactly
+        # as it does for a declared one, with the provenance recorded as inferred.
+        boundary = seasons.accept_as_inferred(boundary)
+    if confirm_first and boundary.verdict is seasons.Verdict.RESET:
+        report["season"] = {
+            "verdict": boundary.verdict.value,
+            "season": boundary.season,
+            "reason": boundary.reason,
+            "evidence": boundary.evidence,
+        }
+        # Held, not filed. The source restarted its numbering without ever writing a
+        # season label, which reads like a new season and might be one — but the two
+        # wrong answers here (duplicate "Episode 01" posts, or a season 1 that quietly
+        # contains season 2) are both permanent and public.
+        await db.execute(
+            "update app.source_candidate set disposition = 'pending', reason = $2 where id = $1",
+            candidate_id,
+            f"season boundary unconfirmed: {boundary.reason}",
+        )
+        report["disposition"] = "pending"
+        report["needs_review"] = True
+        report["held_reason"] = boundary.reason
+        return report
+
+    # Reported after the knob has been applied, because /status must describe the decision
+    # that was taken, not the one that was overridden on the way to it.
+    report["season"] = {
+        "verdict": boundary.verdict.value,
+        "season": boundary.season,
+        "reason": boundary.reason,
+        "evidence": boundary.evidence,
+        "asked_owner_first": boundary.verdict is seasons.Verdict.RESET,
+    }
+    season_id = await _resolve_season(db, series_id, parsed, boundary=boundary)
+    season_number = int(boundary.season)
+    report["series_id"], report["season_id"], report["season_number"] = series_id, season_id, season_number
+    if boundary.is_boundary:
+        await _queue_transition_stickers(db, boundary, season_id=season_id, stream=stream, report=report)
 
     if parsed.file_kind == "batch":
         # Episodes are recorded (coverage is real information), but no variant is
         # invented from one archive — see the module docstring.
         for number in parsed.episode_numbers():
-            episode_id = await _resolve_episode(db, season_id, parsed, number)
+            episode_id = await _resolve_episode(db, season_id, parsed, number, season_number=season_number)
             report["episodes"].append(episode_id)
         report["needs_batch_handling"] = True
         report["batch_reason"] = (
@@ -188,7 +242,7 @@ async def record_message(
         return report
 
     for number in parsed.episode_numbers():
-        episode_id = await _resolve_episode(db, season_id, parsed, number)
+        episode_id = await _resolve_episode(db, season_id, parsed, number, season_number=season_number)
         report["episodes"].append(episode_id)
         variant_id = await _resolve_variant(
             db,
@@ -238,21 +292,130 @@ async def _resolve_series(db: Any, channel_series_id: int | None, parsed: normal
     )
 
 
-async def _resolve_season(db: Any, series_id: int, parsed: normalize.ParsedEpisode) -> int:
-    season_number = parsed.season if parsed.season is not None else 1
+async def season_stream(db: Any, series_id: int) -> dict[str, Any]:
+    """What this series looks like from the filing cabinet's point of view.
+
+    One query, because ingest runs per message and must not fan out into three: the
+    highest season number we have a row for, the largest episode number filed inside it,
+    and which seasons actually contain episodes. ``current_season`` deliberately takes
+    the highest *season number* rather than "the most recently touched" — after a
+    restart mid-backfill, recency would point at whatever the sweep reached last and a
+    season could be opened twice.
+    """
+    rows = await db.fetch(
+        """
+        select s.season_number,
+               count(e.id) as episodes,
+               max(e.episode_number) as highest
+          from app.season s
+          left join app.episode e on e.season_id = s.id
+         where s.series_id = $1
+         group by s.season_number
+         order by s.season_number
+        """,
+        series_id,
+    )
+    if not rows:
+        return {"current_season": 1, "highest": None, "populated": [], "seasons": []}
+    seasons_ = [dict(row) for row in rows]
+    numbers = [int(row["season_number"]) for row in seasons_]
+    current = max(numbers)
+    row = next(r for r in seasons_ if int(r["season_number"]) == current)
+    return {
+        "current_season": current,
+        "highest": int(row["highest"]) if row["highest"] is not None else None,
+        "episodes_in_current": int(row["episodes"] or 0),
+        "populated": [int(r["season_number"]) for r in seasons_ if int(r["episodes"] or 0) > 0],
+        "seasons": numbers,
+    }
+
+
+def _boundary_kind(boundary: seasons.Boundary | None) -> str | None:
+    """`declared` or `inferred`, for ``app.season.boundary_kind`` — or NULL.
+
+    A season opened by a caption is a different kind of fact from one opened by a
+    numbering restart we accepted on the operator's word, and the column is where that
+    difference survives after the logs have rotated.
+    """
+    if boundary is None or not boundary.is_boundary:
+        return None
+    return "inferred" if boundary.evidence.get("accepted") == "inferred" else "declared"
+
+
+async def _queue_transition_stickers(
+    db: Any,
+    boundary: seasons.Boundary,
+    *,
+    season_id: int,
+    stream: dict[str, Any],
+    report: dict[str, Any],
+) -> None:
+    """The closing sticker first, then the new season's opening one, then uploads.
+
+    Queued as jobs rather than posted inline: the sticker's document id comes from the
+    pack mapping, which is a live-account question (see ``stickers.mapping_mode``), and a
+    job that cannot run yet shows up as *blocked* in /status. An inline call would have to
+    either invent an id or fail the ingest, and failing the ingest over a divider sticker
+    is how an episode gets lost.
+    """
+    steps = seasons.transition_stickers(
+        boundary,
+        previous_has_content=bool(stream.get("episodes_in_current")),
+    )
+    queued = []
+    for step in steps:
+        dedup = f"season-sticker:{boundary.evidence.get('current_season') or stream['current_season']}:{step.kind}:{step.season}"
+        job = await db.enqueue(
+            JobKind.SEASON_STICKER.value,
+            dedup,
+            payload={**step.as_payload(series_id=0), "reason": boundary.reason},
+            season_id=season_id,
+            priority=60,
+        )
+        queued.append({"kind": step.kind, "season": step.season, "job": bool(job)})
+    report["stickers"] = queued
+
+
+async def _resolve_season(
+    db: Any,
+    series_id: int,
+    parsed: normalize.ParsedEpisode,
+    *,
+    boundary: seasons.Boundary | None = None,
+) -> int:
+    """Create or widen the season row, and record *why* it exists when this is a boundary.
+
+    Note what this function never writes: ``first_episode``/``last_episode``, the declared
+    span. Those are the owner's statement (``/declare``), and filling them from an upload
+    is the bug that used to publish a "Complete Season" post the week a source paused. The
+    ``least``/``greatest`` here widen the *observed* span, which is a different question; the ``coalesce`` on the boundary columns is what makes them non-repeating:
+    once a season's reason is written it never changes, so re-scanning a channel cannot
+    rewrite "declared by the source" into "inferred" and make a real decision look like a
+    guess.
+    """
+    if boundary is not None:
+        season_number = boundary.season
+    else:
+        season_number = parsed.season if parsed.season is not None else 1  # filing, not declaring
     numbers = parsed.episode_numbers() or (parsed.episode,)
     first = min((n for n in numbers if n is not None), default=None)
     last = max((n for n in numbers if n is not None), default=None)
     return int(
         await db.fetchval(
             """
-            insert into app.season (series_id, season_number, first_episode, last_episode)
-            values ($1, $2, $3, $4)
+            insert into app.season (series_id, season_number, observed_first, observed_last,
+                                    boundary_kind, boundary_evidence)
+            values ($1, $2, $3, $4, $5, coalesce($6::jsonb, '{}'::jsonb))
             on conflict (series_id, season_number) do update
-               set first_episode = least(coalesce(app.season.first_episode, excluded.first_episode),
-                                         coalesce(excluded.first_episode, app.season.first_episode)),
-                   last_episode  = greatest(coalesce(app.season.last_episode, 0),
-                                            coalesce(excluded.last_episode, 0)),
+               set observed_first = least(coalesce(app.season.observed_first, excluded.observed_first),
+                                          coalesce(excluded.observed_first, app.season.observed_first)),
+                   observed_last  = greatest(coalesce(app.season.observed_last, 0),
+                                             coalesce(excluded.observed_last, app.season.observed_last)),
+                   boundary_kind = coalesce(app.season.boundary_kind, excluded.boundary_kind),
+                   boundary_evidence = case
+                     when app.season.boundary_evidence = '{}'::jsonb then excluded.boundary_evidence
+                     else app.season.boundary_evidence
+                   end,
                    updated_at = now()
             returning id
             """,
@@ -260,11 +423,20 @@ async def _resolve_season(db: Any, series_id: int, parsed: normalize.ParsedEpiso
             season_number,
             first,
             last,
+            _boundary_kind(boundary),
+            json.dumps(boundary.evidence) if boundary is not None and boundary.is_boundary else None,
         )
     )
 
 
-async def _resolve_episode(db: Any, season_id: int, parsed: normalize.ParsedEpisode, number: int) -> int:
+async def _resolve_episode(
+    db: Any,
+    season_id: int,
+    parsed: normalize.ParsedEpisode,
+    number: int,
+    *,
+    season_number: int | None = None,
+) -> int:
     """One row per (season, episode). The canonical key belongs to the episode's
     *identity*, not to each release: a second language track on the same episode
     widens ``languages`` rather than creating a parallel episode, which is what
@@ -286,7 +458,7 @@ async def _resolve_episode(db: Any, season_id: int, parsed: normalize.ParsedEpis
             """,
             season_id,
             number,
-            parsed.canonical_key(number),
+            parsed.canonical_key(number, season=season_number),
             parsed.series,
             list(parsed.languages),
             parsed.audio_kind,
