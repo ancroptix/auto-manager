@@ -237,8 +237,15 @@ class Settings(BaseSettings):
         lines: list[str] = []
 
         if self.database_url is not None:
-            host = urlparse(self.database_url.get_secret_value()).hostname or "unparseable"
-            lines.append(f"DATABASE_URL set (host {host}, ssl={self.db_ssl})")
+            parsed = urlparse(self.database_url.get_secret_value())
+            if parsed.hostname:
+                where = f"host {parsed.hostname}:{parsed.port or 5432}, db {parsed.path.lstrip('/') or '?'}"
+            else:
+                # A local development cluster is reached through a unix socket, so
+                # there is no host at all. Saying "unparseable" made a working
+                # connection look like a broken setting.
+                where = f"local socket {parsed.query or 'default'}"
+            lines.append(f"DATABASE_URL set ({where}, ssl={self.db_ssl})")
         else:
             lines.append(
                 "DATABASE_URL is NOT set: no persistence, no queue, nothing gets "

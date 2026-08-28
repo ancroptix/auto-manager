@@ -156,3 +156,27 @@ class TestBootAudit:
         notes = Settings(app_name="auto-manager").boot_audit()
         listed = next(n for n in notes if n.startswith("Telegram client"))
         assert "TELEGRAM_API_ID" in listed and "TELEGRAM_SESSION_STRING" in listed
+
+
+class TestBootAuditTargets:
+    """The audit names the database it is pointing at, in the form an operator can
+    recognise — a pooler host, or a socket directory, never "unparseable"."""
+
+    def test_a_pooler_url_shows_host_port_and_database(self) -> None:
+        settings = Settings(
+            _env_file=None,
+            app_name="auto-manager",
+            database_url="postgresql://postgres.abc:<pw>@aws-0-ap-northeast-1.pooler.supabase.com:5432/postgres",
+        )
+        line = next(n for n in settings.boot_audit() if n.startswith("DATABASE_URL"))
+        assert "aws-0-ap-northeast-1.pooler.supabase.com:5432" in line
+        assert "db postgres" in line
+
+    def test_a_unix_socket_url_is_not_reported_as_broken(self) -> None:
+        settings = Settings(
+            _env_file=None,
+            app_name="auto-manager",
+            database_url="postgresql://postgres:@/postgres?host=/repo/.pgdata",
+        )
+        line = next(n for n in settings.boot_audit() if n.startswith("DATABASE_URL"))
+        assert "local socket" in line and "unparseable" not in line
