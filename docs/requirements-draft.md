@@ -56,6 +56,14 @@ episodes as files, each message saying nothing but `episode 7`. In that shape th
   `create_destination` and `/inplace` refuses to switch a channel it cannot write in. The ability to caption in place
   is not an alternative to building the destination, and the standing rule that creation needs no confirmation still
   applies to the created one.
+- **In-place mode replaces no step of the pipeline.** The order stays: caption the file, hand it to the storage
+  helper, take the link back, create the post that carries that link. What the mode decides is *which message a
+  caption is written on* — the file message that already exists, rather than a copy — and nothing else. It is not a
+  way to finish at "now the files have captions", and it lifts no rule about the files: the Hindi-audio gate, the
+  approved template, and the ask-before-overwrite rule all apply in both modes, because in both modes something
+  reaches an audience. (Stated by the operator after the mode was first read too broadly: *"there should be no
+  destination channels with nude files"*. The relaxation it killed was `inplace.mode_allows_missing_audio`, and the
+  gate states `relaxed-for-in-place-captioning` / `captioned_without_audio_claim` no longer exist anywhere.)
 - Corrections that apply to both modes: a source channel's files and thumbnails need not be
   watermark-free to be usable — screening **ranks** copies and picks the best, and a channel with no
   clean candidate is flagged and published with the least-bad copy rather than blocked (content is
@@ -64,6 +72,9 @@ episodes as files, each message saying nothing but `episode 7`. In that shape th
 
 ## 3. Destination channels
 
+- A destination holds **captioned posts with links**, never the files themselves. A channel whose messages are bare
+  files is a source — even when we are admin there and could caption it, which is what makes it a source *we may
+  also write on*, and never what makes it the destination.
 - One **private** destination channel per complete series.
 - Default name: `{TITLE} Anime in Hindi`.
 - Title is derived by cross-checking the source channel name against captions and filenames in that channel. Both

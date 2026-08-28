@@ -27,7 +27,7 @@ from __future__ import annotations
 import json
 from typing import Any, Mapping
 
-from . import inplace, normalize, seasons
+from . import normalize, seasons
 from .keys import (
     discovery_key,
     normalize_title,
@@ -39,10 +39,10 @@ __all__ = ["record_message", "season_stream", "SOURCE_MODE_IGNORED"]
 
 SOURCE_MODE_IGNORED = "ignore"
 
-#: What :func:`_audio_gate` reports. Three states, because "who decided" is the question a
-#: review queue asks, and a relaxed gate has to be distinguishable from a disabled one.
+#: What :func:`_audio_gate` reports. Four states, because "who decided" is the question a
+#: review queue asks, and a gate switched off by the operator has to be distinguishable from one
+#: that simply does not apply to this channel.
 GATE_REQUIRED = "hindi-audio-required"
-GATE_RELAXED_IN_PLACE = "relaxed-for-in-place-captioning"
 GATE_OFF = "off-for-this-channel"
 GATE_FORCED_ON = "forced-on-by-caller"
 GATE_FORCED_OFF = "forced-off-by-caller"
@@ -51,16 +51,14 @@ GATE_FORCED_OFF = "forced-off-by-caller"
 def _audio_gate(channel: Mapping[str, Any]) -> str:
     """Whether the Hindi-audio rule applies to a file read from this channel.
 
-    Read as data, not as a special case buried in the parser: the destination row's
-    ``publish_mode`` (or the channel's own confirmed ``publish_role``) is what says "these are
-    our files, already posted", and ``normalize.parse_episode`` keeps its one gate rule.
+    Only the channel's own setting answers that. It used to also ask whether the channel is in
+    in-place caption mode, on the reasoning that nothing is being *published* there — and that
+    reasoning died with the reading of the mode: in-place captioning is one extra act on the
+    file message, not a replacement for storing it, linking it and posting it. A file that
+    reaches an audience goes through the gate, whoever owns the channel it sits in.
     """
     if not bool(channel["require_hindi_audio"]):
         return GATE_OFF
-    role = channel["publish_role"]
-    mode = channel["destination_publish_mode"]
-    if inplace.mode_allows_missing_audio(mode) or str(role or "") == "source_and_destination":
-        return GATE_RELAXED_IN_PLACE
     return GATE_REQUIRED
 
 
@@ -90,12 +88,7 @@ async def record_message(
         """
         select id, series_id, username, title, mode, priority,
                require_hindi_audio, include_subbed,
-               declared_series, declared_audio, declared_season, publish_role,
-               coalesce(
-                   (select d.publish_mode from app.destination d where d.id = sc.destination_id),
-                   (select d.publish_mode from app.destination d
-                     where d.telegram_channel_id = sc.telegram_channel_id limit 1)
-               ) as destination_publish_mode
+               declared_series, declared_audio, declared_season
           from app.source_channel sc
          where sc.id = $1
         """,
@@ -120,11 +113,6 @@ async def record_message(
     # channel rows, and undoing it must not require a re-scan either.
     trust_declaration = bool(await db.config("ingest.accept_channel_audio_declaration", True))
     declared_audio = channel["declared_audio"] if trust_declaration else None
-    # In-place publishing relaxes one gate and only one. If this channel is the operator's own
-    # destination and the file is already posted there, "prove this carries Hindi audio" has
-    # nothing to protect: nothing is entering the channel, and a caption withheld from your own
-    # video is a formatting failure, not a scope violation. A file being *brought in* from
-    # elsewhere is still judged by the flags above. See app/inplace.py.
     if require_hindi_audio is None:
         audio_gate = _audio_gate(channel)
         require_hindi_audio = audio_gate is GATE_REQUIRED
@@ -144,10 +132,6 @@ async def record_message(
         include_subbed_only=bool(channel["include_subbed"])
         if include_subbed_only is None
         else include_subbed_only,
-        # In-place mode: a file whose own text says nothing about audio is captioned anyway,
-        # because the caption describes the operator's own post rather than licensing a copy
-        # into the channel. A file that says "subbed" still says subbed, and still fails.
-        unknown_audio_allowed=audio_gate is GATE_RELAXED_IN_PLACE,
     )
 
     candidate_id = await db.fetchval(

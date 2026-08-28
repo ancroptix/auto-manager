@@ -2134,15 +2134,19 @@ def test_season_completeness_needs_a_declaration_not_a_pause(conn, seed):
         cur.execute("delete from app.series where id = %s", (paused_id,))
 
 
-def test_in_place_captioning_replaces_the_gate_and_the_plan_is_the_proof(conn):
+def test_in_place_captioning_changes_the_caption_not_the_gate_and_the_plan_is_the_proof(conn):
     """The second shape of the job, end to end, on the real schema.
 
-    The operator's channel already holds the files and each message says ``episode 7``. In
-    link mode that file is parked — "cannot determine whether the file carries Hindi audio" —
-    because publishing it would be putting a stranger's unproven file in front of 30k members.
-    In place mode there is no such act: the file is already posted, by them, in their own
-    channel, and the only thing missing is the caption. So the mode flips one gate and nothing
-    else, and that has to be visible in the row it writes.
+    The operator's channel already holds the files and each message says ``episode 7``, and such
+    a file is parked — "cannot determine whether the file carries Hindi audio" — because putting
+    an unproven file in front of 30k members is the one thing this service will not do.
+
+    In-place mode used to flip that gate. The reasoning was that captioning a file nobody re-posts
+    publishes nothing, so the gate had nothing to guard; the operator corrected the reasoning, not
+    just the wording: caption the file, then the store bot, then the link, then the post, and a
+    channel of bare files is never a destination. So what this scenario proves is the narrower
+    claim, and it is the one worth pinning in a test — the mode decides *which message a caption
+    is written on* and changes no rule about the file itself.
     """
     import asyncio
 
@@ -2213,13 +2217,20 @@ def test_in_place_captioning_replaces_the_gate_and_the_plan_is_the_proof(conn):
         assert await db.connect(), await db.last_error
         bot = ControlBot(api=Api(), db=db, settings=_ingest_settings(), owner_ids=frozenset({7}))
 
-        async def scan(message_id: int, episode: int) -> dict:
+        async def scan(message_id: int, episode: int, *, audio: str = "") -> dict:
+            """One file message, as the pipeline sees it. ``audio`` is the file's own claim.
+
+            The claim goes in the *file name*, deliberately. The caption has to stay a bare label
+            so the overwrite rule still says "write it", and the audio has to be proven by the file
+            rather than by the mode. The re-scan is the other half: the same message scanned twice
+            updates one row instead of leaving two candidates side by side.
+            """
             return await record_message(
                 db,
                 source_channel_id=channel_id,
                 message_id=message_id,
                 media_type="document",
-                file_name=f"episode {episode}.mp4",
+                file_name=f"episode {episode}" + (f" [{audio} Audio]" if audio else "") + ".mp4",
                 raw_caption=f"episode {episode}",
                 video_height=720,
                 fingerprint=f"inplace-{message_id}",
@@ -2237,8 +2248,8 @@ def test_in_place_captioning_replaces_the_gate_and_the_plan_is_the_proof(conn):
         assert "no source channel to compare" in text, text
         assert parked["disposition"] == "pending", "plan must not have written anything"
 
-        # Now the mode is recorded. Nothing about the file changed; what changed is which rules
-        # apply to it, and the next scan of a *different* file has to show that.
+        # Now the mode is recorded. Nothing about the file changed and nothing about the rules for
+        # it changed either; the mode is about where the caption goes.
         replies = await bot.dispatch(update("/inplace @yc_inplace", 2))
         assert "in-place captioning is ON" in replies[0].text, replies[0].text
         role = conn.execute(
@@ -2246,14 +2257,30 @@ def test_in_place_captioning_replaces_the_gate_and_the_plan_is_the_proof(conn):
         ).fetchone()[0]
         assert role == "source_and_destination", role
 
-        filed = await scan(8302, 2)
+        # The gate still stands, which is the point of this block: an in-place channel is not a
+        # channel where the rules were lifted. Parked, same reason, nothing filed.
+        blocked = await scan(8302, 2)
+        assert blocked["disposition"] == "pending", blocked
+        assert blocked["audio_gate"] == "hindi-audio-required", blocked
+        assert "cannot determine whether the file carries Hindi audio" in blocked["reason"], blocked
+        assert blocked["episodes"] == [] and blocked["variants"] == [], blocked
+        assert "captioned_without_audio_claim" not in blocked["flags"], blocked
+
+        # What clears the file is the file saying something, not the mode. Same message, second
+        # scan, name now carrying the claim: accepted, one episode row, one variant — and the row
+        # updated in place instead of a second candidate appearing next to it.
+        filed = await scan(8302, 2, audio="Hindi")
         assert filed["disposition"] == "accepted", filed
-        assert filed["audio_gate"] == "relaxed-for-in-place-captioning", filed
-        assert "captioned_without_audio_claim" in filed["flags"], filed
-        # Accepted, not *claimed*: the caption this file would print says Unknown, and the
-        # series still comes from the channel's own title (one signal), so the archive row is
-        # the only place it becomes a claim.
-        assert filed["audio_source"] == "none" and filed["series_source"] == "channel_name", filed
+        assert filed["candidate_id"] == blocked["candidate_id"], filed
+        assert filed["audio_gate"] == "hindi-audio-required", filed
+        # Where the claim came from is recorded as the file's own text, never as the mode.
+        assert filed["audio_source"] in ("file_name", "caption"), filed
+        # The kind it recorded is the file's own word ("dual_audio" for a name saying
+        # `[Hindi Audio]`), which is the point: the claim travelled in through the text.
+        assert "audio detected" in filed["reason"], filed
+        # The series still comes from the channel's own title (one signal), which is the honest
+        # reading: nothing here pretends the file named a show.
+        assert filed["series_source"] == "channel_name", filed
         assert len(filed["episodes"]) == 1 and len(filed["variants"]) == 1, filed
 
         # The plan the publisher would act on, read straight from the rows.

@@ -2,17 +2,23 @@
 
 The operator described a second shape of the job. Not "read a stranger's channel and build
 a clean one beside it", but: *this* channel already holds the episodes as files, each message
-saying nothing but ``episode 7`` — and it is the channel they want published, because they own
-it. In that shape there is nothing to copy, nothing to name, and nothing to delete. The file
-post **is** the post. The whole job is to put the approved caption on it.
+saying nothing but ``episode 7``. So the caption goes onto the file message itself, in place,
+instead of being written on a copy we re-uploaded somewhere else.
 
-That distinction is the spine of this module, and it is why the rules here are looser in one
-place and stricter in three:
+That is one step of the pipeline, and only that step. The rule the operator repeated when this
+module was first read too broadly stands in code, not in prose:
 
-* looser on **scope**: the "Hindi audio only" gate guards the door through which files *enter*
-  your channel. In-place work opens no such door — the file is already there, posted by you —
-  so a file nobody can prove is Hindi still gets its caption. Withholding the label is a
-  formatting failure; deleting your content over a formatting failure is not one.
+    caption the file -> store bot -> link -> create the post with that link
+
+In-place mode never replaces the storage handoff, the link or the post, and a channel sitting
+full of bare files is **not** a destination — "no destination channels with nude files". The
+destination is the channel named from the series, and it holds captioned posts with links.
+If that channel does not exist yet, this mode has no bearing on the decision: it gets built.
+
+What the mode does change is the file message in the channel we can write in — the caption is
+edited there instead of duplicated there. And because it is an edit of someone's existing
+message, the rules here are stricter in three places:
+
 * stricter about **overwriting**: the existing text may be the only thing between that message
   and confusion (a note like ``dub added 12/8, source fixed``, a download mirror). So only a
   caption that is clearly a *label* gets replaced; anything that carries real information is
@@ -52,7 +58,6 @@ __all__ = [
     "plan",
     "summary",
     "shape_note",
-    "mode_allows_missing_audio",
     "pair_roles",
     "Route",
     "route_for",
@@ -60,18 +65,14 @@ __all__ = [
 
 #: ``app.destination.publish_mode``. Two modes, because the operator uses both: a link
 #: destination (Channel Help composes text + buttons, files live in the master archive) and an
-#: in-place destination (the files are already here; their captions are the publishing).
+#: in-place destination (the files are already here, so their captions are edited here rather
+#: than written onto a fresh copy). Both modes store, both get a link, both publish the post.
 MODE_LINK = "link_post"
 MODE_IN_PLACE = "in_place_caption"
 
 #: Telegram's own limit for a media caption. A long edited template must fail here, in a
 #: sentence, and not mid-publish with a generic MTProto error.
 MAX_CAPTION_CHARS = 1024
-
-#: A destination whose files are already posted never needs the audio gate to stop it: see the
-#: module docstring. The gate still applies to files being *brought in*.
-def mode_allows_missing_audio(mode: str | None) -> bool:
-    return str(mode or MODE_LINK).strip().casefold() == MODE_IN_PLACE
 
 
 class Action:
@@ -492,13 +493,15 @@ def _caption_from_row(row: Mapping[str, Any]) -> tuple[str | None, tuple[str, ..
 class Route:
     """Which publishing shape a channel gets, and whether a channel still has to be built.
 
-    The invariant this exists to protect: ``create_destination`` is false **only** when a
-    destination already exists, or when the files we are captioning are already in the channel
-    that *is* the destination. "I can caption in place here" has never been a reason to skip
-    building a destination that does not exist yet — and if it were allowed to be, the failure
-    would be silent: a shelf of source files, no published channel, and nothing in the log
-    naming what is missing. The operator said this twice; the second time it came with "tab bhi
-    channel banane wala hissa skip mat karne lag jana".
+    The invariant this exists to protect: ``create_destination`` is false for exactly one reason
+    — a destination for this series already exists. Not "the files are here", not "I can caption
+    in place here", not "these posts look publishable as they stand". A channel of bare files is
+    never the destination; the destination is the channel named from the series, and it is built
+    when it is missing. If that were allowed to be skipped the failure would be silent: a shelf
+    of source files, no published channel, and nothing in the log naming what is missing. The
+    operator said this twice; the second time it came with "tab bhi channel banane wala hissa
+    skip mat karne lag jana", and the third time as "there should be no destination channels with
+    nude files".
     """
 
     mode: str
@@ -528,7 +531,12 @@ class Route:
             needs = "" if self.name else ", and its name needs the series named first (/source)"
             return f"{who} is created from scratch, starting with `{SETUP_STEPS[0].name}`{needs}"
         if self.mode == MODE_IN_PLACE:
-            return "nothing is created and nothing is fetched: these posts are the destination"
+            # Said in this order on purpose: the caption is what this mode adds, the pipeline is
+            # what it never removes.
+            return (
+                "the caption is written on the file message, and the file still goes to storage, "
+                "still comes back as a link, and still gets its post"
+            )
         return "posts go to the destination that already exists for this series"
 
 
@@ -558,7 +566,9 @@ def route_for(
       true. This is physics, not preference: a user account without posting rights cannot edit a
       message, so "caption it where it already is" is not on the table for that channel.
     * **whether the destination exists** — a channel named ``{TITLE} Anime in Hindi`` for this
-      series, already created by us or already added by you as an admin.
+      series, already created by us or already added by you as an admin. This is the *only*
+      question that can turn creation off. Rights decide whether a caption is written in place,
+      and nothing else.
 
     A member-only channel with no destination is therefore *not* a dead end and *not* a question
     about rights. It is the ordinary case: the channel you sent is a source, and the destination
@@ -572,10 +582,12 @@ def route_for(
     if we_are_admin and files_already_there:
         return Route(
             MODE_IN_PLACE,
-            False,
-            "these posts are already in a channel we can write in, so the file message is the "
-            "post: the caption goes on it, nothing is fetched and no channel is created. a row in "
-            "app.destination is still recorded — a season needs an owner even when nobody is copied",
+            not destination_exists,
+            "these posts sit in a channel we can write in, so the approved caption goes on the "
+            "file message itself instead of onto a copy. that is the only thing this changes: the "
+            "file still goes to storage, the link still comes back, and the post is still made. a "
+            "channel of bare files is not a destination, so a row in app.destination is recorded "
+            "for the channel that is",
             name=name,
             can_write=True,
         )

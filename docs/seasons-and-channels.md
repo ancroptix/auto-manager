@@ -308,18 +308,24 @@ of the backlog to point at it first.
 ## 4. When the channel you add is the channel you publish in
 
 Everything above assumes the pipeline *builds* a destination: a new private channel, a name, a
-picture, an admin list, and posts made beside the files. There is a second shape, and it is the
-one a channel full of your own files needs: **the channel you add is the destination**, and the
-only thing wrong with it is the text under each video.
+picture, an admin list, and posts made beside the files. There is a second act available, and it
+is the one a channel full of your own files wants: **the caption is written on the file message
+where it already sits**, instead of being written onto a copy somebody re-uploaded.
+
+That is one act, and only that one. This mode has never been a shorter pipeline. The order the
+operator gave stands over both modes, and the second line of it is the reason a channel of bare
+files cannot be called a destination:
+
+    caption the file -> store bot -> link -> create the post with that link
 
 | | link mode (`link_post`) | in-place mode (`in_place_caption`) |
 | --- | --- | --- |
-| where the file lives | private master archive, then a link | already in this channel |
-| what a post is | Channel Help composes text + buttons | the existing file message, edited |
-| what is fetched | every accepted file | nothing, unless an episode is missing here |
+| where the file's caption is written | on the copy in the destination | on the file message where it already is |
+| what a post is | Channel Help composes text + buttons | still that: a post in the named destination |
+| what is fetched | every accepted file | every accepted file — the mode skips no step |
 | what is deleted | never | never |
-| does "Hindi audio proven" gate it | yes | no — see below |
-| inline buttons | yes | no (and nothing to link to) |
+| does "Hindi audio proven" gate it | yes | yes — see below |
+| inline buttons | yes | on the destination's post; a user session cannot attach a keyboard to a media message |
 
 ### Which channel is which, when two of them share a name
 
@@ -328,6 +334,13 @@ in** is the destination, the one where we are an ordinary **member** is a source
 trust judgement — an account with no posting rights physically cannot edit those messages, so
 the rights *are* the answer, and guessing the other way round produces a job that fails on every
 file. Two admin-able channels with one name is a question rather than a sort.
+
+That rule and the rule above are not in conflict, and the difference is worth being exact about,
+because both sentences say "destination". Picking the writable same-named channel as the
+destination is fine — the files in it get captioned *and* the linked posts land in it, so it is
+never a shelf of bare files. What is not allowed is calling a channel the destination and then
+stopping there, content that it now has tidy captions. Nude files means "nothing was ever
+published here", not "a file lives here".
 
 And **no** writable channel is not a question at all. It is the ordinary case, and the answer is
 the second half of the job: the channel you joined is a **source**, and if no channel named
@@ -376,16 +389,21 @@ media-caption limit is a question, never a truncation; and a message whose text 
 caption we would write is a `skip`, which is what makes a restart in the middle of a 400-episode
 backlog resume instead of re-editing.
 
-### Why the audio gate does not apply here
+### Why the audio gate applies here too
 
-The Hindi-audio rule guards the door through which files *enter* a channel: it is what stops a
-stranger's subbed release being published to 30k members as a Hindi one. In-place mode opens no
-such door — you posted the file, it is your channel, and a caption withheld from your own video is
-a formatting failure rather than a scope violation. So `inplace.mode_allows_missing_audio` turns
-that one gate off for this mode, and nothing else moves: a file whose own text says *subbed* still
-says subbed, and a file being **brought in** from another channel is still judged by every rule in
-part 3. The caption prints `〄 𝗔𝘂𝗱𝗶𝗼: Unknown` rather than inventing `Hindi`; say
-`/source <channel> audio hindi` and it prints Hindi with the provenance to back it.
+It used not to. The reasoning was that in-place mode publishes nothing — it edits a caption on a
+file you posted yourself — so "prove this carries Hindi audio" had no door left to guard, and
+`inplace.mode_allows_missing_audio` switched that one gate off for the mode.
+
+That reasoning had a hole in it, and the operator found it: the file does get published. In-place
+mode adds the act of captioning where the file lies; it removes the storage handoff, the link or
+the post from nobody's schedule. A file whose audio nobody can prove therefore waits here exactly
+as it waits anywhere else, whoever owns the channel it sits in. So the helper is gone from
+`app.inplace`, `app.ingest` has no relaxed gate state to report, and the only switch left is the
+channel's own `require_hindi_audio` box — set it off, and it is off in the log, for every mode
+alike. What is unchanged is what the caption prints while a file waits: `〄 𝗔𝘂𝗱𝗶𝗼: Unknown`
+rather than an invented `Hindi`, and `/source <channel> audio hindi` makes it print Hindi with the
+provenance to back that statement.
 
 ### What is not finished
 

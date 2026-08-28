@@ -11,19 +11,33 @@ from __future__ import annotations
 
 import pytest
 
-from app import captions, inplace
+from app import captions, inplace, normalize
 
 
 # --- modes -------------------------------------------------------------------------------
 
 
-def test_in_place_mode_skips_the_audio_gate_but_link_mode_keeps_it() -> None:
-    """The gate guards the door files come *in* through; in-place opens no door."""
-    assert inplace.mode_allows_missing_audio(inplace.MODE_IN_PLACE) is True
-    assert inplace.mode_allows_missing_audio(inplace.MODE_LINK) is False
-    # A destination with no mode set yet is a link destination, gate and all.
-    assert inplace.mode_allows_missing_audio(None) is False
-    assert inplace.mode_allows_missing_audio("In_Place_Caption") is True  # tolerant of casing
+def test_no_mode_touches_the_audio_gate() -> None:
+    """The gate is the operator's rule about *files*, and a publishing mode has no vote.
+
+    This used to be the opposite: in-place mode relaxed the gate, on the theory that captioning a
+    file nobody re-posts publishes nothing. That theory died with the reading of the mode — an
+    in-place channel still hands its files to storage, still gets links back, still has posts made
+    for it. So both modes answer the same question the channel's own row answers.
+    """
+    from app import ingest
+
+    assert not hasattr(inplace, "mode_allows_missing_audio"), (
+        "no helper may exist that a mode could use to switch the gate off"
+    )
+    assert not hasattr(ingest, "GATE_RELAXED_IN_PLACE")
+    on = {"require_hindi_audio": True}
+    assert ingest._audio_gate(on) == ingest.GATE_REQUIRED
+    assert ingest._audio_gate({"require_hindi_audio": False}) == ingest.GATE_OFF
+    # Unknown audio parks a file whatever the mode says, and a subbed claim still fails outright.
+    parked = normalize.parse_episode(file_name="ep07.mp4", require_hindi_audio=True)
+    assert not parked.accepted and parked.disposition == normalize.Disposition.PENDING
+    assert parked.reason == "cannot determine whether the file carries Hindi audio"
 
 
 # --- what is only a label ----------------------------------------------------------------
@@ -220,9 +234,11 @@ def test_a_member_only_channel_with_an_existing_destination_creates_nothing() ->
 def test_the_creation_question_is_answered_from_rights_not_from_convenience() -> None:
     """One invariant, checked across every combination rather than asserted once.
 
-    ``create_destination`` may be false for exactly two reasons — a destination already exists,
-    or these very posts are the destination — and every other case must say ``True``. This is
-    the rule that stops in-place mode from quietly becoming a way to skip building a channel.
+    ``create_destination`` may be false for exactly one reason — a destination already exists —
+    and every other case must say ``True``. This is the rule that stops in-place mode from quietly
+    becoming a way to skip building a channel, and it is why rights and file-presence are not in
+    the expression at all: they decide *where the caption goes*, never *whether there is a place
+    for the posts*.
     """
     for admin in (True, False, None):
         for files in (True, False):
@@ -233,8 +249,7 @@ def test_the_creation_question_is_answered_from_rights_not_from_convenience() ->
                     destination_exists=exists,
                     series="Berserk",
                 )
-                allowed = exists or (route.mode == inplace.MODE_IN_PLACE and admin is True and files)
-                assert route.create_destination is (not allowed), (admin, files, exists, route)
+                assert route.create_destination is (not exists), (admin, files, exists, route)
 
 
 def test_member_rights_never_produce_an_in_place_caption() -> None:
@@ -265,14 +280,28 @@ def test_unverified_rights_are_treated_as_the_narrow_case() -> None:
 
 
 def test_admin_files_already_posted_are_the_only_in_place_case() -> None:
+    """The mode's whole claim: the caption goes on the message that exists. Nothing else.
+
+    Read the other way round — "these posts are the publishing" — this mode became a way to stop
+    the job at step one. The operator's answer to that was one line: caption the file, then the
+    store bot, then the link, then the post, and "there should be no destination channels with
+    nude files". So the in-place route says what it changes *and* what it leaves alone.
+    """
     route = inplace.route_for(
         we_are_admin=True, files_already_there=True, destination_exists=False, series="Berserk"
     )
     assert route.mode == inplace.MODE_IN_PLACE and route.may_caption is True
-    assert route.create_destination is False
-    assert "nothing is fetched and no channel is created" in route.reason
-    # …and the bookkeeping that *is* still done, so this is not mistaken for "no destination row".
-    assert "app.destination is still recorded" in route.reason
+    assert route.create_destination is True, "captioning in place never cancels the destination"
+    assert route.name == "Berserk Anime in Hindi"
+    assert "bare files is not a destination" in route.reason
+    assert "still goes to storage" in route.reason and "the post is still made" in route.reason
+    assert "created from scratch" in route.consequence()
+    # With a destination already there, the same route says the posts go to it, and nothing is built.
+    built = inplace.route_for(
+        we_are_admin=True, files_already_there=True, destination_exists=True, series="Berserk"
+    )
+    assert built.create_destination is False
+    assert "still goes to storage" in built.consequence(), built.consequence()
 
 
 # --- the caption on the file -------------------------------------------------------------

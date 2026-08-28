@@ -60,7 +60,7 @@ Owner private Telegram chat  (control commands, review queues, approvals)
 | Source scanning and metadata parsing (series, season, episode, language, quality) | built (`normalize.py`, `ingest.py`); the live listener that feeds it needs a session |
 | Season boundaries: declared vs inferred, sticker ordering, publish hold | built (`seasons.py`, [docs](docs/seasons-and-channels.md)) |
 | Thumbnail screening (allowlist: `@YCAnime`, `@india_crunchyroll`) | built as a **gate** (`thumbnails.py`): with no image evidence it parks for review. Your correction — screening should rank and flag rather than block — is **not built yet** |
-| In-place publishing: caption the file post that is already there (`/inplace`, [docs](docs/seasons-and-channels.md)) | policy, plan, mode and command built and tested; the `EditMessage` call itself is the unwired write layer |
+| In-place publishing: caption the file post that is already there, pipeline unchanged (`/inplace`, [docs](docs/seasons-and-channels.md)) | policy, plan, mode and command built and tested; the `EditMessage` call itself is the unwired write layer |
 | Storage bot verbs (`/genlink`, `/batch`, `/custom_batch`, `/special_link`, `/universal_link`) | observed and recorded, with a drift check and an unsendable list ([docs](docs/storage-bot.md)) |
 | Archive copy, the storage bot's *reply protocol*, Channel Help adapter | **not built** — the menu is known; what each command asks for next is not, and one authenticated run (`/probe`) settles it |
 | Season sticker *posting*, join-request campaigns | **not built** — the pack's document ids and the request template are still open; the boundary logic above is not |

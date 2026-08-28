@@ -158,7 +158,10 @@ Three replies to expect, all deliberate:
   session has ever read our rights. The channel you named is then a source, and the reply says the destination
   `… Anime in Hindi` will be created: being unable to caption in place is never a reason to skip building it. It
   names the command that makes the naming safe (`/source … series <name> audio hindi`) and, only when rights are
-  unread, the one column you can set by hand if this really is your own channel.
+  unread, the one column you can set by hand if this really is your own channel. And switching the mode on
+  changes where a caption is written, never whether the job runs: the file still goes to storage, the link
+  still comes back, the post is still made. "There should be no destination channels with nude files" is the
+  rule this command refuses to quietly drop.
 * **"this command changed the plan, not the channel"** — true until the MTProto write
   layer is wired on the live account. `/inplace` is safe to run today; the edits follow
   once the session can send `EditMessage`.

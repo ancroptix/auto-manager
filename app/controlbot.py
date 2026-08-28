@@ -63,7 +63,7 @@ HELP = """auto-manager control
 /probe       ask the storage bot and Channel Help their questions (report arrives here)
 /declare     say how long a season is (Total Episodes, and the batch post)
 /source      say what a source channel carries (series, audio, season) — for bare-file channels
-/inplace     caption the files already posted in your own channel (no copy, no delete)
+/inplace     caption the files already posted in your own channel (no delete; link + post still run)
 /sessions    stored Telegram sessions (never their contents)
 /use <name>  make one session the active account
 /forget <n>  delete a stored session from the database
@@ -649,17 +649,25 @@ class ControlBot:
         "  /inplace @naruto_hindi plan             show the plan, change nothing\n"
         "  /inplace @naruto_hindi from @uploads4u  also compare with that source, to fill gaps\n"
         "  /inplace @naruto_hindi off              back to the link route\n\n"
-        "in-place means: no new channel, no copying, no deleting. the post that already holds "
-        "the file gets the approved caption written on it."
+        "in-place means one thing only: the approved caption is written on the message that "
+        "already holds the file, instead of onto a copy. nothing is deleted, and nothing is "
+        "skipped — storage, the link and the post all still happen, and a destination channel is "
+        "still created when it does not exist, because a channel of bare files is not one."
     )
 
     async def _inplace(self, update: Update, args: list[str]) -> list[Reply]:
-        """``/inplace <channel> [from <other>] [plan|off]`` — publish by editing, not by posting.
+        """``/inplace <channel> [from <other>] [plan|off]`` — caption the file messages in place.
 
         The other shape of this service, for the case the operator described: a channel whose
         messages already are the posts, each saying nothing but ``episode 7``. This command
         records the mode and shows the plan it implies. It never touches Telegram, and it says so:
         the edits themselves are the user session's job, and the publish layer is unwired.
+
+        What this command deliberately does *not* offer is a way out of the rest of the job. The
+        mode adds an act (the caption, on the message that exists) and removes none: the file is
+        still handed to storage, a link still comes back, and a post is still made in the channel
+        named from the series — which is built when missing, since bare files sitting in a channel
+        never make it a destination.
         """
         from . import inplace  # noqa: PLC0415  (see the module's import policy: one-way, no cycle)
 

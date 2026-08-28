@@ -1209,7 +1209,10 @@ async def test_inplace_explains_itself_before_touching_anything() -> None:
     db = FakeDb()
     control, _api, _db = bot(db=db)
     (text,) = await say(control, "/inplace")
-    assert "usage" in text.lower() and "no copying, no deleting" in text
+    assert "usage" in text.lower() and "nothing is deleted" in text
+    # The usage line has to keep the pipeline in the sentence. "no copying" read on its own
+    # sounds like "no storing, no linking, no post", which is not what the mode means.
+    assert "a destination channel is still created" in text, text
     assert not db.writes
 
 
