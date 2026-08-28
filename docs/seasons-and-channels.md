@@ -305,6 +305,85 @@ of the backlog to point at it first.
 
 ---
 
+## 4. When the channel you add is the channel you publish in
+
+Everything above assumes the pipeline *builds* a destination: a new private channel, a name, a
+picture, an admin list, and posts made beside the files. There is a second shape, and it is the
+one a channel full of your own files needs: **the channel you add is the destination**, and the
+only thing wrong with it is the text under each video.
+
+| | link mode (`link_post`) | in-place mode (`in_place_caption`) |
+| --- | --- | --- |
+| where the file lives | private master archive, then a link | already in this channel |
+| what a post is | Channel Help composes text + buttons | the existing file message, edited |
+| what is fetched | every accepted file | nothing, unless an episode is missing here |
+| what is deleted | never | never |
+| does "Hindi audio proven" gate it | yes | no — see below |
+| inline buttons | yes | no (and nothing to link to) |
+
+### Which channel is which, when two of them share a name
+
+The rule the operator gave, implemented in `app.inplace.pair_roles`: the channel **we are admin
+in** is the destination, the one where we are an ordinary **member** is a source. It is not a
+trust judgement — an account with no posting rights physically cannot edit those messages, so
+the rights *are* the answer, and guessing the other way round produces a job that fails on every
+file. Two admin-able channels with one name is a question rather than a sort; neither is a
+writable channel is also a question ("add the session as admin first"). Recorded in
+`app.source_channel.we_are_admin` and `publish_role`, so a later run explains the decision
+instead of silently re-making it.
+
+### Twelve files there, twelve files here: twelve edits, zero copies
+
+The comparison is `app.inplace.compare(destination_episodes, source_episodes)`, and the case the
+operator described — 12 raw files in the source, the same 12 raw files in the destination — comes
+back as `12 caption` and nothing else. No episode is fetched, because none is missing.
+
+Two other answers it can give, both deliberate:
+
+* an episode only the *source* has becomes `copy_then_caption`, and the copy is a **server-side
+  forward from the master archive** — the free tier buys no download;
+* equal counts with **no overlap** (here `1-12`, there `13-24`) is *not* twelve missing files. It
+  is one renumbering scheme against another, and copying would paste the whole season onto itself.
+  So `SeasonShape.numbering_shifted` reports the offset and the plan emits **one question and zero
+  copies**. A partial overlap proves the two lists use the same scheme, and then the difference is
+  acted on.
+
+### What gets overwritten without asking
+
+`looks_like_label` is the whole safety rule: an empty caption, or one that is nothing but an
+episode marker (`episode 7`, `E07`, `07/24`, `PART 3`, `12 - mkv`, `S2 E3`), is a label and is
+replaced. Anything carrying a link, an `@handle`, a date, or the words *fixed / updated / note /
+source / mirror / link* is information, and it becomes `ask` with the old text preserved — in
+Telegram a replaced caption is gone, so `app.destination_post.caption_previous` is the only copy.
+
+Two more refusals, both small and both load-bearing: a caption over Telegram's **1024-character**
+media-caption limit is a question, never a truncation; and a message whose text already equals the
+caption we would write is a `skip`, which is what makes a restart in the middle of a 400-episode
+backlog resume instead of re-editing.
+
+### Why the audio gate does not apply here
+
+The Hindi-audio rule guards the door through which files *enter* a channel: it is what stops a
+stranger's subbed release being published to 30k members as a Hindi one. In-place mode opens no
+such door — you posted the file, it is your channel, and a caption withheld from your own video is
+a formatting failure rather than a scope violation. So `inplace.mode_allows_missing_audio` turns
+that one gate off for this mode, and nothing else moves: a file whose own text says *subbed* still
+says subbed, and a file being **brought in** from another channel is still judged by every rule in
+part 3. The caption prints `〄 𝗔𝘂𝗱𝗶𝗼: Unknown` rather than inventing `Hindi`; say
+`/source <channel> audio hindi` and it prints Hindi with the provenance to back it.
+
+### What is not finished
+
+The decision table, the plan, the caption and the mode are implemented and tested, and
+`/inplace` shows the plan against the real rows today. The edit itself is one call in the MTProto
+layer — `EditMessage` with the new text — which is the same unwired write path as publishing. The
+job kind exists (`edit_post`), the dedup key exists (`inplace:<destination>:<message>`), and the
+row to record the result exists; what is missing is a live session to send from. So `/inplace` says
+"this command changed the plan, not the channel", and that is the accurate sentence until the first
+real edit goes out.
+
+---
+
 ## Where each decision is recorded
 
 | Question | Answer lives in |
@@ -316,6 +395,8 @@ of the backlog to point at it first.
 | how far did channel setup get before the restart? | `app.destination.setup_state` |
 | which picture is on the channel, and why that one? | `app.destination.photo_source` / `photo_candidate_id` |
 | whose words were the series / the language / the quality? | `app.source_channel.declared_*`, mirrored into the candidate's `parsed` as `*_source` |
+| which publishing mode a destination uses, and which source it was compared with | `app.destination.publish_mode` / `paired_source_channel_id`, plus `app.source_channel.publish_role` |
+| what the text under a file post said before we captioned it | `app.destination_post.caption_previous` (and `edits`, how often it was rewritten) |
 
 A decision that is only in a log line is a decision nobody can audit next month, which is
 why every one of these is a column rather than a comment.

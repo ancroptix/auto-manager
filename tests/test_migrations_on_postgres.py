@@ -2132,3 +2132,195 @@ def test_season_completeness_needs_a_declaration_not_a_pause(conn, seed):
         cur.execute("delete from app.episode where season_id = %s", (season_id,))
         cur.execute("delete from app.season where id = %s", (season_id,))
         cur.execute("delete from app.series where id = %s", (paused_id,))
+
+
+def test_in_place_captioning_replaces_the_gate_and_the_plan_is_the_proof(conn):
+    """The second shape of the job, end to end, on the real schema.
+
+    The operator's channel already holds the files and each message says ``episode 7``. In
+    link mode that file is parked — "cannot determine whether the file carries Hindi audio" —
+    because publishing it would be putting a stranger's unproven file in front of 30k members.
+    In place mode there is no such act: the file is already posted, by them, in their own
+    channel, and the only thing missing is the caption. So the mode flips one gate and nothing
+    else, and that has to be visible in the row it writes.
+    """
+    import asyncio
+
+    from app import inplace
+    from app.controlbot import ControlBot
+    from app.db import Database
+    from app.ingest import record_message
+
+    # Not `_ingest_channel`: its series row is named `ingest <handle>`, and an earlier test's
+    # cleanup deletes every row matching `ingest %` — which quietly unlinks this channel's
+    # series and makes the control bot's lookup answer "not configured". This test owns its
+    # rows, including removing them first, so a leftover from a previous run cannot answer for
+    # the one being made now.
+    slug, tg = "inplace @yc_inplace", -100700097
+    for statement in (
+        "delete from app.destination_post where destination_id in"
+        " (select id from app.destination where telegram_channel_id = %s)",
+        "delete from app.destination where telegram_channel_id = %s",
+        "delete from app.source_candidate where source_channel_id in"
+        " (select id from app.source_channel where telegram_channel_id = %s)",
+        "delete from app.processed_message where source_channel_id in"
+        " (select id from app.source_channel where telegram_channel_id = %s)",
+        "delete from app.source_channel where telegram_channel_id = %s",
+        "delete from app.season where series_id in"
+        " (select id from app.series where normalized_title = %s)",
+        "delete from app.series where normalized_title = %s",
+    ):
+        conn.execute(statement, (tg if "channel_id = %s" in statement else slug,))
+    with conn.cursor() as cur:
+        cur.execute(
+            "insert into app.series (title, normalized_title) values (%s, %s) returning id",
+            ("Naruto Inplace", slug),
+        )
+        series_id = cur.fetchone()[0]
+        cur.execute(
+            "insert into app.source_channel (series_id, telegram_channel_id, username, title, priority, mode)"
+            " values (%s, %s, 'yc_inplace', 'Naruto Inplace', 100, 'full') returning id",
+            (series_id, tg),
+        )
+        channel_id = cur.fetchone()[0]
+    db = Database(_ingest_settings())
+
+    class Api:
+        async def send(self, chat_id, text, *, reply_to=None, parse_mode=None):
+            return 1
+
+        async def delete(self, chat_id, *message_ids):
+            return 0
+
+        async def get_updates(self, *, timeout=None):
+            return []
+
+        async def get_me(self):
+            return {"id": 1, "username": "ctrl"}
+
+        async def answer_callback(self, callback_id, text=""):
+            return None
+
+    def update(text: str, update_id: int):
+        from app.botapi import Update
+
+        return Update(
+            update_id=update_id, chat_id=7, from_id=7, from_username=None, text=text, message_id=update_id
+        )
+
+    async def scenario() -> None:
+        assert await db.connect(), await db.last_error
+        bot = ControlBot(api=Api(), db=db, settings=_ingest_settings(), owner_ids=frozenset({7}))
+
+        async def scan(message_id: int, episode: int) -> dict:
+            return await record_message(
+                db,
+                source_channel_id=channel_id,
+                message_id=message_id,
+                media_type="document",
+                file_name=f"episode {episode}.mp4",
+                raw_caption=f"episode {episode}",
+                video_height=720,
+                fingerprint=f"inplace-{message_id}",
+            )
+
+        parked = await scan(8301, 1)
+        assert parked["disposition"] == "pending", parked
+        assert parked["audio_gate"] == "hindi-audio-required", parked
+
+        # The command's own preview, before it changes anything: one message, one caption, and
+        # the honest line that there is no second channel to compare against.
+        replies = await bot.dispatch(update("/inplace @yc_inplace plan", 1))
+        text = replies[0].text
+        assert "plan only" in text and "1 caption" in text, text
+        assert "no source channel to compare" in text, text
+        assert parked["disposition"] == "pending", "plan must not have written anything"
+
+        # Now the mode is recorded. Nothing about the file changed; what changed is which rules
+        # apply to it, and the next scan of a *different* file has to show that.
+        replies = await bot.dispatch(update("/inplace @yc_inplace", 2))
+        assert "in-place captioning is ON" in replies[0].text, replies[0].text
+        role = conn.execute(
+            "select publish_role from app.source_channel where id = %s", (channel_id,)
+        ).fetchone()[0]
+        assert role == "source_and_destination", role
+
+        filed = await scan(8302, 2)
+        assert filed["disposition"] == "accepted", filed
+        assert filed["audio_gate"] == "relaxed-for-in-place-captioning", filed
+        assert "captioned_without_audio_claim" in filed["flags"], filed
+        # Accepted, not *claimed*: the caption this file would print says Unknown, and the
+        # series still comes from the channel's own title (one signal), so the archive row is
+        # the only place it becomes a claim.
+        assert filed["audio_source"] == "none" and filed["series_source"] == "channel_name", filed
+        assert len(filed["episodes"]) == 1 and len(filed["variants"]) == 1, filed
+
+        # The plan the publisher would act on, read straight from the rows.
+        rows = await bot._inplace_rows({"id": channel_id}, None)
+        assert len(rows) == 2, rows
+        decisions = inplace.plan(rows)
+        assert [decision.action for decision in decisions] == [inplace.Action.CAPTION] * 2, decisions
+        caption = decisions[0].caption
+        caption_by_episode = {decision.episode: decision.caption for decision in decisions}
+        assert "\u274d 𝗘𝗽𝗶𝘀𝗼𝗱𝗲: 01" in caption, caption  # padded, like the approved box
+        assert "〄 𝗔𝘂𝗱𝗶𝗼: Unknown" in caption and "◎ 𝗧𝗼𝘁𝗮𝗹 𝗘𝗽𝗶𝘀𝗼𝗱𝗲𝘀: TBA" in caption, caption
+        assert "\u2750" not in caption and "http" not in caption, caption  # no buttons, no link
+        assert decisions[0].previous_caption == "episode 1", decisions[0]
+
+        # Writing it is a separate act; the row that records it makes a re-plan a no-op and
+        # keeps the burned text, which is the only copy Telegram does not have.
+        destination_id = conn.execute(
+            "insert into app.destination (series_id, telegram_channel_id, title, publish_mode)"
+            " values (%s, %s, %s, 'in_place_caption') returning id",
+            (series_id, -100700097, "Naruto Inplace"),
+        ).fetchone()[0]
+        episode_id = conn.execute(
+            "select e.id from app.episode e join app.season s on s.id = e.season_id"
+            " where s.series_id = %s and s.season_number = 1 and e.episode_number = 2",
+            (series_id,),
+        ).fetchone()[0]
+
+        # Writing the caption is the publisher's act, not this command's. What the row buys is
+        # that a second pass is a no-op — the message carries the box, and the text it replaced
+        # is kept here because Telegram keeps no copy of it.
+        conn.execute(
+            "insert into app.destination_post"
+            " (destination_id, kind, episode_id, message_id, body, caption_previous, edits)"
+            " values (%s, 'episode', %s, 8302, %s, %s, 1)",
+            (destination_id, episode_id, caption_by_episode[2], "episode 2"),
+        )
+        conn.execute(
+            "update app.source_candidate set raw_caption = %s"
+            " where source_channel_id = %s and message_id = 8302",
+            (caption_by_episode[2], channel_id),
+        )
+        rows = await bot._inplace_rows(
+            {"id": channel_id}, {"id": destination_id, "series_id": series_id}
+        )
+        by_message = {decision.message_id: decision for decision in inplace.plan(rows)}
+        assert by_message[8302].action == inplace.Action.SKIP, by_message[8302]
+        assert by_message[8301].action == inplace.Action.CAPTION, by_message[8301]
+        stored = conn.execute(
+            "select caption_previous, body, edits from app.destination_post where message_id = 8302"
+        ).fetchone()
+        assert stored[0] == "episode 2" and stored[1] == caption_by_episode[2], stored
+        assert stored[2] == 1, stored
+
+        # Switching back is a write too, and it must not un-caption anything: the edited post
+        # stays edited, because undoing a caption is a human decision about their own channel.
+        replies = await bot.dispatch(update("/inplace @yc_inplace off", 3))
+        assert "link route again" in replies[0].text, replies[0].text
+        mode, role = conn.execute(
+            "select d.publish_mode, s.publish_role from app.destination d, app.source_channel s"
+            " where d.id = %s and s.id = %s",
+            (destination_id, channel_id),
+        ).fetchone()
+        assert mode == "link_post" and role == "source", (mode, role)
+        third = await scan(8303, 3)
+        assert third["disposition"] == "pending" and third["audio_gate"] == "hindi-audio-required", third
+
+        conn.execute("delete from app.destination_post where destination_id = %s", (destination_id,))
+        conn.execute("delete from app.destination where id = %s", (destination_id,))
+        conn.execute("delete from app.source_candidate where source_channel_id = %s", (channel_id,))
+
+    asyncio.run(scenario())

@@ -30,6 +30,11 @@ lines the parser recognises, which is why they are kept on their own line each.
 
 Posted by Channel Help into `{TITLE} Anime in Hindi`.
 
+In the second publishing mode (`/inplace`, 0007) the same box — every character of it — is written
+onto the file message that already exists in the operator's own channel, with nothing under it: no
+button line, because there is no link to attach and a user session cannot put a keyboard on a media
+message. A caption used that way must stand alone, which this one does.
+
 ```text
 ✦ Dekin no mogura: The earthbound mole ✦
 

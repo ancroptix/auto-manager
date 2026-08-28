@@ -26,6 +26,7 @@ __all__ = [
     "storage_key",
     "publish_key",
     "sticker_key",
+    "inplace_key",
     "screening_key",
     "reconciliation_key",
     "campaign_key",
@@ -129,6 +130,16 @@ def publish_key(episode_id: int) -> str:
     post is edited in place: a new quality reuses the same job rather than
     creating a second post out of order in the channel."""
     return f"publish:episode:{int(episode_id)}"
+
+
+def inplace_key(destination_id: int, message_id: int) -> str:
+    """One in-place caption edit per (destination, message), forever.
+
+    A re-run must be a no-op, and a restart mid-list must resume rather than re-edit: the
+    message id is the stable thing here, unlike a candidate id, because in this mode the post
+    *is* the message that was already there.
+    """
+    return f"inplace:{destination_id}:{message_id}"
 
 
 def sticker_key(season_id: int) -> str:

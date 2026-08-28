@@ -105,6 +105,10 @@ stage**, and a `reconciliation` job is enqueued. So it resumes at
 | One active universal link per episode | partial unique index | `test_one_active_universal_link_per_episode` |
 | Display order is 480p, 720p, 1080p regardless of arrival order | `v_episode_manifest` ordered by `quality_rank` | `test_manifest_orders_by_quality_not_arrival` |
 | A half-imported season never gets a "Complete Season" post | `v_season_coverage.season_complete` requires a file per episode **and** a declared span | `test_season_coverage_needs_files_not_just_row_counts` |
+| In-place captioning never overwrites a message's real note | `app.inplace.looks_like_label` (whole-string label patterns) + `ASK` | `test_anything_with_information_in_it_is_not` |
+| The text a caption replaced still exists somewhere | `app.destination_post.caption_previous` | `test_a_replacement_carries_the_text_it_burned` |
+| Twelve files here and twelve there is twelve edits, not twelve copies | `SeasonShape.counts` -> `plan` | `test_twelve_files_against_twelve_files_is_twelve_edits_and_no_copies` |
+| A suspected renumbering copies nothing at all | `SeasonShape.numbering_shifted` short-circuits the copy branch | `test_the_renumbering_trap_copies_nothing_and_asks_instead` |
 | A source pausing is not read as a season finishing | ingest writes `observed_first/last`; the view reads `first_episode/last_episode`, which only `/declare` writes | `test_season_completeness_needs_a_declaration_not_a_pause` |
 | An unlabelled numbering restart cannot open a season on a guess | `seasons.classify` returns an `ask_owner` reset and `ingest` parks the candidate instead of writing a season row | `test_an_unlabelled_restart_is_held_and_files_nothing`, `test_unlabelled_restart_is_a_boundary_we_do_not_act_on_alone` |
 | Season stickers go out in the operator's order, once | `transition_stickers()` + one flag per side, and `publish_hold()` | `test_the_stickers_come_in_the_operators_order`, `test_stickers_are_never_posted_twice_for_one_boundary` |

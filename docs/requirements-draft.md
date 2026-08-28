@@ -29,12 +29,43 @@ season length, open a season boundary, or outvote a file whose own text contradi
 Quality may come from the video's pixel size (shorter side), because Telegram reports that
 without a download; language may not come from anything but text or a declaration.
 
+## 2c. In-place publishing (added 2026-08-28, supersedes parts of 2b, 5 and 6)
+
+The channel the operator adds is sometimes the channel to be published: it already holds the
+episodes as files, each message saying nothing but `episode 7`. In that shape the job is
+**captioning, not fetching** — the operator's words were "unhe theek karoge, mtlb post bana doge".
+
+- The existing file post is **edited in place**. No new post beside it, no re-post, and the earlier
+  idea of deleting the file afterwards is set aside: an edit keeps the post working and a deletion
+  buys nothing. Nothing in this mode deletes.
+- When two same-named channels are joined and we are **admin in one, member in the other**: admin
+  is the destination, member is the source. Rights decide it, because a channel we cannot post in
+  cannot be captioned. Both holding the same 12 episodes means **12 edits and nothing else**.
+- The approved caption is written on the file itself; Channel Help is not involved (it posts text
+  plus buttons, and here there is no link to put in a button), and no inline keyboard is claimed —
+  a user session cannot attach one to a media message.
+- The **Hindi-audio gate does not apply** to it: that gate guards files *entering* a channel. A file
+  whose own text says `subbed` still says subbed; a file being brought in from elsewhere is still
+  judged by every rule above.
+- A caption replaces existing text only when that text is an episode **label**. Anything with a link,
+  a handle, a date or a second sentence in it is left alone and asked about, and the replaced text is
+  stored (`app.destination_post.caption_previous`) because Telegram keeps no copy.
+- Corrections that apply to both modes: a source channel's files and thumbnails need not be
+  watermark-free to be usable — screening **ranks** copies and picks the best, and a channel with no
+  clean candidate is flagged and published with the least-bad copy rather than blocked (content is
+  the operator's own; leech channels re-watermark it). Re-rendering a thumbnail by downloading and
+  re-uploading still requires asking first.
+
 ## 3. Destination channels
 
 - One **private** destination channel per complete series.
 - Default name: `{TITLE} Anime in Hindi`.
 - Title is derived by cross-checking the source channel name against captions and filenames in that channel. Both
   signals must agree before a name is generated (e.g. source `berserk` + episodes of *Berserk* → `Berserk Anime in Hindi`).
+  This two-signal rule is about **naming a channel that does not exist yet**. A channel that already exists — an
+  in-place destination, or a caption on a file — takes its title from one signal (the declared series, the channel
+  name, or the filename), records that as `series_source = 'channel_name'`, and parks only when the signals
+  contradict each other (operator correction, 2026-08-28).
 - Destination channels are created automatically when both signals agree; no interactive confirmation is required.
 - The name is capped at Telegram's 128 characters by shortening the title and never the `Anime in Hindi` suffix.
 - **Profile, at creation, before anyone else is involved:** title, photo and bio are set as one ordered step

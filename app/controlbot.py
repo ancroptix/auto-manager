@@ -63,6 +63,7 @@ HELP = """auto-manager control
 /probe       ask the storage bot and Channel Help their questions (report arrives here)
 /declare     say how long a season is (Total Episodes, and the batch post)
 /source      say what a source channel carries (series, audio, season) — for bare-file channels
+/inplace     caption the files already posted in your own channel (no copy, no delete)
 /sessions    stored Telegram sessions (never their contents)
 /use <name>  make one session the active account
 /forget <n>  delete a stored session from the database
@@ -94,6 +95,7 @@ _ROUTES: dict[str, str] = {
     "probe": "_probe",
     "declare": "_declare",
     "source": "_source",
+    "inplace": "_inplace",
     "sessions": "_sessions",
     "use": "_use",
     "forget": "_forget",
@@ -102,6 +104,20 @@ _ROUTES: dict[str, str] = {
     "password": "_password",
     "cancel": "_cancel",
 }
+
+
+def _col(row: Any, name: str, default: Any = None) -> Any:
+    """Read one column, tolerating a row that does not carry it.
+
+    A couple of these commands read columns added by later migrations, and a fake row in the
+    tests answers with the shape the earlier commands needed. Reading ``None`` there is the
+    right failure, because "not recorded" is also what it means in the database.
+    """
+    try:
+        value = row[name]
+    except (KeyError, IndexError, TypeError):
+        return default
+    return default if value is None else value
 
 
 def _int_or_none(token: str | None) -> int | None:
@@ -627,12 +643,286 @@ class ControlBot:
         "audio is one of: hindi, dual, multi, subbed, subbed_only, unknown."
     )
 
+    _INPLACE_USAGE = (
+        "usage: /inplace <@handle or channel id> [from <@other>] [plan|off]\n"
+        "  /inplace @naruto_hindi                  caption the files already in that channel\n"
+        "  /inplace @naruto_hindi plan             show the plan, change nothing\n"
+        "  /inplace @naruto_hindi from @uploads4u  also compare with that source, to fill gaps\n"
+        "  /inplace @naruto_hindi off              back to the link route\n\n"
+        "in-place means: no new channel, no copying, no deleting. the post that already holds "
+        "the file gets the approved caption written on it."
+    )
+
+    async def _inplace(self, update: Update, args: list[str]) -> list[Reply]:
+        """``/inplace <channel> [from <other>] [plan|off]`` — publish by editing, not by posting.
+
+        The other shape of this service, for the case the operator described: a channel whose
+        messages already are the posts, each saying nothing but ``episode 7``. This command
+        records the mode and shows the plan it implies. It never touches Telegram, and it says so:
+        the edits themselves are the user session's job, and the publish layer is unwired.
+        """
+        from . import inplace
+
+        handle = (args[0].strip() if args else "")
+        if not handle or handle.lower() in {"help", "?"}:
+            return [Reply(self._INPLACE_USAGE)]
+        if self.db is None or not getattr(self.db, "connected", False):
+            return [Reply("the database is not reachable, so I cannot record a publish mode.")]
+
+        tokens = [token.strip() for token in args[1:]]
+        other = ""
+        if tokens and tokens[0].casefold() == "from":
+            if len(tokens) < 2 or not tokens[1]:
+                return [Reply(f"`from` needs the other channel's @handle or id.\n{self._INPLACE_USAGE}")]
+            other = tokens[1]
+            tokens = tokens[2:]
+        if len(tokens) > 1:
+            return [Reply(f"one of plan or off, not both.\n{self._INPLACE_USAGE}")]
+        flag = tokens[0].casefold() if tokens else ""
+        if flag not in {"", "plan", "off"}:
+            return [Reply(f"I did not understand `{tokens[0]}`.\n{self._INPLACE_USAGE}")]
+
+        rows = await self._find_source_channel(handle)
+        if isinstance(rows, str):
+            return [Reply(rows)]
+        if len(rows) > 1:
+            listed = "\n".join(
+                f"  {row['id']}: @{_col(row, 'username', '?')} — {_col(row, 'title', 'no title')}" for row in rows
+            )
+            return [Reply(f"`{handle}` matches {len(rows)} channels, so I will not pick one:\n{listed}")]
+        channel = rows[0]
+
+        destination = await self.db.fetchrow(
+            """
+            select id, telegram_channel_id, title, series_id, publish_mode,
+                   coalesce(paired_source_channel_id, -1) as paired_source_channel_id
+              from app.destination
+             where id = $1 or ($2::bigint is not null and telegram_channel_id = $2)
+             order by id
+             limit 1
+            """,
+            _col(channel, "destination_id", -1),
+            _col(channel, "telegram_channel_id"),
+        )
+        if destination is not None and "id" not in destination:  # a fake row with no destination
+            destination = None
+
+        plan_rows = await self._inplace_rows(channel, destination)
+        source_row = None
+        shape = None
+        if other:
+            source_rows = await self._find_source_channel(other)
+            if isinstance(source_rows, str):
+                return [Reply(source_rows)]
+            if len(source_rows) > 1:
+                return [Reply(f"`{other}` matches {len(source_rows)} channels — name one exactly.")]
+            source_row = source_rows[0]
+            shape = await self._inplace_shape(plan_rows, source_row)
+
+        overwrite = str(await self.db.config("inplace.overwrite_notes", "ask") or "ask").casefold()
+        allow_copy = bool(await self.db.config("inplace.copy_missing", True))
+        decisions = inplace.plan(
+            plan_rows,
+            shape=shape,
+            allow_copy=allow_copy,
+            replace_notes=overwrite == "replace",
+            destination_id=destination["id"] if destination else None,
+        )
+        preview = self._inplace_text(channel, decisions, shape, overwrite=overwrite)
+
+        if flag == "plan":
+            return [Reply(preview + "\n\n(plan only — nothing was changed.)")]
+
+        if flag == "off":
+            await self.db.execute(
+                "update app.source_channel set publish_role = 'source', updated_at = now() where id = $1",
+                channel["id"],
+            )
+            if destination:
+                await self.db.execute(
+                    "update app.destination set publish_mode = 'link_post', updated_at = now() where id = $1",
+                    destination["id"],
+                )
+            return [
+                Reply(
+                    f"link route again for {handle}: nothing will be written onto the posts that "
+                    "are already there. I did not change any message either — an episode that "
+                    "already carries our caption keeps it, and /inplace plan lists those."
+                )
+            ]
+
+        await self.db.execute(
+            "update app.source_channel set publish_role = $2, updated_at = now() where id = $1",
+            channel["id"],
+            "destination" if other else "source_and_destination",
+        )
+        if destination:
+            await self.db.execute(
+                "update app.destination set publish_mode = 'in_place_caption', updated_at = now() "
+                "where id = $1",
+                destination["id"],
+            )
+        if source_row is not None:
+            await self.db.execute(
+                "update app.source_channel set publish_role = 'source', updated_at = now() where id = $1",
+                source_row["id"],
+            )
+            if destination:
+                await self.db.execute(
+                    "update app.destination set paired_source_channel_id = $2, updated_at = now() "
+                    "where id = $1",
+                    destination["id"],
+                    source_row["id"],
+                )
+        note = ""
+        if not destination:
+            note = (
+                "\n\nthis channel has no row in app.destination yet, so the mode is recorded on the "
+                "channel itself; the destination row inherits it when it is created or linked, and "
+                "until then nothing here is published either way."
+            )
+        return [Reply(f"in-place captioning is ON for {handle}.\n\n{preview}{note}")]
+
+    async def _inplace_rows(self, channel: Any, destination: Any) -> list:
+        """The channel's own file messages, in the shape ``app.inplace.plan`` reads.
+
+        One query per channel, not per episode: a 400-episode backlog has to be planable in a
+        single round trip, because the plan is what the operator sees before any edit is tried.
+        Every disposition is included — in this mode a file parked for want of an audio claim
+        still has a caption missing, and that is exactly what the mode is for.
+        """
+        import json
+
+        rows = await self.db.fetch(
+            """
+            select c.message_id,
+                   c.episode_number as episode,
+                   c.raw_caption    as caption,
+                   (c.media_type is not null or c.file_name is not null) as is_media,
+                   c.parsed ->> 'audio_kind' as audio_kind,
+                   c.parsed -> 'languages'   as languages,
+                   coalesce(nullif(sc.declared_series, ''), nullif(sr.title, ''), sc.title) as title,
+                   sr.subtitle as subtitle,
+                   c.season_number as season,
+                   s.first_episode as declared_first,
+                   s.last_episode  as declared_episodes,
+                   s.observed_first,
+                   s.observed_last,
+                   dp.caption_previous
+              from app.source_candidate c
+              join app.source_channel sc on sc.id = c.source_channel_id
+              left join app.series sr on sr.id = coalesce($2::bigint, sc.series_id)
+              left join app.season s on s.series_id = sr.id and s.season_number = coalesce(c.season_number, 1)
+              left join app.destination_post dp
+                     on dp.destination_id = $3 and dp.message_id = c.message_id and dp.kind = 'episode'
+             where c.source_channel_id = $1
+             order by c.episode_number nulls last, c.message_id
+            """,
+            channel["id"],
+            destination["series_id"] if destination else None,
+            destination["id"] if destination else None,
+        )
+        unknown = await self.db.config("caption.total_episodes_unknown", "TBA")
+        out = []
+        for row in rows:
+            item = dict(row)
+            languages = item.pop("languages", None)
+            if isinstance(languages, str):
+                try:
+                    languages = json.loads(languages)
+                except ValueError:
+                    languages = None
+            item["languages"] = [str(value) for value in (languages or []) if str(value).strip()]
+            item["unknown_label"] = unknown
+            out.append(item)
+        return out
+
+    async def _inplace_shape(self, plan_rows: list, source_channel: Any) -> Any:
+        """Both channels' episode numbers, as :func:`app.inplace.compare` reads them."""
+        from . import inplace
+
+        theirs = await self.db.fetch(
+            """
+            select distinct episode_number
+              from app.source_candidate
+             where source_channel_id = $1 and episode_number is not null
+             order by episode_number
+            """,
+            source_channel["id"],
+        )
+        return inplace.compare(
+            [row.get("episode") for row in plan_rows],
+            [row["episode_number"] for row in theirs],
+        )
+
+    def _inplace_text(self, channel: Any, decisions: list, shape: Any, *, overwrite: str) -> str:
+        """The plan in the operator's words, with the questions on top instead of buried."""
+        from . import inplace
+
+        lines = [
+            f"what I would do with the {len(decisions)} messages of this channel:",
+            "  " + inplace.summary(decisions),
+            "  " + inplace.shape_note(shape),
+        ]
+        asks = [decision for decision in decisions if decision.action == inplace.Action.ASK]
+        if asks:
+            lines.append("")
+            lines.append(f"{len(asks)} need you before I touch them:")
+            for decision in asks[:3]:
+                where = f"msg {decision.message_id}" if decision.message_id else "a file with no number on it"
+                lines.append(f"  {where}: {decision.reason}")
+            if len(asks) > 3:
+                lines.append(f"  … and {len(asks) - 3} more like that")
+        overwritten = [
+            decision for decision in decisions if "overwrite_notes" in (decision.reason or "")
+        ]
+        if overwritten:
+            lines.append("")
+            lines.append(
+                f"{len(overwritten)} of these carry a note rather than a label, and "
+                'inplace.overwrite_notes = "replace" is what wrote over it. the text it replaced '
+                "is in app.destination_post.caption_previous, which is the only copy Telegram "
+                "does not have."
+            )
+        elif any("note" in (decision.reason or "") for decision in asks):
+            lines.append("")
+            lines.append(
+                "(if every one of those notes is your own text and you want it gone, set "
+                '"inplace.overwrite_notes" to "replace" in app.config — the old caption is kept '
+                "either way.)"
+            )
+        keys = [
+            str(decision.details.get("dedup_key"))
+            for decision in decisions
+            if decision.details.get("dedup_key")
+        ]
+        if keys:
+            lines.append("")
+            lines.append(
+                f"each edit is its own job, keyed once per message ({keys[0]}): running this twice "
+                "on the same channel cannot edit the same post twice, and a restart in the middle "
+                "resumes at the first message that still needs it."
+            )
+        lines.append("")
+        lines.append(
+            "no new channel, no copy, no deletion, and no buttons under the post: a user session "
+            "cannot attach a keyboard to a video, and there is no link to put in one here, so the "
+            "caption has to stand on its own. it does — the approved box, powered-by line included."
+        )
+        lines.append(
+            "this command changed the plan, not the channel. the edits go out through the user "
+            "session, and while the publish layer is unwired that is the part still missing."
+        )
+        return "\n".join(lines)
+
     async def _find_source_channel(self, handle: str) -> list | str:
         """Look a source channel up by @handle or numeric Telegram id.
 
         Both, because the operator reads handles in Telegram and the database keys on the
         numeric id, and the one case where a numeric-looking handle is actually a username
-        (`@1000hours`) is handled by matching the text form too.
+        (`@1000hours`) is handled by matching the text form too. A stored ``@`` is trimmed on
+        our side as well: these rows are also edited by hand in the dashboard, and a row saved
+        as ``@some_channel`` must still answer to ``/source @some_channel``.
         """
         stripped = handle.lstrip("@")
         # Negative on purpose: every Telegram channel id the operator will copy out of a
@@ -641,12 +931,13 @@ class ControlBot:
         numeric = int(stripped) if stripped.lstrip("-").isdigit() and stripped != "-" else None
         rows = await self.db.fetch(
             """
-            select id, username, title, telegram_channel_id,
+            select id, username, title, telegram_channel_id, series_id, destination_id,
+                   we_are_admin, publish_role,
                    coalesce(declared_series, '') as declared_series,
                    coalesce(declared_audio, '') as declared_audio,
                    coalesce(declared_season, -1) as declared_season
               from app.source_channel
-             where ($1::text is not null and (lower(coalesce(username, '')) = lower($1)
+             where ($1::text is not null and (lower(btrim(coalesce(username, ''), '@')) = lower($1)
                                               or lower(coalesce(title, '')) = lower($1)))
                 or ($2::bigint is not null and telegram_channel_id = $2)
              order by id

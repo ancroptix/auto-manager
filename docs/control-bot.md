@@ -123,6 +123,7 @@ at boot; if it comes back with `authorized: true`, that is the whole proof.
 | `/reconcile` | reclaims expired leases and queues a reconciliation pass |
 | `/probe` | read-only discovery against the storage bot and Channel Help; the report arrives in this chat |
 | `/source <@handle\|channel id> [series <name>] [audio <kind>] [season <n>]` | what a *files-only* source channel carries, stated once for the whole channel instead of guessed per file. With no arguments it shows what is declared; `clear` stops assuming. It never re-decides a file that was already decided — parked ones are re-read on the next scan |
+| `/inplace <@handle\|channel id> [from <@other>] [plan\|off]` | publish by editing instead of posting: the channel's own file messages get the approved caption written onto them. No new channel, no copy, no delete, no buttons. `plan` shows what it would do and changes nothing; `from` compares with a second channel so episodes only *it* has are forwarded in; `off` goes back to the link route |
 | `/declare <series> <season> <episodes>` | state how long a season is — the only thing that can fill **◎ Total Episodes**, and the only thing that can make a season count as complete. It publishes nothing itself; the batch post stays the publisher's decision. `/declare bleach 2 tba` takes the claim back |
 | `/sessions` | name, kind, account, age, character count — never contents |
 | `/use backup` | make another stored session the live one |
@@ -131,6 +132,31 @@ at boot; if it comes back with `authorized: true`, that is the whole proof.
 
 Every one of these is a thin wrapper over something the HTTP control surface
 already exposes; the bot adds no authority of its own.
+
+### What `/inplace` answers before you ask it twice
+
+The preview line it prints is not decoration — it is the same plan the publisher
+will act on, computed from the rows in the database:
+
+```
+what I would do with the 12 messages of this channel:
+  12 caption
+  no source channel to compare with: everything here is captioned from this channel alone
+
+no new channel, no copy, no deletion, and no buttons under the post …
+```
+
+Two replies to expect, both deliberate:
+
+* **a question instead of an edit** — if a message's existing text is more than an
+  episode label (a note, a mirror link, a date), it is left alone and named:
+  `msg 902: the existing caption looks like a note`. Telegram keeps no history of a
+  caption, so guessing costs you the text. Setting `inplace.overwrite_notes` to
+  `"replace"` in `app.config` makes it write anyway, and the replaced text is still
+  stored in `app.destination_post.caption_previous` — the only copy that exists.
+* **"this command changed the plan, not the channel"** — true until the MTProto write
+  layer is wired on the live account. `/inplace` is safe to run today; the edits follow
+  once the session can send `EditMessage`.
 
 ## 4. Closing the door afterwards
 

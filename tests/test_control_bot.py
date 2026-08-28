@@ -106,6 +106,12 @@ class FakeDb:
             }
         ]
         self.declared_history: list[dict] = []
+        # /inplace: the destination row for the channel being switched, the messages it would
+        # edit, and the episode numbers of the channel it is compared against.
+        self.destination: dict | None = None
+        self.inplace_rows: list[dict] = []
+        self.inplace_source: list[int] = []
+        self.config_rows: dict[str, Any] = {}
         # What `select reason, count(*) ... where disposition = 'pending'` would answer.
         self.parked: list[dict] = []
         self.writes: list[tuple[str, tuple]] = []
@@ -131,6 +137,10 @@ class FakeDb:
             needle = str(args[0] or "")
             hits = [row for row in self.series if needle and needle in row["normalized_title"]]
             return hits or ([] if needle else [dict(row) for row in self.series])
+        if "as is_media" in sql:  # /inplace's plan query
+            return [dict(row) for row in self.inplace_rows]
+        if "select distinct episode_number" in sql:
+            return [{"episode_number": number} for number in self.inplace_source]
         if "from app.source_candidate" in sql:
             return list(self.parked)
         if "from app.source_channel" in sql:
@@ -148,6 +158,8 @@ class FakeDb:
         return []
 
     async def fetchrow(self, sql: str, *args: Any):
+        if "from app.destination" in sql:
+            return dict(self.destination) if self.destination else None
         if "delete from app.telegram_session" in sql:
             removed = [row for row in self.stored if row["name"] == args[0]]
             self.stored = [row for row in self.stored if row["name"] != args[0]]
@@ -168,7 +180,30 @@ class FakeDb:
             return self.review_count
         return None
 
+    async def config(self, key: str, default: Any = None) -> Any:
+        return self.config_rows.get(key, default)
+
     async def execute(self, sql: str, *args: Any) -> int:
+        if "publish_role" in sql:
+            import re as _re
+
+            match = _re.search(r"publish_role = (?:'([^']+)'|\$(\d+))", sql)
+            role = match.group(1) or args[int(match.group(2)) - 1]
+            row = next((r for r in self.source_channels if r["id"] == args[0]), None)
+            if row is not None:
+                row["publish_role"] = role
+            self.writes.append((sql, args))
+            return 1
+        if "app.destination set" in sql:
+            import re as _re
+
+            mode = _re.search(r"publish_mode = '([^']+)'", sql)
+            if mode and self.destination is not None:
+                self.destination["publish_mode"] = mode.group(1)
+            if "paired_source_channel_id" in sql and self.destination is not None:
+                self.destination["paired_source_channel_id"] = args[1]
+            self.writes.append((sql, args))
+            return 1
         if "update app.source_channel set" in sql:
             import re as _re
 
@@ -1137,3 +1172,224 @@ async def test_source_without_a_database_says_so_instead_of_pretending() -> None
     # and the usage text, with no arguments at all, needs no database either
     control2 = ControlBot(api=FakeApi(), db=None, settings=settings(), owner_ids=frozenset({OWNER}))  # type: ignore[arg-type]
     assert "usage" in (await say(control2, "/source"))[0].lower()
+
+
+# ----------------------------------------------------------------------- /inplace
+# The second publishing shape: the channel that is added is the channel we publish in, its
+# files are already posted, and the only thing missing is the caption under them. These tests
+# are the command that records that mode and shows the plan it implies — including the two
+# replies that must not happen: a preview that writes, and an undo that rewrites messages.
+
+
+def _inplace_row(message_id: int = 901, episode: int | None = 1, caption: str | None = "episode 1", **extra: Any) -> dict:
+    row = {
+        "message_id": message_id,
+        "episode": episode,
+        "caption": caption,
+        "is_media": True,
+        "audio_kind": "hindi",
+        "languages": [],
+        "title": "Bleach",
+        "season": 1,
+        "declared_first": 1,
+        "declared_episodes": 12,
+        "observed_first": 1,
+        "observed_last": 12,
+        "caption_previous": None,
+        "unknown_label": "TBA",
+    }
+    row.update(extra)
+    return row
+
+
+async def test_inplace_explains_itself_before_touching_anything() -> None:
+    db = FakeDb()
+    control, _api, _db = bot(db=db)
+    (text,) = await say(control, "/inplace")
+    assert "usage" in text.lower() and "no copying, no deleting" in text
+    assert not db.writes
+
+
+async def test_inplace_shows_the_plan_and_writes_nothing_on_a_preview() -> None:
+    db = FakeDb()
+    db.inplace_rows = [
+        _inplace_row(901, 1, "episode 1"),
+        _inplace_row(902, 2, "episode 2 fixed, mirror link added"),
+    ]
+    control, _api, _db = bot(db=db)
+    (text,) = await say(control, "/inplace @anime_uploads4u plan")
+    assert "1 caption, 1 ask" in text, text
+    assert "plan only" in text and not db.writes, "a preview that writes is not a preview"
+    assert "msg 902" in text, "the question has to name the message it is about"
+    assert "no new channel, no copy, no deletion" in text
+    assert "unwired" in text, "the reply must not imply the edit has been sent"
+
+
+async def test_inplace_records_the_mode_on_the_channel_when_no_destination_row_exists() -> None:
+    """The channel row is where the answer has to live until a destination does.
+
+    An in-place channel is often added before any destination exists for it — that is the whole
+    point of the mode — and the audio gate is read per file, so a mode that only lived in
+    app.destination would silently do nothing for weeks.
+    """
+    db = FakeDb()
+    db.inplace_rows = [_inplace_row(901, 1)]
+    control, _api, _db = bot(db=db)
+    (text,) = await say(control, "/inplace @anime_uploads4u")
+    assert "in-place captioning is ON" in text
+    assert "no row in app.destination" in text
+    assert db.source_channels[0]["publish_role"] == "source_and_destination", db.source_channels[0]
+    assert len(db.writes) == 1, db.writes
+
+
+async def test_inplace_switches_the_destination_row_when_there_is_one() -> None:
+    db = FakeDb()
+    db.destination = {
+        "id": 6,
+        "telegram_channel_id": -1001112223334,
+        "title": "Bleach Anime in Hindi",
+        "series_id": 7,
+        "publish_mode": "link_post",
+        "paired_source_channel_id": -1,
+    }
+    db.source_channels[0]["destination_id"] = 6
+    db.inplace_rows = [_inplace_row(901, 1)]
+    control, _api, _db = bot(db=db)
+    (text,) = await say(control, "/inplace @anime_uploads4u")
+    assert db.destination["publish_mode"] == "in_place_caption", db.destination
+    assert "no row in app.destination" not in text, text
+    assert "1 caption" in text
+    assert "inplace:6:901" in text, "the reply must name the job a run would enqueue"
+
+
+async def test_inplace_off_reverts_the_mode_and_leaves_the_posts_alone() -> None:
+    """Undoing the mode is not undoing the work: an edited caption stays edited."""
+    db = FakeDb()
+    db.source_channels[0]["publish_role"] = "source_and_destination"
+    control, _api, _db = bot(db=db)
+    (text,) = await say(control, "/inplace @anime_uploads4u off")
+    assert "link route again" in text
+    assert "I did not change any message" in text
+    assert db.source_channels[0]["publish_role"] == "source", db.source_channels[0]
+
+
+async def test_inplace_paires_the_source_it_was_told_about() -> None:
+    db = FakeDb()
+    db.source_channels.append(
+        {
+            "id": 5,
+            "username": "anime_backup_src",
+            "title": "Bleach Source",
+            "telegram_channel_id": -1005556667778,
+            "declared_series": "",
+            "declared_audio": "",
+            "declared_season": -1,
+        }
+    )
+    db.destination = {
+        "id": 6,
+        "telegram_channel_id": -1001112223334,
+        "title": "Bleach Anime in Hindi",
+        "series_id": 7,
+        "publish_mode": "link_post",
+        "paired_source_channel_id": -1,
+    }
+    db.inplace_rows = [_inplace_row(901, 1), _inplace_row(902, 2)]
+    db.inplace_source = [1, 2, 3]  # the source has an episode this channel does not
+    control, _api, _db = bot(db=db)
+    (text,) = await say(control, "/inplace @anime_uploads4u from @anime_backup_src")
+    assert "2 caption, 1 copy_then_caption" in text, text
+    assert "1 only in the source" in text, text
+    assert db.source_channels[1]["publish_role"] == "source", db.source_channels[1]
+    assert db.destination["paired_source_channel_id"] == 5, db.destination
+
+
+async def test_inplace_refuses_to_copy_on_a_suspected_renumbering() -> None:
+    """Equal counts with no overlap is a numbering difference, not twelve missing files."""
+    db = FakeDb()
+    db.destination = {
+        "id": 6,
+        "telegram_channel_id": -1001112223334,
+        "title": "Bleach",
+        "series_id": 7,
+        "publish_mode": "link_post",
+        "paired_source_channel_id": -1,
+    }
+    db.source_channels.append(
+        {
+            "id": 5,
+            "username": "anime_backup_src",
+            "title": "Bleach Other",
+            "telegram_channel_id": -1005556667778,
+            "declared_series": "",
+            "declared_audio": "",
+            "declared_season": -1,
+        }
+    )
+    db.inplace_rows = [_inplace_row(900 + n, n) for n in (1, 2, 3, 4)]
+    db.inplace_source = [5, 6, 7, 8]
+    control, _api, _db = bot(db=db)
+    (text,) = await say(control, "/inplace @anime_uploads4u from @anime_backup_src plan")
+    assert "shifted by +4" in text, text
+    assert "copy_then_caption" not in text, text
+    assert "nothing is copied until you confirm" in text or "renumbering" in text, text
+
+
+async def test_inplace_honours_the_overwrite_knob_and_says_which_one_it_used() -> None:
+    db = FakeDb()
+    db.inplace_rows = [_inplace_row(901, 1, "episode 1 fixed, mirror link added")]
+    control, _api, _db = bot(db=db)
+    (asked,) = await say(control, "/inplace @anime_uploads4u plan")
+    assert "1 ask" in asked and "inplace.overwrite_notes" in asked, asked
+
+    db.config_rows["inplace.overwrite_notes"] = "replace"
+    (replaced,) = await say(control, "/inplace @anime_uploads4u plan")
+    assert "1 caption" in replaced, replaced
+    assert "inplace.overwrite_notes" in replaced, "the reply has to name the knob that made it"
+
+
+async def test_inplace_reports_a_post_it_would_only_skip() -> None:
+    """Already carrying the approved box is the one outcome that must cost nothing.
+
+    The test renders the caption with the real template rather than typing a lookalike: "is
+    this message published?" is answered by comparing text, and a hand-typed box would pass the
+    test while the production comparison failed on a single em-dash.
+    """
+    from app import inplace
+
+    db = FakeDb()
+    caption, missing = inplace.caption_for(
+        title="Bleach", episode=1, audio_kind="hindi", declared_episodes=12
+    )
+    assert missing == ()
+    db.inplace_rows = [_inplace_row(901, 1, caption, caption_previous="episode 1")]
+    control, _api, _db = bot(db=db)
+    (text,) = await say(control, "/inplace @anime_uploads4u plan")
+    assert "1 skip" in text, text
+    assert not db.writes, "a plan with nothing to do must not write even the mode twice"
+
+
+async def test_inplace_names_a_flag_it_did_not_understand() -> None:
+    db = FakeDb()
+    control, _api, _db = bot(db=db)
+    (text,) = await say(control, "/inplace @anime_uploads4u delete")
+    assert "did not understand" in text and "usage" in text.lower()
+    assert not db.writes
+
+
+async def test_inplace_refuses_to_pick_between_two_channels_of_one_name() -> None:
+    db = FakeDb()
+    db.source_channels.append(
+        {
+            "id": 9,
+            "username": "anime_uploads4u",
+            "title": "second row",
+            "telegram_channel_id": -100777,
+            "declared_series": "",
+            "declared_audio": "",
+            "declared_season": -1,
+        }
+    )
+    control, _api, _db = bot(db=db)
+    (text,) = await say(control, "/inplace @anime_uploads4u")
+    assert "matches 2 channels" in text and not db.writes

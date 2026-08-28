@@ -619,12 +619,18 @@ def parse_episode(
     quality_order: tuple[str, ...] | list[str] | None = None,
     require_hindi_audio: bool = True,
     include_subbed_only: bool = False,
+    unknown_audio_allowed: bool = False,
 ) -> ParsedEpisode:
     """Read one source message into a decision plus its evidence.
 
     Policy arguments mirror ``app.config`` (``ingest.require_hindi_audio``,
     ``ingest.include_subbed_only``, ``quality.order``); the caller reads the
     operator's settings from the database, which keeps this a pure function.
+
+    ``unknown_audio_allowed`` is the in-place exception (``app.inplace``): accept a file whose
+    audio nobody has claimed. It never applies to a file that *denies* carrying Hindi — a
+    subbed release stays rejected whatever the mode is, because rejecting it is about what the
+    file says, not about how much we know.
 
     ``source_series_declared`` / ``declared_audio`` carry the *channel-level statements* the
     operator makes with ``/source`` — which channel this is, and what its files carry. They
@@ -716,9 +722,11 @@ def parse_episode(
             if subbed_only
             else f"dub without Hindi audio ({', '.join(sorted(languages)) or 'unknown'}): out of scope"
         )
-    elif require_hindi_audio and audio_kind == AudioKind.UNKNOWN:
+    elif require_hindi_audio and audio_kind == AudioKind.UNKNOWN and not unknown_audio_allowed:
         # The branch that matters: unknown audio neither publishes nor drops the
-        # file. It waits for a human, which is the only safe answer.
+        # file. It waits for a human, which is the only safe answer. The one
+        # exception is ``unknown_audio_allowed`` (in-place captioning of a file the
+        # operator already posted themselves), which is decided by the caller, never here.
         accepted, disposition = False, Disposition.PENDING
         reason = "cannot determine whether the file carries Hindi audio"
         flags.append("needs_owner_review")
@@ -743,6 +751,10 @@ def parse_episode(
 
     if accepted and quality is None:
         flags.append("no_quality_label")
+    if accepted and audio_kind == AudioKind.UNKNOWN and unknown_audio_allowed:
+        # Loud rather than silent: "this caption was written without an audio claim" has to be
+        # greppable, because the line it prints says Unknown and someone will ask why.
+        flags.append("captioned_without_audio_claim")
     if accepted and file_kind == "batch" and not episodes:
         flags.append("batch_episode_count_unknown")
 
