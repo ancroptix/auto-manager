@@ -29,6 +29,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Sequence
 
+from .storagebot import FORBIDDEN as FORBIDDEN_COMMANDS
+
 log = logging.getLogger("auto_manager.probe")
 
 __all__ = ["ProbeBudget", "ProbePolicy", "ProbeViolation", "format_report", "run_probe", "MAX_REPORT_CHARS", "SAFE_COMMANDS"]
@@ -36,6 +38,10 @@ __all__ = ["ProbeBudget", "ProbePolicy", "ProbeViolation", "format_report", "run
 #: Telegram's message limit. The report has to fit in one message: a report split
 #: over four messages is a report nobody pastes in full.
 MAX_REPORT_CHARS = 3800
+
+#: Commands the storage bot offers that this program may never send, whatever else changes: its
+#: moderation tools act on people, which is not this pipeline's job. See ``app/storagebot.py``.
+FORBIDDEN_COMMANDS  # noqa: B018  (re-exported through the guard above; see may_send)
 
 #: The only text this probe may ever send. Everything here is a menu-navigation
 #: command; nothing starts an upload, accepts a request, or talks to a person.
@@ -82,6 +88,13 @@ class ProbePolicy:
 
     def may_send(self, peer: Any, text: str) -> bool:
         peer_key = str(peer).lstrip("@").casefold()
+        wanted = str(text).strip().casefold().lstrip("/")
+        if wanted in {name.lstrip("/").casefold() for name in FORBIDDEN_COMMANDS}:
+            # Checked before the allowlist, not after it. `SAFE_COMMANDS` is a list someone will
+            # one day widen while testing by hand, and ``/broadcast`` is a command that has to
+            # stay unsendable by a program however reasonable that widening looks at the time:
+            # it makes the storage bot message *people*.
+            return False
         return peer_key in self.peers and str(text).strip().casefold() in SAFE_COMMANDS
 
     def allows_button(self, text: str | None) -> bool:

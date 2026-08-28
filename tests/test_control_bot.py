@@ -103,6 +103,9 @@ class FakeDb:
                 "declared_series": "",
                 "declared_audio": "",
                 "declared_season": -1,
+                # Read from the row like a real one: the in-place mode is refused until rights are
+                # known, so a fake row without this key is a fake row nobody can caption in.
+                "we_are_admin": True,
             }
         ]
         self.declared_history: list[dict] = []
@@ -1393,3 +1396,85 @@ async def test_inplace_refuses_to_pick_between_two_channels_of_one_name() -> Non
     control, _api, _db = bot(db=db)
     (text,) = await say(control, "/inplace @anime_uploads4u")
     assert "matches 2 channels" in text and not db.writes
+
+
+async def test_inplace_refuses_a_series_it_cannot_name_yet_and_says_what_it_needs() -> None:
+    """No declared series means no destination name, and a placeholder is not a name.
+
+    `Untitled Series Anime in Hindi` is a channel title somebody could create by accident, so the
+    refusal says the name is what is missing — and puts `/source` in front of creation, in that
+    order, because the order is the fix.
+    """
+    db = FakeDb()
+    db.source_channels[0]["we_are_admin"] = False
+    db.inplace_rows = [_inplace_row(901, 1)]
+    control, _api, _db = bot(db=db)
+    (text,) = await say(control, "/inplace @anime_uploads4u")
+    assert "a destination channel is created" in text, text
+    assert "needs the series named first" in text, text
+    assert "Untitled" not in text, "no placeholder may reach a reply that doubles as an instruction"
+
+
+async def test_inplace_refuses_a_member_only_channel_and_says_what_happens_instead() -> None:
+    """The correction, in one reply: no rights here ⇒ this is a source, and a destination is built.
+
+    The old answer was "make me admin and ask again", which reads like a permission problem and
+    hides the real one: the channel they named was never meant to be written to. Being able to
+    caption in place must never become a reason to skip creating the destination.
+    """
+    db = FakeDb()
+    db.source_channels[0]["we_are_admin"] = False
+    db.source_channels[0]["declared_series"] = "Bleach"
+    db.inplace_rows = [_inplace_row(901, 1)]
+    control, _api, _db = bot(db=db)
+    (text,) = await say(control, "/inplace @anime_uploads4u")
+    assert "I did not switch this channel to in-place mode" in text, text
+    assert "this channel stays a source" in text and "is created" in text, text
+    assert "Anime in Hindi" in text, "the reply has to name what is going to be created"
+    assert "skip" in text and "/source" in text, "and say creation is not skipped, plus how to name it"
+    assert not db.writes, "a refusal writes nothing"
+
+
+async def test_inplace_off_is_never_blocked_by_a_rights_check() -> None:
+    """Leaving the mode is a step that asks nothing of the channel, so it is always allowed."""
+    db = FakeDb()
+    db.source_channels[0]["we_are_admin"] = None
+    control, _api, _db = bot(db=db)
+    (text,) = await say(control, "/inplace @anime_uploads4u off")
+    assert "link route again" in text, text
+    assert len(db.writes) == 1, db.writes
+
+
+async def test_inplace_records_the_mode_for_a_channel_nobody_has_scanned_yet() -> None:
+    """The mode is a setting; the plan is a reading. Only the second one needs messages.
+
+    A channel added before its first scan is the normal case, so refusing to record anything
+    until a scan has run would make the setup order matter for no reason — and inventing a count
+    of zero-captioned files would be worse.
+    """
+    db = FakeDb()
+    db.inplace_rows = []
+    control, _api, _db = bot(db=db)
+    (text,) = await say(control, "/inplace @anime_uploads4u")
+    assert "no plan to show" in text and "next scan" in text, text
+    assert db.source_channels[0]["publish_role"] == "source_and_destination", db.source_channels[0]
+
+
+async def test_a_channel_of_text_posts_is_still_recorded_and_its_posts_left_alone() -> None:
+    """Nothing to caption today, no refusal: the mode is a setting, and text messages stay text."""
+    db = FakeDb()
+    db.destination = {
+        "id": 6,
+        "telegram_channel_id": -1001112223334,
+        "title": "Bleach Anime in Hindi",
+        "series_id": 7,
+        "publish_mode": "link_post",
+        "paired_source_channel_id": -1,
+    }
+    db.source_channels[0]["destination_id"] = 6
+    db.inplace_rows = [_inplace_row(901, 1, "welcome", is_media=False)]
+    control, _api, _db = bot(db=db)
+    (text,) = await say(control, "/inplace @anime_uploads4u plan")
+    assert "1 ignore" in text, text
+    assert "1 text message" not in text  # the summary names the action, not a count of messages
+    assert db.destination["publish_mode"] == "link_post", "a plan preview must not flip the mode"

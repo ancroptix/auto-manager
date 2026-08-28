@@ -2178,8 +2178,9 @@ def test_in_place_captioning_replaces_the_gate_and_the_plan_is_the_proof(conn):
         )
         series_id = cur.fetchone()[0]
         cur.execute(
-            "insert into app.source_channel (series_id, telegram_channel_id, username, title, priority, mode)"
-            " values (%s, %s, 'yc_inplace', 'Naruto Inplace', 100, 'full') returning id",
+            "insert into app.source_channel"
+            " (series_id, telegram_channel_id, username, title, priority, mode, we_are_admin)"
+            " values (%s, %s, 'yc_inplace', 'Naruto Inplace', 100, 'full', true) returning id",
             (series_id, tg),
         )
         channel_id = cur.fetchone()[0]
@@ -2319,8 +2320,34 @@ def test_in_place_captioning_replaces_the_gate_and_the_plan_is_the_proof(conn):
         third = await scan(8303, 3)
         assert third["disposition"] == "pending" and third["audio_gate"] == "hindi-audio-required", third
 
+        # And the same column, read as data from a real row, decides the other half: lose the
+        # rights and the answer stops being "caption it here" and becomes "this is a source, and
+        # the destination gets built". This is the assertion that keeps channel creation from
+        # being skipped by the existence of an in-place mode.
+        conn.execute("update app.source_channel set we_are_admin = false where id = %s", (channel_id,))
+        # No destination row either — that is the case the sentence is about. With a destination
+        # already present the same rights answer is "posts go there", and this reply would be wrong.
+        conn.execute("delete from app.destination_post where destination_id = %s", (destination_id,))
+        conn.execute("delete from app.destination where id = %s", (destination_id,))
+        replies = await bot.dispatch(update("/inplace @yc_inplace", 4))
+        refusal = replies[0].text
+        assert "I did not switch this channel to in-place mode" in refusal, refusal
+        assert "create_channel" in refusal and "ordinary member" in refusal, refusal
+        assert conn.execute(
+            "select publish_role from app.source_channel where id = %s", (channel_id,)
+        ).fetchone()[0] == "source", "a refusal must not have flipped the role back on"
+        # A count over the whole table would answer for other tests' channels too. This series is
+        # the one this scenario owns, so this is the row a skipped-creation bug would leave missing.
+        assert conn.execute(
+            "select count(*) from app.destination d join app.series s on s.id = d.series_id"
+            " where s.normalized_title = %s",
+            (slug,),
+        ).fetchone()[0] == 0, "a refusal creates nothing either, in the database or on Telegram"
+        conn.execute("update app.source_channel set we_are_admin = true where id = %s", (channel_id,))
+
         conn.execute("delete from app.destination_post where destination_id = %s", (destination_id,))
         conn.execute("delete from app.destination where id = %s", (destination_id,))
         conn.execute("delete from app.source_candidate where source_channel_id = %s", (channel_id,))
+        conn.execute("delete from app.processed_message where source_channel_id = %s", (channel_id,))
 
     asyncio.run(scenario())

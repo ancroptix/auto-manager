@@ -661,7 +661,7 @@ class ControlBot:
         records the mode and shows the plan it implies. It never touches Telegram, and it says so:
         the edits themselves are the user session's job, and the publish layer is unwired.
         """
-        from . import inplace
+        from . import inplace  # noqa: PLC0415  (see the module's import policy: one-way, no cycle)
 
         handle = (args[0].strip() if args else "")
         if not handle or handle.lower() in {"help", "?"}:
@@ -708,6 +708,26 @@ class ControlBot:
             destination = None
 
         plan_rows = await self._inplace_rows(channel, destination)
+        if flag == "off":
+            # Turning the mode off is always allowed and never blocked by a rights check: it asks
+            # for no write at all, and a refusal here would strand a channel in a mode the
+            # operator has just decided against.
+            return await self._inplace_off(channel, destination, handle)
+
+        # "files already posted here" is about the media, not about the row count: a channel of
+        # text posts is not an in-place destination no matter how many messages it has.
+        files_already_there = any(bool(row.get("is_media")) for row in plan_rows)
+        # Rights first, mode second. The operator's rule is that being able to caption in place
+        # never replaces building a destination: if we are a member here, or have never read our
+        # own rights, this channel is a source and the destination is created (or already exists)
+        # — so the command says that and writes nothing, rather than switching a mode that no
+        # publisher could honour.
+        route = inplace.route_for(
+            we_are_admin=_col(channel, "we_are_admin"),
+            files_already_there=files_already_there,
+            destination_exists=destination is not None,
+            series=_col(channel, "declared_series") or _col(channel, "title"),
+        )
         source_row = None
         shape = None
         if other:
@@ -719,42 +739,57 @@ class ControlBot:
             source_row = source_rows[0]
             shape = await self._inplace_shape(plan_rows, source_row)
 
+        if not route.may_caption:
+            return [Reply(self._inplace_refusal(channel, route))]
+
         overwrite = str(await self.db.config("inplace.overwrite_notes", "ask") or "ask").casefold()
         allow_copy = bool(await self.db.config("inplace.copy_missing", True))
-        decisions = inplace.plan(
-            plan_rows,
-            shape=shape,
-            allow_copy=allow_copy,
-            replace_notes=overwrite == "replace",
-            destination_id=destination["id"] if destination else None,
-        )
-        preview = self._inplace_text(channel, decisions, shape, overwrite=overwrite)
+        if plan_rows:
+            decisions = inplace.plan(
+                plan_rows,
+                shape=shape,
+                allow_copy=allow_copy,
+                replace_notes=overwrite == "replace",
+                destination_id=destination["id"] if destination else None,
+            )
+            preview = self._inplace_text(channel, decisions, shape, overwrite=overwrite, route=route)
+        else:
+            # Rights are fine and there is simply nothing read yet. The mode is a setting rather
+            # than a plan, so recording it is right — inventing a count is not. A channel created
+            # before its first scan is the normal case, and this is the reply that says what will
+            # happen to it instead of refusing for lack of a number.
+            preview = (
+                "nothing from this channel has been read into the database yet, so there is no plan "
+                "to show. the mode is still the right thing to record: every file the next scan finds "
+                "gets its caption as it is filed, and /inplace "
+                f"{handle} plan will count them then."
+            )
 
         if flag == "plan":
             return [Reply(preview + "\n\n(plan only — nothing was changed.)")]
 
-        if flag == "off":
-            await self.db.execute(
-                "update app.source_channel set publish_role = 'source', updated_at = now() where id = $1",
-                channel["id"],
+        await self._inplace_apply(channel, destination, source_row)
+        note = ""
+        if not destination:
+            note = (
+                "\n\nthis channel has no row in app.destination yet, so the mode is recorded on the "
+                "channel itself; the destination row inherits it when it is created or linked, and "
+                "until then nothing here is published either way."
             )
-            if destination:
-                await self.db.execute(
-                    "update app.destination set publish_mode = 'link_post', updated_at = now() where id = $1",
-                    destination["id"],
-                )
-            return [
-                Reply(
-                    f"link route again for {handle}: nothing will be written onto the posts that "
-                    "are already there. I did not change any message either — an episode that "
-                    "already carries our caption keeps it, and /inplace plan lists those."
-                )
-            ]
+        return [Reply(f"in-place captioning is ON for {handle}.\n\n{preview}{note}")]
 
+    async def _inplace_apply(self, channel: Any, destination: Any, source_row: Any) -> None:
+        """Record the mode, on the channel and — when there is one — on the destination row.
+
+        Two writes rather than one because the two rows answer different readers: the pipeline
+        asks its destination what it does, and a channel with no destination row yet still has to
+        know how its own files are treated. Pairing is recorded on the destination side, since a
+        source is only "paired" from the point of view of the channel it feeds.
+        """
         await self.db.execute(
             "update app.source_channel set publish_role = $2, updated_at = now() where id = $1",
             channel["id"],
-            "destination" if other else "source_and_destination",
+            "destination" if source_row is not None else "source_and_destination",
         )
         if destination:
             await self.db.execute(
@@ -774,14 +809,25 @@ class ControlBot:
                     destination["id"],
                     source_row["id"],
                 )
-        note = ""
-        if not destination:
-            note = (
-                "\n\nthis channel has no row in app.destination yet, so the mode is recorded on the "
-                "channel itself; the destination row inherits it when it is created or linked, and "
-                "until then nothing here is published either way."
+
+    async def _inplace_off(self, channel: Any, destination: Any, handle: str) -> list[Reply]:
+        """Back to the link route, leaving every already-edited post exactly as it is."""
+        await self.db.execute(
+            "update app.source_channel set publish_role = 'source', updated_at = now() where id = $1",
+            channel["id"],
+        )
+        if destination:
+            await self.db.execute(
+                "update app.destination set publish_mode = 'link_post', updated_at = now() where id = $1",
+                destination["id"],
             )
-        return [Reply(f"in-place captioning is ON for {handle}.\n\n{preview}{note}")]
+        return [
+            Reply(
+                f"link route again for {handle}: nothing will be written onto the posts that are "
+                "already there. I did not change any message either — an episode that already "
+                "carries our caption keeps it, and /inplace plan lists those."
+            )
+        ]
 
     async def _inplace_rows(self, channel: Any, destination: Any) -> list:
         """The channel's own file messages, in the shape ``app.inplace.plan`` reads.
@@ -855,7 +901,50 @@ class ControlBot:
             [row["episode_number"] for row in theirs],
         )
 
-    def _inplace_text(self, channel: Any, decisions: list, shape: Any, *, overwrite: str) -> str:
+    def _inplace_refusal(self, channel: Any, route: Any) -> str:
+        """"I cannot write here" is not the same as "nothing will happen".
+
+        A refusal that stops at "no rights" is how a season ends up stranded: the operator reads
+        it as a dead end and goes looking for a way to grant access, when the actual answer is
+        that a source channel needs no access at all and a destination needs building. So the
+        reply names the thing that will happen, the name it will use, and the one command that
+        makes the naming safe.
+        """
+        name = route.name or "the destination for this series"
+        lines = ["I did not switch this channel to in-place mode.", ""]
+        lines.append(f"  {route.reason}")
+        lines.append(f"  {route.consequence()}")
+        lines.append("")
+        if route.create_destination:
+            lines.append(
+                f"what happens instead: this channel stays a source, and the destination "
+                f"`{name}` is created — private, with the profile set before anyone is involved, "
+                "@chelpbot added as admin, the one-use invite sent to you, then revoked. that step "
+                "is not skipped because an in-place mode exists, and it is not asked for "
+                "permission first: you already said a channel per finished series is automatic."
+            )
+            lines.append("")
+            lines.append(
+                "to get there, the series has to be named from two agreeing signals, so state it "
+                "once: /source <this channel> series <name> audio hindi"
+            )
+        else:
+            lines.append(
+                "what happens instead: the destination already exists for this series, so posts "
+                "go there through Channel Help, and this channel only feeds it files. nothing to "
+                "create, nothing to caption here."
+            )
+        if not route.rights_verified:
+            lines.append("")
+            lines.append(
+                "(your rights in this channel have never been read by a live session. once one is "
+                "running they are recorded in app.source_channel.we_are_admin; if this really is "
+                "your own channel and you want that asserted now, set that column to true in the "
+                "dashboard and run this again — I would rather be told than guess.)"
+            )
+        return "\n".join(lines)
+
+    def _inplace_text(self, channel: Any, decisions: list, shape: Any, *, overwrite: str, route: Any = None) -> str:
         """The plan in the operator's words, with the questions on top instead of buried."""
         from . import inplace
 
@@ -864,6 +953,8 @@ class ControlBot:
             "  " + inplace.summary(decisions),
             "  " + inplace.shape_note(shape),
         ]
+        if route is not None:
+            lines.append(f"  mode: {route.mode}, destination created: {route.create_destination}")
         asks = [decision for decision in decisions if decision.action == inplace.Action.ASK]
         if asks:
             lines.append("")

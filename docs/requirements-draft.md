@@ -50,6 +50,12 @@ episodes as files, each message saying nothing but `episode 7`. In that shape th
 - A caption replaces existing text only when that text is an episode **label**. Anything with a link,
   a handle, a date or a second sentence in it is left alone and asked about, and the replaced text is
   stored (`app.destination_post.caption_previous`) because Telegram keeps no copy.
+- **Channel creation is never skipped by this mode.** If the operator hands over a channel link and we are only a
+  *member* there — or have never read our own rights — then that channel is a source, and a destination named
+  `{TITLE} Anime in Hindi` is created when no such channel exists. `app.inplace.route_for` returns
+  `create_destination` and `/inplace` refuses to switch a channel it cannot write in. The ability to caption in place
+  is not an alternative to building the destination, and the standing rule that creation needs no confirmation still
+  applies to the created one.
 - Corrections that apply to both modes: a source channel's files and thumbnails need not be
   watermark-free to be usable — screening **ranks** copies and picks the best, and a channel with no
   clean candidate is flagged and published with the least-bad copy rather than blocked (content is
@@ -198,10 +204,18 @@ Both handles are primary and always appear together.
 
 ## 10. Storage bot
 
-- Bot: `@anime_hindifilesbot` (advanced: single, batch, universal links, and more commands).
-- Exact command/menu protocol, link validation, batch-update and revocation behavior require authenticated
-  integration testing after the operator completes a secure Telegram login. The operator will not screen-record the
-  flow, so the agent discovers it live at runtime.
+- Bot: `@anime_hindifilesbot`. Its command menu was observed from the operator's screenshots on 2026-08-28 and is
+  recorded verbatim in [`docs/storage-bot.md`](storage-bot.md) / `app/storagebot.py`: `/genlink` (one message or file),
+  `/batch` (many messages from a channel), `/custom_batch` (an explicit list), `/special_link` (an **editable** link,
+  moderators only), `/universal_link` (one link across the bot's clones, moderator only), `/shortener`, `/settings`,
+  plus `/broadcast`, `/ban`, `/unban`.
+- **Never sent by this program:** `/broadcast`, `/ban`, `/unban`. They act on people, and the refusal is checked
+  before the probe's own allowlist so widening that list during testing cannot grant the capability.
+- What the menu does **not** answer — and therefore what still keeps `storage_upload` blocked instead of implemented:
+  what each command asks for next, whether the reply is a message or a button, the shape and lifetime of a link,
+  whether a batch can be appended to, what "moderators only" is moderation *of*, and whether a link can be revoked.
+  The operator will not screen-record the flow, so one authenticated run reads those back; `/probe` re-reads the menu
+  and reports any drift against the recorded copy.
 - Files go to the archive/storage workflow; destination channels receive text/link posts only.
 - Missing-quality flow: upload only the new variant → add to the ordered manifest → rebuild or extend the batch /
   universal link → edit the existing destination post in place. Never resend the season sticker or create a second

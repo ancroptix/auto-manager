@@ -52,7 +52,11 @@ class Context:
 
 DEPENDENCIES: dict[str, str] = {
     JobKind.ARCHIVE_MEDIA.value: "server-side copy into the private master archive channel",
-    JobKind.STORAGE_UPLOAD.value: "@anime_hindifilesbot menu protocol (needs one authenticated test run)",
+    JobKind.STORAGE_UPLOAD.value: (
+        "the @anime_hindifilesbot menu is known (app/storagebot.py: /genlink, /batch, "
+        "/custom_batch, /special_link, /universal_link); what each command asks for next, and "
+        "the link shape it replies with, are what one authenticated run still has to read back"
+    ),
     JobKind.LINK_VERIFY.value: "link liveness probe",
     JobKind.PUBLISH_POST.value: "ChannelHelpPublisher adapter",
     JobKind.EDIT_POST.value: "ChannelHelpPublisher adapter (in-place quality edits)",

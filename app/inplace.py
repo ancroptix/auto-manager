@@ -54,6 +54,8 @@ __all__ = [
     "shape_note",
     "mode_allows_missing_audio",
     "pair_roles",
+    "Route",
+    "route_for",
 ]
 
 #: ``app.destination.publish_mode``. Two modes, because the operator uses both: a link
@@ -486,7 +488,128 @@ def _caption_from_row(row: Mapping[str, Any]) -> tuple[str | None, tuple[str, ..
     )
 
 
-def pair_roles(channels: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+@dataclass(frozen=True, slots=True)
+class Route:
+    """Which publishing shape a channel gets, and whether a channel still has to be built.
+
+    The invariant this exists to protect: ``create_destination`` is false **only** when a
+    destination already exists, or when the files we are captioning are already in the channel
+    that *is* the destination. "I can caption in place here" has never been a reason to skip
+    building a destination that does not exist yet — and if it were allowed to be, the failure
+    would be silent: a shelf of source files, no published channel, and nothing in the log
+    naming what is missing. The operator said this twice; the second time it came with "tab bhi
+    channel banane wala hissa skip mat karne lag jana".
+    """
+
+    mode: str
+    create_destination: bool
+    reason: str
+    #: The name the destination would be created with, when it must be created.
+    name: str | None = None
+    #: False when we have never read our own rights in this channel. The mode is then decided
+    #: the safe way rather than the convenient way, and the reason says so.
+    rights_verified: bool = True
+    #: Whether this account may write in the channel at all, as read from its own rights.
+    can_write: bool = False
+
+    def consequence(self) -> str:
+        """One sentence: what follows from the finding.
+
+        Kept apart from ``reason`` because the two callers want different lengths — the control bot
+        expands it into the whole creation sequence, ``pair_roles`` appends it as it stands, and a
+        reply that printed both would say "the destination is created" twice in one breath.
+        """
+        from .channels import SETUP_STEPS
+
+        if self.create_destination:
+            # A name that cannot be chosen yet is said out loud rather than filled with a
+            # placeholder: `Untitled Series Anime in Hindi` is a channel name somebody might create.
+            who = f"the destination `{self.name}`" if self.name else "a destination channel"
+            needs = "" if self.name else ", and its name needs the series named first (/source)"
+            return f"{who} is created from scratch, starting with `{SETUP_STEPS[0].name}`{needs}"
+        if self.mode == MODE_IN_PLACE:
+            return "nothing is created and nothing is fetched: these posts are the destination"
+        return "posts go to the destination that already exists for this series"
+
+
+    @property
+    def may_caption(self) -> bool:
+        """Whether captions may be written onto this channel's own posts.
+
+        Rights decide it, not "are the files here yet": a channel set up before its first scan is
+        perfectly legal to record, and a channel where we are an ordinary member never is — no
+        matter how many files are sitting in it, we cannot edit a message we cannot post in.
+        """
+        return self.can_write
+
+
+def route_for(
+    *,
+    we_are_admin: bool | None,
+    files_already_there: bool,
+    destination_exists: bool,
+    series: str | None = None,
+) -> Route:
+    """Decide the publishing shape for one joined channel.
+
+    Read the two facts, in this order:
+
+    * **rights** — admin means we could write here; member means we could not, whatever else is
+      true. This is physics, not preference: a user account without posting rights cannot edit a
+      message, so "caption it where it already is" is not on the table for that channel.
+    * **whether the destination exists** — a channel named ``{TITLE} Anime in Hindi`` for this
+      series, already created by us or already added by you as an admin.
+
+    A member-only channel with no destination is therefore *not* a dead end and *not* a question
+    about rights. It is the ordinary case: the channel you sent is a source, and the destination
+    is built, starting at ``create_channel``.
+    """
+    from .channels import destination_name
+
+    # No series means no name, and inventing one here is exactly what the naming rule exists to
+    # prevent: a destination channel's name is public and semi-permanent.
+    name = destination_name(series) if series else None
+    if we_are_admin and files_already_there:
+        return Route(
+            MODE_IN_PLACE,
+            False,
+            "these posts are already in a channel we can write in, so the file message is the "
+            "post: the caption goes on it, nothing is fetched and no channel is created. a row in "
+            "app.destination is still recorded — a season needs an owner even when nobody is copied",
+            name=name,
+            can_write=True,
+        )
+    if we_are_admin is False:
+        return Route(
+            MODE_LINK,
+            not destination_exists,
+            "we are an ordinary member here, so nothing can be written onto these messages — that "
+            "is not a restriction we can talk our way past, it is what the rights say. this "
+            "channel is a source, and nothing in it is edited",
+            name=name if not destination_exists else None,
+        )
+    if we_are_admin is None:
+        return Route(
+            MODE_LINK,
+            not destination_exists,
+            "our rights in this channel have never been read, and guessing them is how a season "
+            "ends up captioned in a channel we cannot post in — or, worse, how a destination gets "
+            "skipped because someone assumed we could. treated as a source until a session that "
+            "can read them has run",
+            name=name if not destination_exists else None,
+            rights_verified=False,
+        )
+    return Route(
+        MODE_LINK,
+        not destination_exists,
+        "we can post here, but these messages are not the files, so this is a destination to write "
+        "into rather than a shelf to caption",
+        name=name if not destination_exists else None,
+        can_write=True,
+    )
+
+
+def pair_roles(channels: Sequence[Mapping[str, Any]], *, destination_exists: bool = False) -> dict[str, Any]:
     """Who is the destination when two joined channels share a name.
 
     The rule the operator gave: the channel we are **admin** in is the destination, because
@@ -495,8 +618,18 @@ def pair_roles(channels: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     account with no posting rights physically cannot caption those messages, so guessing the
     other way round would produce a job that fails on every file.
 
-    Returns ``{"destination": [...], "source": [...], "ask": reason|None}``. Two admin channels
-    of one name is a genuine ambiguity and is reported as such rather than resolved by sorting.
+    Two answers, one of them a correction the operator made:
+
+    * *two* channels of one name that we both admin is a genuine ambiguity — that is a question,
+      because picking one silently puts posts in the wrong place.
+    * *zero* such channels is **not** a question about rights. It used to answer "add the session
+      as admin here", which reads as a request and is actually a dead end: when the destination
+      channel by that name does not exist, the answer is to create it. A channel we merely joined
+      is a source, and the creation steps run. ``create_destination`` says so, and nothing is
+      skipped because in-place mode exists.
+
+    Returns ``{"destination": [...], "source": [...], "ask": reason|None,
+    "create_destination": bool, "note": str|None}``.
     """
     rows = [dict(row) for row in channels]
     admin = [row for row in rows if bool(row.get("we_are_admin"))]
@@ -507,12 +640,28 @@ def pair_roles(channels: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
             f"{len(admin)} of these channels are ones we admin, so the rights rule cannot pick "
             "one on its own; tell me which is the destination and I will remember it"
         )
-    elif not admin:
-        ask = (
-            "none of these channels is one we can post in, so there is nothing to caption — "
-            "add the session as admin with post/edit rights first"
-        )
-    return {"destination": ([] if ask else admin), "source": member, "ask": ask}
+    if admin and not ask:
+        return {
+            "destination": admin,
+            "source": member,
+            "ask": None,
+            "create_destination": False,
+            "note": None,
+        }
+    series = next((row.get("declared_series") or row.get("title") for row in rows), None)
+    route = route_for(
+        we_are_admin=False if member else None,
+        files_already_there=False,
+        destination_exists=destination_exists,
+        series=series,
+    )
+    return {
+        "destination": [],
+        "source": rows,
+        "ask": ask,
+        "create_destination": route.create_destination,
+        "note": None if ask else f"{route.reason} {route.consequence()}",
+    }
 
 
 def summary(decisions: Iterable[Decision]) -> str:

@@ -146,7 +146,7 @@ what I would do with the 12 messages of this channel:
 no new channel, no copy, no deletion, and no buttons under the post …
 ```
 
-Two replies to expect, both deliberate:
+Three replies to expect, all deliberate:
 
 * **a question instead of an edit** — if a message's existing text is more than an
   episode label (a note, a mirror link, a date), it is left alone and named:
@@ -154,6 +154,11 @@ Two replies to expect, both deliberate:
   caption, so guessing costs you the text. Setting `inplace.overwrite_notes` to
   `"replace"` in `app.config` makes it write anyway, and the replaced text is still
   stored in `app.destination_post.caption_previous` — the only copy that exists.
+* **"I did not switch this channel to in-place mode"** — when we are an ordinary member there, or when no live
+  session has ever read our rights. The channel you named is then a source, and the reply says the destination
+  `… Anime in Hindi` will be created: being unable to caption in place is never a reason to skip building it. It
+  names the command that makes the naming safe (`/source … series <name> audio hindi`) and, only when rights are
+  unread, the one column you can set by hand if this really is your own channel.
 * **"this command changed the plan, not the channel"** — true until the MTProto write
   layer is wired on the live account. `/inplace` is safe to run today; the edits follow
   once the session can send `EditMessage`.

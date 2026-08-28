@@ -194,10 +194,85 @@ def test_two_admin_channels_is_a_question_not_a_sort() -> None:
     assert "cannot pick" in pair["ask"]
 
 
-def test_no_admin_channel_means_nothing_can_be_written_anywhere() -> None:
-    pair = inplace.pair_roles([{"id": 1, "we_are_admin": False}])
-    assert pair["destination"] == []
-    assert "rights" in pair["ask"]
+def test_a_member_only_channel_is_a_source_and_the_destination_gets_built() -> None:
+    """The correction, as an assertion. This answer used to be "make me admin here".
+
+    That reply was not wrong about the rights and it was wrong about what to *do*: the channel
+    the operator joined is a source, and when no channel named ``{TITLE} Anime in Hindi`` exists,
+    the answer is to create it — never to leave the season stranded with a "skip" that looks like
+    a permission problem they have to solve.
+    """
+    pair = inplace.pair_roles([{"id": 1, "we_are_admin": False, "title": "Berserk HQ"}])
+    assert pair["destination"] == [] and pair["ask"] is None
+    assert pair["create_destination"] is True
+    assert "member" in pair["note"] and "create_channel" in pair["note"]
+    assert "add the session as admin" not in pair["note"]
+
+
+def test_a_member_only_channel_with_an_existing_destination_creates_nothing() -> None:
+    pair = inplace.pair_roles(
+        [{"id": 1, "we_are_admin": False, "title": "Berserk HQ"}], destination_exists=True
+    )
+    assert pair["create_destination"] is False
+    assert pair["ask"] is None
+
+
+def test_the_creation_question_is_answered_from_rights_not_from_convenience() -> None:
+    """One invariant, checked across every combination rather than asserted once.
+
+    ``create_destination`` may be false for exactly two reasons — a destination already exists,
+    or these very posts are the destination — and every other case must say ``True``. This is
+    the rule that stops in-place mode from quietly becoming a way to skip building a channel.
+    """
+    for admin in (True, False, None):
+        for files in (True, False):
+            for exists in (True, False):
+                route = inplace.route_for(
+                    we_are_admin=admin,
+                    files_already_there=files,
+                    destination_exists=exists,
+                    series="Berserk",
+                )
+                allowed = exists or (route.mode == inplace.MODE_IN_PLACE and admin is True and files)
+                assert route.create_destination is (not allowed), (admin, files, exists, route)
+
+
+def test_member_rights_never_produce_an_in_place_caption() -> None:
+    route = inplace.route_for(
+        we_are_admin=False, files_already_there=True, destination_exists=False, series="Berserk"
+    )
+    assert route.mode == inplace.MODE_LINK
+    assert route.may_caption is False
+    assert route.create_destination is True
+    assert route.name == "Berserk Anime in Hindi"
+    assert "not a restriction we can talk our way past" in route.reason
+
+
+def test_unverified_rights_are_treated_as_the_narrow_case() -> None:
+    """Never read the rights yet? Then no captioning and no skipping — build the destination.
+
+    Both directions of the guess are bad, but they are bad differently: guessing "we can post"
+    strands a season in a channel we cannot write in, and guessing "we cannot" talks the operator
+    out of the channel they asked for. So the safe half is taken (no writes) and the honest half
+    is said out loud (`rights_verified` False, and the reason names the check that is missing).
+    """
+    route = inplace.route_for(
+        we_are_admin=None, files_already_there=True, destination_exists=False, series="Berserk"
+    )
+    assert route.mode == inplace.MODE_LINK and route.create_destination is True
+    assert route.rights_verified is False and route.may_caption is False
+    assert "never been read" in route.reason
+
+
+def test_admin_files_already_posted_are_the_only_in_place_case() -> None:
+    route = inplace.route_for(
+        we_are_admin=True, files_already_there=True, destination_exists=False, series="Berserk"
+    )
+    assert route.mode == inplace.MODE_IN_PLACE and route.may_caption is True
+    assert route.create_destination is False
+    assert "nothing is fetched and no channel is created" in route.reason
+    # …and the bookkeeping that *is* still done, so this is not mistaken for "no destination row".
+    assert "app.destination is still recorded" in route.reason
 
 
 # --- the caption on the file -------------------------------------------------------------

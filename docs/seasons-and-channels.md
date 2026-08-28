@@ -327,10 +327,25 @@ The rule the operator gave, implemented in `app.inplace.pair_roles`: the channel
 in** is the destination, the one where we are an ordinary **member** is a source. It is not a
 trust judgement — an account with no posting rights physically cannot edit those messages, so
 the rights *are* the answer, and guessing the other way round produces a job that fails on every
-file. Two admin-able channels with one name is a question rather than a sort; neither is a
-writable channel is also a question ("add the session as admin first"). Recorded in
-`app.source_channel.we_are_admin` and `publish_role`, so a later run explains the decision
-instead of silently re-making it.
+file. Two admin-able channels with one name is a question rather than a sort.
+
+And **no** writable channel is not a question at all. It is the ordinary case, and the answer is
+the second half of the job: the channel you joined is a **source**, and if no channel named
+`{TITLE} Anime in Hindi` exists, it is **created**. This sentence is the correction the operator
+made the same day the mode was built ("tab bhi channel banane wala hissa skip mat karne lag
+jana"), because the tempting wrong answer is *"make me admin here and I will caption it"* — which
+reads as help, and in practice leaves a finished season sitting in a source channel with nowhere
+to go. So `app.inplace.route_for` returns `create_destination`, and `/inplace` refuses to record
+an in-place mode on a channel it cannot write in. Rights that have never been read count as member
+rights, never as admin rights, and the reply names the missing check instead of guessing. Both
+outcomes are recorded — `app.source_channel.we_are_admin` and `publish_role` — so a later run
+explains the decision rather than silently re-making it.
+
+One thing not to oversell: nothing reads those rights on its own yet. The only code that asks
+Telegram "what are we here" is the probe's chat inspection (`app.probe`), and the MTProto layer
+that would run `GetFullChannel` on every joined channel is still unwired. Until it is, the column
+is a value the operator sets once in the dashboard — which is exactly what `/inplace` says when it
+refuses, rather than quietly treating an unread channel as writable.
 
 ### Twelve files there, twelve files here: twelve edits, zero copies
 
@@ -396,6 +411,7 @@ real edit goes out.
 | which picture is on the channel, and why that one? | `app.destination.photo_source` / `photo_candidate_id` |
 | whose words were the series / the language / the quality? | `app.source_channel.declared_*`, mirrored into the candidate's `parsed` as `*_source` |
 | which publishing mode a destination uses, and which source it was compared with | `app.destination.publish_mode` / `paired_source_channel_id`, plus `app.source_channel.publish_role` |
+| who may write in a joined channel, and so whether a destination has to be built | `app.source_channel.we_are_admin`, read by `app.inplace.route_for` into `create_destination` |
 | what the text under a file post said before we captioned it | `app.destination_post.caption_previous` (and `edits`, how often it was rewritten) |
 
 A decision that is only in a log line is a decision nobody can audit next month, which is

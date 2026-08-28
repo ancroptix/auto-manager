@@ -161,6 +161,13 @@ to `false` once the session works. And if the bot says nothing at all: the token
 owner ID, or the branch is wrong — `/status` cannot answer, which is the tell that
 `TELEGRAM_BOT_TOKEN` did not make it in.
 
+**One box worth filling while you are in the dashboard:** `app.source_channel.we_are_admin`.
+`true` where the session can post and edit, `false` where it is only a member, `null` where
+nobody has looked. That one box decides the shape of the whole job for a channel — admin and
+files already there means captions are edited in place (`/inplace @channel`); member means the
+channel is a source and the destination is **built**, not skipped. `/status` reads it, and the
+app never guesses it.
+
 ## 8. Teach the app the two third-party bots — this is the real finish line
 
 Right now three jobs work for real (`reconciliation`, `ingest_media`, `thumbnail_screen`)
@@ -176,6 +183,12 @@ account.
 3. A report comes back in the chat (it is capped at ~3,800 characters; if the menu is
    longer, ask `/probe` again after the app has been idle and it will re-run). **Paste
    that report here.** It contains no secrets: it is button labels and replies.
+
+   Half of this is already done, from screenshots the operator sent on 2026-08-28: the
+   storage bot's menu is written down in `docs/storage-bot.md`, and the moderation verbs in
+   it (`/broadcast`, `/ban`, `/unban`) are now refused by `app.probe` before the allowlist
+   is even consulted. What the screenshots cannot answer is what each command asks *next* —
+   that is still unread, so `storage_upload` stays blocked.
 4. Set `PROBE_ON_BOOT=0` afterwards, so a restart never re-probes.
 
 Once I have the report I implement `storage_upload`, `archive_media`, `publish_post` and
