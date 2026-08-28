@@ -81,6 +81,11 @@ episodes as files, each message saying nothing but `episode 7`. In that shape th
   `SHARE URL` button.
 - So the object stored per series channel is that link, and the announcement is rendered from it. The token is
   stored, not the URL, so a bot rename cannot rot a published post.
+- Four decisions, given 2026-08-28 and recorded in `app.config`: **one** updates channel for the whole brand
+  (`updates.channel`), posted by **the app's own account** as plain text, **one announcement per episode** as it
+  lands (`updates.per_episode`), and the shareable link **survives its card**, so one token per series channel is
+  reusable and a rotated invite can regenerate the card. That last answer changes no deletion rule: nothing is
+  deleted because of it, it only means an old announcement cannot be broken by a new card.
 - Recorded in `app/linkprovider.py` with its open questions, in [docs/updates-channel.md](docs/updates-channel.md).
   The announcement shape is **not** in the approved caption templates, deliberately: describing a post and being
   allowed to send it are two different permissions in this project.

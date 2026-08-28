@@ -193,6 +193,38 @@ def test_the_open_questions_stay_written_down_and_counted() -> None:
     assert str(len(unknown)) in linkprovider.summary()
 
 
+def test_status_line_refuses_to_look_ready_from_one_half_alone() -> None:
+    """A named channel and an unapproved box are different problems, and the line says both.
+
+    This is the only place the two settings live, so it is also where a future reader is told that
+    ``updates.channel`` being set is not the same as announcements being possible.
+    """
+    unset = linkprovider.status_line("", True)
+    assert "not set" in unset and "nowhere to go" in unset
+    named = linkprovider.status_line("@yc_updates", True)
+    assert "@yc_updates" in named and "one announcement per episode" in named
+    assert "NOT an approved caption box" in named, "setting the channel must not read as permission to send"
+    batched = linkprovider.status_line("yc_updates", False)
+    assert "one per batch" in batched and batched.startswith("updates channel:")
+    # And the sentence only changes if the approval actually happens.
+    captions.APPROVED_TEMPLATES["templates.announcement_post"] = "x"
+    try:
+        assert "box is approved" in linkprovider.status_line("@yc_updates", True)
+    finally:
+        del captions.APPROVED_TEMPLATES["templates.announcement_post"]
+
+
+def test_the_two_config_rows_have_a_reader() -> None:
+    """A config row nobody reads is documentation pretending to be a setting.
+
+    ``/status`` is the reader today; this test is what fails loudly if the line is ever deleted and
+    the rows are left behind as decoration.
+    """
+    source = (ROOT / "app" / "controlbot.py").read_text(encoding="utf-8")
+    assert '"updates.channel"' in source and '"updates.per_episode"' in source
+    assert "status_line" in source
+
+
 # --- the doc cannot drift -------------------------------------------------------------------
 
 

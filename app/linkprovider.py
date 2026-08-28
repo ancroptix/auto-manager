@@ -46,6 +46,7 @@ __all__ = [
     "announcement_matches_shape",
     "still_unknown",
     "summary",
+    "status_line",
 ]
 
 #: The username as it appears in the link the bot itself sent (``t.me/Link_providerobot?start=…``),
@@ -229,6 +230,35 @@ def still_unknown() -> tuple[str, ...]:
         "whether one updates channel serves every series (as it appears to now) or one per show, and "
         "which channel it is by handle: the screenshots show it open by id, not by username",
         "whether the announcement is owed per episode, per batch, or only when you say so",
+    )
+
+
+def status_line(channel: Any, per_episode: Any = True) -> str:
+    """The one line ``/status`` prints about the updates channel, from the two config rows.
+
+    Written as a function rather than inline in the control bot because both halves of the answer
+    have to be true at once for an announcement to be possible: a channel to post in, and an
+    approved box to post. Only the first is a setting, so the second is repeated here every time,
+    in the same sentence, so the line can never read as "ready to send".
+    """
+    from .captions import APPROVED_TEMPLATES  # local import: captions owns the approval set
+
+    approved = "templates.announcement_post" in APPROVED_TEMPLATES
+    named = str(channel or "").strip()
+    where = f"{named}" if named.startswith("@") else (f"@{named}" if named else "not set")
+    rhythm = "one announcement per episode" if str(per_episode).casefold() in {"true", "1", "yes"} else "one per batch"
+    if not named:
+        return (
+            f"updates channel: not set — announcements have nowhere to go, so {rhythm} is a plan "
+            "with no audience; name it in app.config (updates.channel) and /status will say so here"
+        )
+    return (
+        f"updates channel: {where}, {rhythm}, sent by your own account as plain text "
+        + (
+            "with a link; the box is approved, so posts may go out"
+            if approved
+            else "with a link; the announcement text is recorded but NOT an approved caption box, so nothing sends yet"
+        )
     )
 
 

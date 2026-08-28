@@ -81,6 +81,34 @@ posted.
   to that channel until you approve the exact text. Say "the announcement box is approved" (or give me
   the line you want changed) and it becomes one row.
 
+## What the operator answered, 2026-08-28
+
+Four questions were asked and four answers came back, so they are recorded as decisions rather than
+left in a chat log:
+
+| asked | answered | what that means in the code |
+| --- | --- | --- |
+| one global channel, or one per series? | **one, for the whole brand** | `app.config` row `updates.channel` holds it — a `@handle` or the numeric id. Empty does not mean "announce nowhere", it means "the app does not know where", and `/status` says that in those words instead of staying quiet |
+| who posts it? | **your own account**, through the logged-in session | plain text links and no button row, like both samples; no new permission is involved, only the write layer that is unwired today |
+| when is one owed? | **per episode, as it lands** | `updates.per_episode = true`, which is what the samples look like anyway (`Episode 14 Added`, never a range). Set it false and the same shape names the range instead |
+| does the link survive its card? | **yes, it keeps working** | the token is reusable, so one per series channel is enough, and rotating a private invite can regenerate the card without orphaning a published announcement. The app still never deletes — this answer only says a deleted card would not break what was already posted |
+
+The `/status` line prints the whole state in one sentence because the two halves are easy to satisfy
+one at a time:
+
+```text
+updates channel: not set — announcements have nowhere to go, so one announcement per episode is a plan with no audience; …
+updates channel: @yc_updates, one announcement per episode, sent by your own account as plain text with a link; the announcement text is recorded but NOT an approved caption box, so nothing sends yet
+```
+
+## Why there is no queue table for this
+
+An announcement is a post, and `app.job` already queues posts (`publish_post`). A second table asking
+"is an announcement owed?" would be a second answer to the same question, and two answers is how one
+episode gets announced twice to 33k people. So 0008 adds two settings and nothing else: when the
+sender exists, it reads `updates.channel`, `updates.per_episode`, the destination's stored card token,
+and the approved-caption gate. Every one of those already has a reader.
+
 ## What it does not settle
 
 Recording a flow is not authorising one. These are the questions the three screenshots cannot answer,

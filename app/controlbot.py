@@ -320,6 +320,18 @@ class ControlBot:
             )
             if pending_review:
                 lines.append(f"thumbnails awaiting your decision: {pending_review}")
+            # The noticeboard the operator runs beside every series channel. It is in /status
+            # rather than only in the docs because the two halves of "can we announce" are easy to
+            # satisfy one at a time — a channel named, a box unapproved — and a line that prints
+            # both refuses to look ready when it is not.
+            from .linkprovider import status_line as _updates_status  # noqa: PLC0415
+
+            lines.append(
+                _updates_status(
+                    await self.db.config("updates.channel", ""),
+                    await self.db.config("updates.per_episode", True),
+                )
+            )
             # The other queue the operator has to drain by hand, grouped by *why*: a
             # files-only channel parks four hundred candidates for one missing statement,
             # and "400 × cannot determine Hindi audio" is answered by one /source command,

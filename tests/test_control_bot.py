@@ -460,6 +460,25 @@ async def test_status_reports_mode_queue_and_settings_without_secrets() -> None:
 
 
 @pytest.mark.asyncio
+async def test_status_names_the_updates_channel_state() -> None:
+    """The noticeboard is a real destination, so /status admits when it cannot be reached.
+
+    With nothing set, the honest answer is "nowhere to go" — not silence, and not a count of
+    announcements that would be queued if someone had named the channel.
+    """
+    db = FakeDb()
+    control, _api, _db = bot(db=db)
+    (text,) = await say(control, "/status")
+    assert "updates channel: not set" in text, text
+
+    db2 = FakeDb()
+    db2.config_rows.update({"updates.channel": "@yc_updates", "updates.per_episode": True})
+    control2, _api2, _db2 = bot(db=db2)
+    (text2,) = await say(control2, "/status")
+    assert "@yc_updates" in text2 and "NOT an approved caption box" in text2, text2
+
+
+@pytest.mark.asyncio
 async def test_status_says_so_when_the_database_is_not_connected() -> None:
     class NotConnected(FakeDb):
         @property
