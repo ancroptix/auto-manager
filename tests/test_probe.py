@@ -403,3 +403,76 @@ class TestWiring:
         assert Settings(_env_file=None, worker_enabled=False).probe_on_boot is False
         blueprint = Path("render.yaml").read_text(encoding="utf-8")
         assert "PROBE_ON_BOOT" in blueprint and 'value: "false"' in blueprint
+
+
+class TestRightsWiring:
+    """The probe is the only code that ever sees the dialog list, so it is also where our own rights
+    are read and written (``app/rights.py``). These tests pin the three seams: the SELECT shape, the
+    write, and the line the operator actually reads."""
+
+    class Db:
+        def __init__(self, rows: list[dict], *, fail: bool = False) -> None:
+            self.rows, self.fail = rows, fail
+            self.sql: list[tuple[str, tuple]] = []
+            self.connected = True
+
+        async def fetch(self, sql: str, *args: Any) -> list[dict]:
+            # `app.rights.record` writes with `update … returning id`, so a write is a fetch here.
+            # Failing on any statement would also fail the SELECT, and the test wants to distinguish
+            # "the read happened" from "the write landed".
+            self.sql.append((sql, args))
+            if self.fail and sql.lstrip().lower().startswith("update"):
+                raise RuntimeError("read-only replica")
+            if sql.lstrip().lower().startswith("update"):
+                return [{"id": args[0]}]
+            return list(self.rows)
+
+        async def execute(self, sql: str, *args: Any) -> int:  # pragma: no cover - unused by record
+            self.sql.append((sql, args))
+            if self.fail:
+                raise RuntimeError("read-only replica")
+            return 1
+
+    def test_the_expected_query_selects_the_keys_the_matcher_needs(self) -> None:
+        client = FakeClient()
+        db = self.Db([])
+        run(run_probe(client, policy=policy(), db=db, send=False))
+        selects = [sql for sql, _ in db.sql if sql.strip().startswith("select")]
+        assert selects, "the probe stopped reading the configured channels"
+        for column in ("id", "username", "telegram_channel_id", "we_are_admin"):
+            assert column in selects[0], f"{column} is how app.rights finds the row; the SELECT lost it"
+
+    def test_a_configured_channel_it_can_see_is_reported_with_its_rights(self) -> None:
+        client = FakeClient()
+        db = self.Db([{"id": 3, "username": "@ycanime_bleach", "telegram_channel_id": -100111, "we_are_admin": None}])
+        report = run(run_probe(client, policy=policy(), db=db, send=False))
+        decided = report["account"]["rights"]
+        updates = decided["updates"]
+        # The fake entity has no `admin_rights`, so the honest answer is "member" — False, written,
+        # and never None: a probe that read the channel and found nothing must change the row.
+        assert [u["source_channel_id"] for u in updates] == [3]
+        assert updates[0]["we_are_admin"] is False and updates[0]["can_edit"] is False
+        assert decided["unseen"] == []
+        writes = [sql for sql, _ in db.sql if sql.strip().startswith("update")]
+        assert writes and "app.source_channel" in writes[0] and "rights_checked_at = now()" in writes[0]
+
+    def test_a_configured_channel_it_cannot_see_is_said_out_loud(self) -> None:
+        client = FakeClient()
+        db = self.Db([{"id": 9, "username": "@never_seen", "telegram_channel_id": -1009, "we_are_admin": True}])
+        report = run(run_probe(client, policy=policy(), db=db, send=False))
+        assert report["account"]["rights"]["unseen"] == ["@never_seen"]
+        assert report["account"]["rights"]["updates"] == [], "absence must not write anything"
+        assert not [sql for sql, _ in db.sql if sql.strip().startswith("update")]
+        text = format_report(report)
+        assert "@never_seen" in text, "the report has to name the channel the probe could not read"
+
+    def test_a_failed_write_keeps_the_report(self) -> None:
+        client = FakeClient()
+        db = self.Db(
+            [{"id": 3, "username": "@ycanime_bleach", "telegram_channel_id": -100111, "we_are_admin": None}],
+            fail=True,
+        )
+        report = run(run_probe(client, policy=policy(), db=db, send=False))
+        assert report["account"]["rights"]["updates"], "the read still happened"
+        assert report["rights_recorded"] == {"considered": 1, "written": 0}
+        assert "could not be recorded" in format_report(report) or report["rights_error"]

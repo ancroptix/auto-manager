@@ -3,7 +3,8 @@
 Three screenshots are the whole evidence base for this module, so the tests hold three things apart
 on purpose: the *observed* strings (which must survive verbatim), the *shape* the app renders (which
 must equal the doc), and the boundaries that keep the flow from being acted on early — the probe will
-not mint a link, and the announcement has no approved caption box.
+not mint a link, and the announcement renders from the approved box rather than from a
+copy of the sample someone kept in a comment.
 """
 
 from __future__ import annotations
@@ -163,32 +164,48 @@ def test_widening_the_allowlist_does_not_enable_the_link_verb(monkeypatch: pytes
     assert policy.may_send(linkprovider.BOT_USERNAME, linkprovider.COMMAND) is False
 
 
-def test_the_announcement_is_not_an_approved_caption_yet() -> None:
-    """The gate is a dict, and the absence of a key is the app saying "not authorised".
+def test_the_announcement_box_is_approved_and_is_the_only_way_that_post_is_written() -> None:
+    """Approved on 2026-08-28, in the same conversation that described the flow.
 
-    If someone adds ``templates.announcement_post`` to the approved set, this test fails and they
-    have to say why the operator approved it — which is the whole mechanism working.
+    The assertion is about *where the words live*, not about whether they are nice: the text must be
+    in ``captions.APPROVED_TEMPLATES`` (the gate) and the renderer must read it from there, so an
+    operator who edits the row in ``app.config`` changes the post without a redeploy. A test that only
+    checked the rendered string would keep passing while the box stopped being editable.
     """
-    assert "templates.announcement_post" not in captions.APPROVED_TEMPLATES
-    assert "templates.announcement" not in "".join(captions.APPROVED_TEMPLATES)
+    assert "templates.announcement_post" in captions.APPROVED_TEMPLATES
     assert linkprovider.LINK_LABEL in linkprovider.announcement_caption("X", 1, 1, SAMPLE_LINK)
+    assert "{title_full}" in captions.APPROVED_TEMPLATES["templates.announcement_post"]
+    edited = captions.APPROVED_TEMPLATES["templates.announcement_post"].replace("Added", "ho gaya")
+    try:
+        assert "ho gaya" in linkprovider.announcement_caption("X", 1, 1, SAMPLE_LINK, template=edited)
+    finally:
+        assert "ho gaya" not in linkprovider.announcement_caption("X", 1, 1, SAMPLE_LINK)
 
 
 def test_the_blocked_jobs_name_this_flow() -> None:
     """`/status` must not be able to say "publishing works" while the announcement is unwritten."""
     from app.handlers import DEPENDENCIES
 
+    # The blocker must name the missing *plumbing*, never the wording: the box is approved now, and a
+    # refusal that says "not approved" after approval is a refusal nobody can act on.
+    for kind in ("publish_post", "edit_post"):
+        assert "box not approved" not in DEPENDENCIES[kind]
+        assert "docs/channel-help.md" in DEPENDENCIES[kind], f"{kind} must point at the documented path"
     assert "app/linkprovider.py" in DEPENDENCIES["publish_post"]
-    assert "box not approved" in DEPENDENCIES["publish_post"]
+    assert "approved" in DEPENDENCIES["publish_post"], "and say plainly that the text is signed off"
     assert "Link_providerobot" in DEPENDENCIES["storage_upload"], "the sibling verb is a recorded hint"
 
 
 def test_the_open_questions_stay_written_down_and_counted() -> None:
     unknown = linkprovider.still_unknown()
-    assert len(unknown) >= 6
+    assert len(unknown) >= 3
     joined = " ".join(unknown).lower()
-    for subject in ("who posts", "expires", "/start menu", "emoji", "updates channel", "per episode"):
+    for subject in ("expires", "/start menu", "emoji", "rights"):
         assert subject in joined, f"the question about {subject!r} must stay on the record"
+    # And the four things the operator answered must NOT still be listed as unknowns: an answered
+    # question left in the list is how a doc ends up asking for a decision that was made months ago.
+    for settled in ("who posts", "per episode", "one per show"):
+        assert settled not in joined, f"{settled!r} was answered on 2026-08-28 and belongs in config"
     assert "questions still open" in linkprovider.summary()
     assert str(len(unknown)) in linkprovider.summary()
 
@@ -199,19 +216,24 @@ def test_status_line_refuses_to_look_ready_from_one_half_alone() -> None:
     This is the only place the two settings live, so it is also where a future reader is told that
     ``updates.channel`` being set is not the same as announcements being possible.
     """
+    saved = captions.APPROVED_TEMPLATES["templates.announcement_post"]
     unset = linkprovider.status_line("", True)
     assert "not set" in unset and "nowhere to go" in unset
     named = linkprovider.status_line("@yc_updates", True)
     assert "@yc_updates" in named and "one announcement per episode" in named
-    assert "NOT an approved caption box" in named, "setting the channel must not read as permission to send"
+    assert "the box is approved" in named
+    assert "unwired" in named, "approved must never read as wired: there is no sender yet"
     batched = linkprovider.status_line("yc_updates", False)
     assert "one per batch" in batched and batched.startswith("updates channel:")
-    # And the sentence only changes if the approval actually happens.
-    captions.APPROVED_TEMPLATES["templates.announcement_post"] = "x"
+    # The sentence only changes if the approval is withdrawn — which is a real thing an operator may do
+    # by editing app.config, so the line has to follow the gate rather than a memory of it.
+    del captions.APPROVED_TEMPLATES["templates.announcement_post"]
     try:
-        assert "box is approved" in linkprovider.status_line("@yc_updates", True)
+        unmade = linkprovider.status_line("@yc_updates", True)
+        assert "approved" in unmade and "the box is approved" not in unmade
     finally:
-        del captions.APPROVED_TEMPLATES["templates.announcement_post"]
+        captions.APPROVED_TEMPLATES["templates.announcement_post"] = saved
+    assert "the box is approved" in linkprovider.status_line("@yc_updates", True)
 
 
 def test_the_two_config_rows_have_a_reader() -> None:
@@ -238,8 +260,12 @@ def test_the_doc_quotes_the_observed_words_and_the_rendered_post() -> None:
         linkprovider.COMMAND,
     ):
         assert text in doc, f"{text!r} must appear verbatim in docs/updates-channel.md"
-    sample = linkprovider.announcement_caption("Daemon of the shadow realm", 1, 14, SAMPLE_LINK)
-    assert sample in doc, "the doc's announcement block has to be what the code renders"
+    # The same call the doc's generator makes, so this catches drift in either direction. A second
+    # sample proves the template is not a typed copy of one post: the numbers move, the shape holds.
+    assert linkprovider.announcement_caption("Re Zero", 4, 9, SAMPLE_LINK) in doc
+    other = linkprovider.announcement_caption("Daemon of the shadow realm", 1, 14, SAMPLE_LINK)
+    assert "Daemon of the shadow realm (S1)" in other and "Episode 14 Added" in other
+    assert other.count(SAMPLE_LINK) == 2, "both samples repeat the link, so the template must too"
     assert linkprovider.card_caption("https://t.me/+RM_bWDqzldg2OWFI") in doc
 
 
@@ -253,3 +279,86 @@ def test_the_doc_lists_exactly_the_open_questions() -> None:
 def test_the_readme_links_this_flow() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     assert "docs/updates-channel.md" in readme
+
+
+# --- private channels and the id that names them -------------------------------------------
+
+
+def test_a_private_channel_is_named_by_its_marked_id_not_invented_as_a_handle() -> None:
+    """The operator's updates channel is private, so a numeric id is the *normal* spelling here.
+
+    Two separate failure modes are being closed. A `status_line` that wrapped a number in `@` would
+    tell the operator to look for a handle that does not exist; and an id built by arithmetic
+    (`-100` times a power of ten, or an offset) is how a 13-digit channel silently stops matching its
+    own row — so the exact number is pinned, in both directions.
+    """
+    # `marked_channel_id` is `app.rights`'s business — it is how a row and a channel are proved to be
+    # the same place — but `/status` prints the same value, so the two spellings are pinned together.
+    from app.rights import marked_channel_id
+
+    assert marked_channel_id(2072936982) == -1002072936982
+    assert marked_channel_id("2072936982") == -1002072936982
+    assert marked_channel_id("-1002072936982") == -1002072936982, "already-marked stays as written"
+    assert marked_channel_id("@yc_updates") is None and marked_channel_id(None) is None
+    assert marked_channel_id("") is None and marked_channel_id("-abc") is None
+
+    line = linkprovider.status_line("-1002072936982", True)
+    assert line.startswith("updates channel: private channel -1002072936982")
+    assert "no @handle, which is what private means" in line
+    assert "@-1002072936982" not in line, "a number never becomes a handle"
+    assert "one announcement per episode" in line
+    assert linkprovider.status_line("yc_updates", False).startswith("updates channel: @yc_updates")
+
+
+def test_the_approved_box_is_the_one_the_operator_signed_off() -> None:
+    """The rendered post must equal the observed shape byte for byte, emoji, tail and both links."""
+    text = linkprovider.announcement_caption("Re Zero", 4, 9, linkprovider.deep_link(SAMPLE_TOKEN))
+    assert text == "\n".join(
+        [
+            "🍓 Re Zero (S4)",
+            "",
+            "😗 Episode 09 Added...✨”",
+            "",
+            f"[Click here to start and get episode]({linkprovider.deep_link(SAMPLE_TOKEN)})",
+            f"[Click here to start and get episode]({linkprovider.deep_link(SAMPLE_TOKEN)})",
+        ]
+    )
+    assert linkprovider.announcement_matches_shape(text)["is_ours"] is True
+    # A post that only mentions an episode is not ours, even in that channel.
+    assert linkprovider.announcement_matches_shape("😗 Episode 09 added!\n" + linkprovider.deep_link(SAMPLE_TOKEN))["is_ours"] is not True
+
+
+def test_the_builder_refuses_to_invent_the_number_it_prints() -> None:
+    link = linkprovider.deep_link(SAMPLE_TOKEN)
+    for args in (("", 1, 5, link), ("Solo", None, 5, link), ("Solo", 1, None, link), ("Solo", 1, "", link)):
+        with pytest.raises(ValueError):
+            linkprovider.announcement_caption(*args)
+    # `link` must be the provider's deep link: an invite or an unrelated URL would print a link 33k
+    # people click and that this app never verified.
+    for bad in ("https://t.me/+RM_bWDqzldg2OWFI", "https://example.com/x", ""):
+        with pytest.raises(ValueError):
+            linkprovider.announcement_caption("Solo", 1, 5, bad)
+
+
+def test_the_card_caption_refuses_the_style_that_would_print_brackets() -> None:
+    invite = "https://t.me/+RM_bWDqzldg2OWFI"
+    assert linkprovider.card_caption(invite).count(invite) == 2
+    assert linkprovider.card_caption(invite, repeats=1).count(invite) == 1
+    with pytest.raises(ValueError, match="plain text"):
+        linkprovider.card_caption(invite, style="markdown")
+    with pytest.raises(ValueError, match="link style"):
+        linkprovider.card_caption(invite, style="html")
+    # The announcement can be flattened to plain text from the same box; the card cannot be inflated
+    # to markdown from it. Same care, opposite directions, because the two fields are different.
+    assert "](" not in linkprovider.announcement_caption("Re Zero", 4, 9, linkprovider.deep_link(SAMPLE_TOKEN), style="text")
+
+
+def test_the_announcement_title_is_the_same_title_the_episode_post_uses() -> None:
+    """``{title_full}`` means one thing in every template, or a series ends up spelled two ways in
+    two channels that are supposed to agree. The announcement is a caption box like any other, so it
+    takes the same optional alternate title — and drops the separator, not the line, when there is none.
+    """
+    link = linkprovider.deep_link(SAMPLE_TOKEN)
+    with_subtitle = linkprovider.announcement_caption("Re Zero", 3, 4, link, subtitle="Zero kara Hajimeru")
+    assert "Re Zero: Zero kara Hajimeru (S3)" in with_subtitle.splitlines()[0]
+    assert ": " not in linkprovider.announcement_caption("Re Zero", 3, 4, link).splitlines()[0]

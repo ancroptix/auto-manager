@@ -957,10 +957,12 @@ class ControlBot:
         if not route.rights_verified:
             lines.append("")
             lines.append(
-                "(your rights in this channel have never been read by a live session. once one is "
-                "running they are recorded in app.source_channel.we_are_admin; if this really is "
-                "your own channel and you want that asserted now, set that column to true in the "
-                "dashboard and run this again — I would rather be told than guess.)"
+                "(this session has never read its rights in this channel, so I am taking the narrow "
+                "answer. /probe reads them out of the dialog list and records them in "
+                "app.source_channel.we_are_admin — run it and this line goes away by itself. if this "
+                "really is your own channel and you want it asserted before then, set that column to "
+                "true in the dashboard and run this again: I would rather look than guess, and rather "
+                "be told than be wrong.)"
             )
         return "\n".join(lines)
 

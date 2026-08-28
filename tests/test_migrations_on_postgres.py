@@ -2378,3 +2378,108 @@ def test_in_place_captioning_changes_the_caption_not_the_gate_and_the_plan_is_th
         conn.execute("delete from app.processed_message where source_channel_id = %s", (channel_id,))
 
     asyncio.run(scenario())
+
+
+def test_the_announcement_box_is_seeded_and_survives_an_operator_edit(conn):
+    """0009's config row: the text the operator approved is the text the renderer reads, and a
+    re-apply never overwrites a hand edit — the announcement is the one post an operator is most
+    likely to reword, so `do nothing` is not decoration here."""
+    from app.captions import APPROVED_TEMPLATES
+
+    seeded = val(conn, "select value from app.config where key = 'templates.announcement_post'")
+    assert seeded == APPROVED_TEMPLATES["templates.announcement_post"], "SQL and app.captions drifted"
+    assert seeded.count("{link}") == 2, "the double link line is the observed shape, not a typo"
+    assert "{title_full}" in seeded and "{season}" in seeded and "{episode}" in seeded
+
+    original = conn.execute(
+        "select value from app.config where key = 'templates.announcement_post'"
+    ).fetchone()[0]
+    try:
+        conn.execute(
+            "update app.config set value = %s::jsonb where key = 'templates.announcement_post'",
+            [json.dumps("the operator wrote their own words: {title_full}")],
+        )
+        for path in MIGRATIONS:
+            if path.name == "0009_announcement_approved.sql":
+                conn.execute(path.read_text(encoding="utf-8"))
+        kept = val(conn, "select value from app.config where key = 'templates.announcement_post'")
+        assert "the operator wrote their own words" in kept, "0009 clobbered a row the operator edited"
+    finally:
+        # `original` is the decoded jsonb value (a plain string), so it has to be re-encoded on the
+        # way back in — the same trap that caught the sentinel above, and the reason both use json.dumps.
+        conn.execute(
+            "update app.config set value = %s::jsonb where key = 'templates.announcement_post'",
+            [json.dumps(original)],
+        )
+
+
+def test_the_rights_column_exists_and_is_honest_about_never_having_been_read(conn):
+    """`rights_checked_at` is nullable on purpose: a null is the difference between "we are a member"
+    and "this app has never opened that channel", and `app.inplace.route_for` decides on that line."""
+    row = conn.execute(
+        """
+        select is_nullable, data_type from information_schema.columns
+         where table_schema = 'app' and table_name = 'source_channel'
+           and column_name = 'rights_checked_at'
+        """
+    ).fetchone()
+    assert row is not None, "0009 did not add the column app.rights writes"
+    assert row[0] == "YES" and row[1].startswith("timestamp"), row
+    default = conn.execute(
+        "select count(*) from app.source_channel where rights_checked_at is null"
+    ).fetchone()[0]
+    assert default >= 0  # every pre-0009 row reads as "never looked", which is the point
+
+
+def test_a_session_reading_its_own_rights_writes_the_flag_and_the_timestamp(conn):
+    """The whole point of item three: the app detects this itself, through the real schema.
+
+    Run against Postgres rather than a fake, because two of the three things that could break are
+    invisible to a fake — a missing column, and an `is distinct from` that stops being a no-op once
+    the flag is already what the session found.
+    """
+    import asyncio
+
+    from app import rights as R
+    from app.config import Settings
+    from app.db import Database
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            insert into app.source_channel (telegram_channel_id, username, title, we_are_admin)
+            values (-1009007001, 'rights_probe_tmp', 'Rights Probe', true)
+            returning id
+            """
+        )
+        row_id = cur.fetchone()[0]
+
+    settings = Settings(_env_file=None, database_url=pg_uri, db_ssl="disable", worker_enabled=False)
+    db = Database(settings)
+    decided = {
+        "updates": [{"source_channel_id": row_id, "we_are_admin": False, "can_edit": False, "title": "Rights Probe"}],
+        "unseen": [],
+        "ambiguous": [],
+    }
+
+    async def scenario() -> dict:
+        assert await db.connect(), await db.last_error
+        try:
+            first = await R.record(db, decided)
+            after = await db.fetchrow(
+                "select we_are_admin, rights_checked_at from app.source_channel where id = $1", row_id
+            )
+            again = await R.record(db, decided)
+            return {"first": first, "after": dict(after or {}), "again": again}
+        finally:
+            await db.close()
+
+    try:
+        got = asyncio.run(scenario())
+        assert got["first"] == {"considered": 1, "written": 1}, got
+        assert got["after"]["we_are_admin"] is False, "true was left in place — the read did not land"
+        assert got["after"]["rights_checked_at"] is not None, "the flag moved without its timestamp"
+        # A second probe of the same channel changes nothing, and must not look like a change.
+        assert got["again"] == {"considered": 1, "written": 0}, got["again"]
+    finally:
+        conn.execute("delete from app.source_channel where telegram_channel_id = -1009007001")

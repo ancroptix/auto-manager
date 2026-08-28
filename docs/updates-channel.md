@@ -1,135 +1,264 @@
-# The updates channel, and the link that makes it work
+# The updates channel — how the link is obtained, and what is posted there
 
-Everything else in this project ends at a series channel: files stored, links made, posts written.
-This is the flow that happens **after** that, in a channel of its own, where the audience is not the
-people who already follow one show but everyone who follows the brand. The operator has been doing it
-by hand. It is recorded here in their words and their screenshots (2026-08-28), not in ours.
+An operator asked, in three parts: *"add this channel as a destination for new posts"*, then *"ek
+message with caption aaiga aur usme channel ki link hogi, wo aapko ek bot pe bhejni hogi aur uske
+baad jo link ayega wo post me add hoga"*, then *"usme koi files host nahi karni hai"* — one message
+with a caption and the channel's link arrives; that link is sent to a bot; the link the bot answers
+with goes into the post; and the channel hosts no files.
 
-## The four steps, as the operator does them
+That is a different job from every other destination in this project. **Nothing is stored on this
+channel.** Files stay where they are; this channel carries a notice.
 
-1. In the **series channel**, post a card: the series art with the brand handle on it, captioned with
-   the channel's own private invite link.
-2. **Forward that message** to `Link_providerobot`.
-3. It replies with **one shareable link** — `https://t.me/Link_providerob…` in shape, a bot deep link, with a
-   `SHARE URL` button under it.
-4. Put that link in the **announcement** in the updates channel. The post says which series, which
-   season, and which episode was added. Mechanically the link opens the bot and the bot shows the
-   card, so nobody in a 33k-subscriber channel is handed a join link directly. *Why* it is done this
-   way — a restriction on invite links in public channels, or simply how it has always worked — is the
-   first question below, because the answer changes what the app is allowed to automate.
+## The flow, as the operator described it, with the one unknown named
 
-The card, as posted (the arrow emoji after `Channel link` are visible in the screenshot and are not
-counted here — see the open questions):
+```
+the destination channel's link + a caption with it            <- the operator posts this
+                     |  forwarded to @Link_providerobot        <- the operator does this step
+                     v
+              a shareable link back                            <- this is what goes in the post
+                     v
+       announcement post in the updates channel
+```
 
-```text
+Two things are worth separating here, because they are easy to conflate and the app treats them
+differently. **The card is made from the channel link** — the `t.me/joinchat/...` invite is the input
+to `@Link_providerobot`, and its output is the shareable link that goes in the post. **The
+announcement is made from the bot deep link** — `t.me/Link_providerobot?start=<token>`, which is the
+link both sampled posts point at, not the `t.me/joinchat/...` invite. The card is a *device* for
+spreading the invite; the post is the notice that an episode was added. They are different links and
+a substitution between them is the kind of mistake that only shows up a month later when somebody
+reports a dead link.
+
+The operator also asked whether the card can be **edited** after the bot sends it, and whether the
+link survives editing the caption. That is behaviour *inside another bot's chat*: this code neither
+knows nor guesses. What it does guarantee is narrower and checkable — the link is read from the
+bot's reply and then treated as data, so the post is built from whatever link you end up keeping.
+If you edit the card and the bot hands back a different link, use that one; nothing here caches the
+first answer.
+
+The middle step is the operator's, not the app's: the bot is **not** a storage bot, so this code
+never sends it a file, and it has no API or web interface to call — only a chat with a user in it.
+The app therefore starts where the human hands over the result: a bot deep link.
+
+## The two commands, spelled out for audio, exactly as the code uses them
+
+`app.linkprovider` is the only place these strings live; there is no second copy to drift.
+
+```
+link provider bot: @Link_providerobot
+first word: /genlink
+then: the channel's own t.me link
+link shape: t.me/<bot>?start=<token>
+```
+
+```
+what is sent to the bot:
+/genlink https://t.me/Link_providerobot?start=BQADAQAD0RoAAp4PgEa2qMuk0UmjRBYE
+
+what is expected back (first line, prefix match):
+Here is your link:
+https://t.me/Link_providerobot?start=BQADAQAD0RoAAp4PgEa2qMuk0UmjRBYE
+
+what is taken out of it:
+https://t.me/Link_providerobot?start=BQADAQAD0RoAAp4PgEa2qMuk0UmjRBYE
+or, as a Channel Help button line:
+SHARE URL - https://t.me/Link_providerobot?start=BQADAQAD0RoAAp4PgEa2qMuk0UmjRBYE
+```
+
+| step | what is typed or read | what this code does with it |
+| --- | --- | --- |
+| 1 | `/genlink https://t.me/Link_providerobot?start=BQADAQAD0RoAAp4PgEa2qMuk0UmjRBYE` | one line: the bot's own command word, then the deep link the operator opened the card with. Nothing else, so there is nothing to reformat |
+| 2 | the bot's reply | a shape check, then read the shareable link out of it |
+| 3 | `SHARE URL - https://t.me/Link_providerobot?start=BQADAQAD0RoAAp4PgEa2qMuk0UmjRBYE` | what that link becomes in the post: the observed button label, pointing at the bot with the token — Channel Help syntax, so the link half is ours to supply |
+| (0) | the invite link itself | fed to the bot to make the card. Nothing here does that; it is the operator's step, and its output is step 1 |
+
+Step 1 is not free-form: the bot answers only when the forwarded message carries the words it asked
+for first — `Send A Message For To Get Your Shareable Link` — which is why `parse_reply` treats a reply beginning with those same
+words as *the request echoed back*, not as a link. That single distinction is what stops a
+half-finished handoff from reading as a finished one:
+
+```
+the bot's own request, as the operator recorded it:
+Send A Message For To Get Your Shareable Link
+
+so a reply opening with those words means nothing has been minted:
+kind = asks_for_a_message
+and an answer that opens with neither marker is not harvested for a URL:
+kind = unknown
+```
+
+**The first line is read, not searched for.** `parse_reply` looks at the reply's first line and
+requires the prefix `Here is your link:` plus a `t.me/<bot>?start=` link; anything else comes back as
+`{"kind": "unknown"}` with no link in it. A reply that begins with the wrong words is never
+harvested for a plausible URL somewhere inside it: half a recognised answer that yields a
+working-looking link is the worst outcome available here, because that link goes in front of 33k
+people.
+
+The reverse direction is guarded in `app.probe`, not here: `ProbePolicy.may_send` refuses the words
+`genlink`, `link`, `share` *before* it consults its own allowlist, so no probe run can type the link request into
+any chat however much someone widens `SAFE_COMMANDS` while testing by hand. Minting a link inside
+someone else's bot is a write to a third-party service, and this project's read-only rule covers
+that whether or not a file ever moves.
+
+## The caption on the card
+
+```
 Channel link
 
 https://t.me/+RM_bWDqzldg2OWFI
 https://t.me/+RM_bWDqzldg2OWFI
 ```
 
-The announcement, as posted:
+Two facts about that text.
 
-```text
-🍓 Daemon of the shadow realm (S1)
+It repeats the link **twice**, because that is what the operator's own card does — `LINK_LINES` is
+both the default and the observation, and `repeats` is a real knob for the day they decide the card
+reads better with one line. A default that quietly differed from the sample would produce the wrong
+post at 3 a.m. and call it a success.
 
-😗 Episode 14 Added...✨”
+The invite is **not** wrapped in `[]()`. `card_caption`'s `style` parameter exists to refuse one
+thing: `"markdown"` raises, because in a plain-text caption `[label](url)` does not become a
+hyperlink, it becomes square brackets. The announcement below is the opposite case — it is a
+formatted post, so there the same link *is* written as a markdown link, and
+`announcement_caption(style="text")` is offered for anyone who wants the bare form in that one too.
+
+## The announcement post
+
+```
+🍓 Re Zero (S4)
+
+😗 Episode 09 Added...✨”
 
 [Click here to start and get episode](https://t.me/Link_providerobot?start=BQADAQAD0RoAAp4PgEa2qMuk0UmjRBYE)
 [Click here to start and get episode](https://t.me/Link_providerobot?start=BQADAQAD0RoAAp4PgEa2qMuk0UmjRBYE)
 ```
 
-`app.linkprovider.announcement_caption` renders that second block character for character, and
-`tests/test_linkprovider.py` fails if the doc and the function ever disagree. Two details are in the
-function because they are in **both** samples, so they are a habit and not a typo: the season in
-parentheses after the series, and the link written twice on two lines.
+Built from one template — the approved caption box `templates.announcement_post` in
+`app.config` (and in `app/captions.py` as the fallback), so the operator can change the wording
+without a redeploy:
 
-## What was seen, and how it is known
+```
+templates.announcement_post =
+'🍓 {title_full} (S{season})\n\n😗 Episode {episode} Added...✨”\n\n[Click here to start and get episode]({link})\n[Click here to start and get episode]({link})'
+```
 
-| thing | observed |
-| --- | --- |
-| the bot | `@Link_providerobot` (the name as it appears in the link it sent, which is the spelling that is evidence) |
-| what it is asked | `/genlink` |
-| what it answers first | "Send A Message For To Get Your Shareable Link" |
-| what that means | it wants a *forwarded message*, not a URL typed in |
-| the reply | begins "Here is your link:" then the link on its own line |
-| under the reply | a `SHARE URL` button |
-| the link's shape | `https://t.me/<bot>?start=<token>` |
+`announcement_caption` is the only writer of that shape, and it refuses rather than invents: no
+series name, or no episode number, or a season we do not know (every sampled heading carries
+`(S1)`), and any link that is not a `@Link_providerobot` deep link with a token. A missing
+placeholder raises with its name in the message instead of appearing in the post: a queue with one
+bad row has to be caught by the caller once, and a caption rendered with `{title_full}` still in it
+is a post nobody can unpublish.
 
-`app.linkprovider.parse_reply` reads that reply and nothing else counts: a message is a link only
-when the marker and a `?start=` deep link are both there. A reply that asks for a message comes back
-as `asks_for_a_message`, and anything else comes back `unknown` — because the failure mode this
-guards against is a wrong link published to a channel of strangers.
+**The announcement is an approved caption box as of 2026-08-28.** Before that, `app/linkprovider`
+carried the shape and `app/captions.APPROVED_TEMPLATES` did not, and `test_docs` asserted that it
+must not: "we can render it, we cannot send it" was the accurate sentence at the time. So the
+post is a post that may go out. What still blocks it is not approval but plumbing — the send is
+`app.publish.publish_announcement`, which is unwired like every other MTProto write in this project,
+and `app/handlers.py` refuses the job kind until a live channel has seen one posted.
 
-The token, not the whole URL, is what belongs in the database: `L.deep_link(token)` rebuilds the
-link from the bot's current username, so a bot that renames itself cannot invalidate links already
-posted.
+The matcher in `announcement_matches_shape` reads a heading, a note line **whose tail must match**
+(`...Added...✨”` — both samples end that way, so a message that merely mentions an episode is not
+ours), a season, an episode number with or without a leading zero, and links that either all carry
+the same token or carry none at all. It reports what was found and returns `None` values for what
+was not, rather than guessing a season from a title. It is the parser the day comes when
+this project needs to read its own past announcements; it is not a gate on sending them.
 
-## Where this plugs in — and where it deliberately does not
+## `@anime_hindifilesbot` and `@Link_providerobot` are different tools
 
-* **The probe knows it exists.** `app.probe.ProbePolicy` has `link_provider` as a third peer, and
-  `run_probe` maps its menu like the other two. If a reply during a probe is already link-shaped, the
-  report says `reply shape observed`.
-* **The probe will never use `/genlink`.** `/genlink` is not forbidden the way a moderation verb
-  is; it is *not free* — it mints a permanent link on your account and only answers once something has
-  been forwarded to it. A read-only run does neither, and that is enforced before the allowlist, the
-  same guard `app.storagebot.FORBIDDEN` sits behind.
-* **`publish_post` now names this leg.** `app/handlers.py` says the publisher owes an announcement after
-  an episode post, so `/status` cannot report "publishing" while half of it is unwritten.
-* **The announcement shape is *not* an approved caption.** There is no `templates.announcement_post`
-  in `captions.APPROVED_TEMPLATES`, and that is the rule working, not a missing row: nothing is posted
-  to that channel until you approve the exact text. Say "the announcement box is approved" (or give me
-  the line you want changed) and it becomes one row.
+The storage bot hosts files and gives back a post with a link. The link provider mints a shareable
+link for a channel card and hosts nothing. `summary()` keeps that distinction in one line:
 
-## What the operator answered, 2026-08-28
+/genlink on @Link_providerobot takes a forwarded message and answers with a t.me/<bot>?start= link; 4 questions still open
 
-Four questions were asked and four answers came back, so they are recorded as decisions rather than
-left in a chat log:
+## What this is worth in the pipeline, honestly
 
-| asked | answered | what that means in the code |
+The announcement is a notification. It is not a manifest, not a coverage claim, and not an approval
+of anything.
+
+Two consequences are already coded. First, an announcement carries a link to *where to ask*, not a
+file: nothing may reason from its existence that a file was published. Second, the only identifier
+in the text is the token, and it belongs to the link provider, so it cannot be used to find a row
+in `app.episode` — which is exactly why the matcher's `missing` list is a first-class part of its
+answer. Any future "what did we already announce" question gets answered by a table the app writes,
+never by reading the channel back.
+
+## Where the state lives, and the one place the app refuses to be clever
+
+Four rows in `app.config`, seeded by `supabase/migrations/0008_updates_channel.sql`, and the fifth
+(`templates.announcement_post`) by 0009. Three of them have a reader today; `app/linkprovider.status_line`
+prints what it can and `/status` shows that line — a config row nothing reads is a row that lies quietly,
+so this is stated rather than hidden:
+
+- `updates.channel` — the channel to post in: an `@handle` or a marked numeric id. Empty means the
+  app does not know where, and `status_line` says "announcements have nowhere to go" instead of
+  inventing a name. **A private channel is named by its id, because a private channel has no
+  @handle** — that is the usual spelling here, not an edge case, and both are accepted.
+- `updates.per_episode` — `true` is one announcement per episode; `false` is one per batch. A
+  config row, because it is a taste, not a fact.
+
+A numeric id is a 13-digit number with `-100` in front (`marked_channel_id` builds and reads it as
+text for that reason; doing it arithmetically is how a row silently stops matching its channel). To
+find your channel's id: forward one of its posts to `@userinfobot`, or open the channel through
+this app's session and read it from `app.rights` — the second one happens on every `/probe`. A
+private channel also has no public join address, which is why the announcement's link and the
+operator's invite are the only ways in, and why `joinable` stays a question this code answers with
+the dialog list rather than with the id.
+
+`app.probe` will not paste a link into a chat it has not been told to post in. `probe_account`'s
+`expected` list comes from `app.source_channel` rows, the same list that guards `forward_source`,
+and a destination that is neither a configured source nor a named destination in the probe's own
+policy is reported as a missing channel rather than messaged. Sending an announcement to the wrong
+place is not a recoverable mistake, and an account already under a limit is not the place to be
+creative.
+
+Reading rights works the same way round: `app/rights.py` never inserts a row, never matches a
+channel by its title (renames happen, ids do not), and treats a configured-but-invisible channel as
+"not read" — never "member". It records what it found *and* the timestamp it found it at, because
+`we_are_admin` is a claim about yesterday otherwise.
+
+## What the operator answered on 2026-08-28
+
+Four questions were put after the flow was recorded; all four were answered. They are written here as
+data, with the row or file that carries each one, so the next reader does not have to reassemble a
+conversation:
+
+| question | answer | where it lives now |
 | --- | --- | --- |
-| one global channel, or one per series? | **one, for the whole brand** | `app.config` row `updates.channel` holds it — a `@handle` or the numeric id. Empty does not mean "announce nowhere", it means "the app does not know where", and `/status` says that in those words instead of staying quiet |
-| who posts it? | **your own account**, through the logged-in session | plain text links and no button row, like both samples; no new permission is involved, only the write layer that is unwired today |
-| when is one owed? | **per episode, as it lands** | `updates.per_episode = true`, which is what the samples look like anyway (`Episode 14 Added`, never a range). Set it false and the same shape names the range instead |
-| does the link survive its card? | **yes, it keeps working** | the token is reusable, so one per series channel is enough, and rotating a private invite can regenerate the card without orphaning a published announcement. The app still never deletes — this answer only says a deleted card would not break what was already posted |
+| one updates channel, or one per series? | **one global channel** | `app.config` `updates.channel`, a single text value — a per-series setting would have needed a column on `app.destination_channel` instead |
+| who posts there? | **my own account** (the operator's session) | `updates.posted_by`, and `status_line` prints it, because "as plain text with a link" is what a user session does and a bot does not |
+| one announcement per episode, or per batch? | **per episode** | `updates.per_episode` = `true`, read by `status_line` |
+| does the shareable link survive editing the card? | **the link survives** | `updates.link_survives_edits` = `true`, which is what lets a rotated invite regenerate the card without stranding the posts that already carry the old link |
 
-The `/status` line prints the whole state in one sentence because the two halves are easy to satisfy
-one at a time:
-
-```text
-updates channel: not set — announcements have nowhere to go, so one announcement per episode is a plan with no audience; …
-updates channel: @yc_updates, one announcement per episode, sent by your own account as plain text with a link; the announcement text is recorded but NOT an approved caption box, so nothing sends yet
-```
-
-## Why there is no queue table for this
-
-An announcement is a post, and `app.job` already queues posts (`publish_post`). A second table asking
-"is an announcement owed?" would be a second answer to the same question, and two answers is how one
-episode gets announced twice to 33k people. So 0008 adds two settings and nothing else: when the
-sender exists, it reads `updates.channel`, `updates.per_episode`, the destination's stored card token,
-and the approved-caption gate. Every one of those already has a reader.
+Nothing new is posted by those answers, and two things are deliberately not built: no announcement
+queue table (a second ledger would be a second truth; an announcement is a post and `app.job`
+already answers "is one owed?"), and no `app.destination_channel` row for the updates channel (that
+table's rows carry `expected_episodes`, coverage maths, and a `channel_help_post_id` — all episode
+machinery, none of which applies to a notice board).
 
 ## What it does not settle
 
-Recording a flow is not authorising one. These are the questions the three screenshots cannot answer,
-and every one of them is a question about either the bot's protocol or your intent:
+1. whether the link expires, is rate-limited, or stops working when the private invite it shows is revoked and regenerated — the question that decides whether an old announcement is a dead end
+2. what @Link_providerobot's /start menu holds besides /genlink, and whether it has the same moderation verbs as the storage bot's menu (broadcast, ban, unban)
+3. the exact emoji run in the card caption after the words 'Channel link' — visible, not counted
+4. whether this session's account can post in the updates channel at all: /probe reads our own rights from the dialog list (app/rights.py) and writes them, and until that has run, the first announcement is a guess about a channel this account may only be able to read
 
-1. who posts the announcement: your own account, @chelpbot, or the app's session — the sampled posts carry text links and no button row, which is not how Channel Help composes one
-2. whether the shareable link lives forever, or dies with the card message it was made from (this decides whether the app may ever delete a card, and the answer is presumably no)
-3. whether the link expires, is rate-limited, or stops working when the private invite it shows is revoked and regenerated
-4. what @Link_providerobot's /start menu holds besides /genlink, and whether it has the same moderation verbs as the storage bot's menu (broadcast, ban, unban)
-5. the exact emoji run in the card caption after the words 'Channel link' — visible, not counted
-6. whether one updates channel serves every series (as it appears to now) or one per show, and which channel it is by handle: the screenshots show it open by id, not by username
-7. whether the announcement is owed per episode, per batch, or only when you say so
+Each of those has a next step that is a run on a channel we control rather than a guess. The one about
+expiry decides whether an old announcement rots; the one about rights answers itself the first time
+`/probe` runs, because `app/rights.py` reads our own admin status out of the dialog list and records
+it. Listing them here is deliberate: a closed list of unknowns is a to-do list, and an empty one would
+be a lie.
 
-Until the first of those is answered, the app can *describe* an announcement — and will, in a plan —
-but it will not send one.
+## What the guide says, and what has been seen here
 
-## Same verb, different bot: what this says about the storage bot
+Channel Help's own guide documents the posting half of this: caption and media, HTML/Markdown
+formatting, button rows, scheduling, reactions, a signature, and a final step to save or schedule a
+post. `docs/channel-help.md` keeps those facts and says which of them this project depends on.
+The announcement post does not go through Channel Help at all — it is the operator's own account
+posting plain text with a link — so none of the bot's rules bind it, and none of its free-tier limits
+either.
 
-`/genlink` is also the first verb on `@anime_hindifilesbot`'s menu ("To store a single message or
-file"), and the reply shape recorded here — "send me a message, get a link" — is exactly the shape
-that job needs. That is a strong hint that the two bots come from the same family of tool. It is
-**not** proof: `storage_upload` stays blocked, and `app/storagebot.py`'s own list of open questions is
-unchanged, because a guess about one bot is not an observation of the other. The probe re-reading
-`@anime_hindifilesbot`'s replies is still what closes it.
+What has been *seen* on this account's channel is the sample caption quoted above, plus the two
+sample announcements the operator sent. What has not been seen is a private channel's id format
+actually in use, a card being edited and keeping its link, and a link the provider bot handed back
+to this session — all three are documented or operator-asserted, none is observed by this code, and
+each is marked as such at the place it would matter.

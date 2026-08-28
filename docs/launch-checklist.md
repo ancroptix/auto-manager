@@ -129,7 +129,7 @@ Open <https://raw.githubusercontent.com/ancroptix/auto-manager/arena/01a04370-au
 → `Ctrl+A`, `Ctrl+C` (it is ~1,320 lines; do not retype any of it) → Supabase dashboard →
 **SQL Editor** → **New query** → paste → **Run**.
 
-One run, once. It creates 27 tables and views, 14 functions and 43 config rows,
+One run, once. It creates 27 tables and views, 14 functions and 44 config rows,
 including the caption text you approved. Re-running it is safe by design — every
 statement is `if not exists`, `or replace`, or guarded by "only if the value still
 equals the placeholder we shipped", which is why your caption edits survive a re-apply
@@ -161,12 +161,16 @@ to `false` once the session works. And if the bot says nothing at all: the token
 owner ID, or the branch is wrong — `/status` cannot answer, which is the tell that
 `TELEGRAM_BOT_TOKEN` did not make it in.
 
-**One box worth filling while you are in the dashboard:** `app.source_channel.we_are_admin`.
-`true` where the session can post and edit, `false` where it is only a member, `null` where
-nobody has looked. That one box decides the shape of the whole job for a channel — admin and
-files already there means captions are edited in place (`/inplace @channel`); member means the
-channel is a source and the destination is **built**, not skipped. `/status` reads it, and the
-app never guesses it.
+**The app reads its own place in a channel — you do not have to fill anything in.**
+`app.source_channel.we_are_admin` is `true` where the session can post, `false` where it is only a
+member, `null` where nobody has looked yet; `rights_checked_at` says when. A run of `/probe` walks the
+dialog list, matches each configured channel by @handle or by its marked id, and writes all three —
+never by title, and never for a channel it could not see, which the report names out loud. That flag
+decides the shape of the whole job for a channel: admin, with the files already there, means captions
+are edited in place (`/inplace @channel`); member means the channel stays a source and the destination
+is **built**, not skipped. Setting the column by hand is still allowed, for the channel the session
+cannot see at all, and `/status` says which case it is in — the app never guesses, and never edits
+someone else's message on a `null`.
 
 ## 8. Teach the app the two third-party bots — this is the real finish line
 

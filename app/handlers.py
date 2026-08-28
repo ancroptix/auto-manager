@@ -63,13 +63,20 @@ DEPENDENCIES: dict[str, str] = {
     JobKind.LINK_VERIFY.value: "link liveness probe",
     # The publisher has two audiences, and only one of them is a series channel: the episode post
     # goes to the destination, and the updates channel is owed a short announcement carrying the
-    # link-provider deep link. Its shape is recorded in ``app/linkprovider.py`` and deliberately not
-    # yet in ``captions.APPROVED_TEMPLATES``, so it cannot be sent before the operator approves it.
+    # link-provider deep link. That announcement's box is approved (templates.announcement_post,
+    # 2026-08-28), and this job kind is *still* blocked, because approval is not a transport: what is
+    # missing is the send path. ``docs/channel-help.md`` is the documented flow the episode half has
+    # to match, and no part of it has been walked on a channel of ours yet.
     JobKind.PUBLISH_POST.value: (
-        "ChannelHelpPublisher adapter, plus the updates-channel announcement that follows each "
-        "episode post (app/linkprovider.py: shape known, box not approved)"
+        "the MTProto send path — Channel Help's documented post flow for a destination episode "
+        "(docs/channel-help.md), and the updates-channel announcement, whose text is approved and "
+        "whose sender does not exist yet (app/linkprovider.py)"
     ),
-    JobKind.EDIT_POST.value: "ChannelHelpPublisher adapter (in-place quality edits)",
+    JobKind.EDIT_POST.value: (
+        "the session's messages.editMessage path: replacing the media on a post Channel Help made, or "
+        "editing its caption, is documented in docs/channel-help.md under My posts — which is a "
+        "description of the tool, not a test of ours"
+    ),
     JobKind.SEASON_STICKER.value: "sticker-pack label mapping (S1, Season 2, ...)",
     JobKind.JOIN_REQUEST_CAMPAIGN.value: "owner-approved campaign sender with per-hour pacing",
     JobKind.LINK_HEALTH_CHECK.value: "periodic re-check of published storage links",

@@ -29,6 +29,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Sequence
 
+from . import rights as channel_rights
 from .linkprovider import NOT_FOR_PROBE as LINK_MINTING_COMMANDS
 from .linkprovider import parse_reply as _parse_link_reply
 from .linkprovider import summary as _link_provider_summary
@@ -360,17 +361,17 @@ async def probe_account(
             entry: dict[str, Any] = {
                 "title": (getattr(entity, "title", None) or getattr(entity, "first_name", None) or "")[:60],
                 "username": getattr(entity, "username", None),
+                # The id is what makes a private channel matchable: with no @handle to compare, the
+                # marked numeric id is the only key the dashboard row and the entity share.
+                "id": getattr(entity, "id", None),
                 "mine": bool(getattr(entity, "creator", False)),
                 "left": bool(getattr(entity, "left", False)),
                 "members": getattr(entity, "participants_count", None),
                 "channel": getattr(entity, "broadcast", None) is not None,
+                # Always present, `None` included: "we are a member" and "we never looked" have to
+                # stay two different facts, and omitting the key for a member made them the same one.
+                "rights": channel_rights.rights_of(entity),
             }
-            rights = getattr(entity, "admin_rights", None)
-            if rights is not None:
-                entry["rights"] = {
-                    name: bool(getattr(rights, name, False))
-                    for name in ("post_messages", "edit_messages", "delete_messages", "invite_users", "add_admins")
-                }
             dialogs.append(entry)
             if entry["username"]:
                 by_username[str(entry["username"]).casefold()] = entry
@@ -389,6 +390,9 @@ async def probe_account(
         if str(row.get("username") or "").lstrip("@").casefold() not in by_username
     ][:12]
     out["top_dialogs"] = [d for d in dialogs[:10]]
+    # Rights are read here rather than in a second pass because the dialog walk is the expensive
+    # part, and a second walk would be a second chance for the answer to differ from the first.
+    out["rights"] = channel_rights.plan(dialogs, expected)
     run.record("account", dialog_count=len(dialogs), owned=len(out["owned_channels"]))
     return out
 
@@ -410,7 +414,8 @@ async def run_probe(
     if db is not None and getattr(db, "connected", False):
         try:
             expected = await db.fetch(
-                "select username, telegram_channel_id from app.source_channel where coalesce(active, true)"
+                "select id, username, telegram_channel_id, we_are_admin from app.source_channel "
+                "where coalesce(active, true)"
             )
         except Exception as exc:  # noqa: BLE001
             log.warning("probe could not read configured channels: %s", exc)
@@ -439,6 +444,17 @@ async def run_probe(
         # than retried: the account must not be used to probe twice "to be sure".
         report["violation"] = str(exc)
         log.error("probe violated its own policy and stopped: %s", exc)
+
+    decided = (report.get("account") or {}).get("rights") or {}
+    if decided and db is not None and getattr(db, "connected", False):
+        try:
+            report["rights_recorded"] = await channel_rights.record(db, decided)
+        except Exception as exc:  # noqa: BLE001 - a failed write must not lose the report
+            report["rights_recorded"] = {"considered": len(decided.get("updates") or []), "written": 0}
+            # The report survives a failed write, and it says so: a run that read three channels and
+            # recorded none of them must not arrive looking like a run that found nothing to change.
+            report["rights_error"] = f"{type(exc).__name__}: {str(exc)[:120]}"
+            log.warning("rights could not be recorded: %s", exc)
 
     report["messages_sent"] = run.sent
     report["elapsed_seconds"] = run.elapsed
@@ -505,6 +521,14 @@ def format_report(report: dict[str, Any]) -> str:
     missing = account.get("missing_channels") or []
     if missing:
         lines.append("  configured but NOT visible: " + ", ".join(str(m.get("want")) for m in missing[:8]))
+    decided = account.get("rights") or {}
+    if decided:
+        lines.append("  " + channel_rights.summary(decided, report.get("rights_recorded") or {}))
+    if report.get("rights_error"):
+        lines.append(
+            "  RIGHTS NOT RECORDED: " + str(report["rights_error"])
+            + " — what was read is in this report only; the database still holds the old values"
+        )
 
     for label, key in (("storage bot", "storage_bot"), ("channel help", "channel_help"), ("link provider", "link_provider")):
         section = report.get(key) or {}

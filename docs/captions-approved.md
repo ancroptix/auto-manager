@@ -1,10 +1,12 @@
 # Approved captions and buttons
 
-*One shape is deliberately missing from this page: the updates-channel announcement. Its text is
-recorded in [docs/updates-channel.md](docs/updates-channel.md) and rendered by
-`app.linkprovider.announcement_caption`, but it is not in `APPROVED_TEMPLATES`, so nothing can send it
-until the operator says the box is right. That is the gate working, not a gap — say "approve the
-announcement box" and it becomes one row here.*
+*The updates-channel announcement is on this page now, as `templates.announcement_post`: approved on
+2026-08-28 in the same conversation that described the flow. It was recorded first in
+[docs/updates-channel.md](docs/updates-channel.md) and rendered by
+`app.linkprovider.announcement_caption`, and deliberately kept out of `APPROVED_TEMPLATES` until the
+operator said the box was right — that part worked as intended. What still blocks the send is the
+missing write path, not the wording: `publish_post` is blocked in `app/handlers.py` until a live
+channel has seen one posted.*
 
 The operator's own samples, as implemented. What is on this page is what a post
 will say — no code reading required to check it. If a line below is wrong, say

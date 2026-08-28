@@ -275,6 +275,17 @@ APPROVED_TEMPLATES: dict[str, str] = {
     # one row, a newline starts the next. The fancy ❐ brackets are the operator's,
     # and the label stays identical for a single link — the quality is only named
     # when there is more than one to choose between.
+    # The updates channel's announcement, approved 2026-08-28 in the same conversation that
+    # described the flow: heading with the season, the line naming the episode, and the link
+    # twice because that is what both sampled posts do. A caption box like every other one here,
+    # so it is editable in `app.config` without a redeploy — and `app.linkprovider` still refuses
+    # to render anything whose {link} is not a real bot deep link.
+    "templates.announcement_post": (
+        "\U0001f353 {title_full} (S{season})\n\n"
+        "\U0001f617 Episode {episode} Added...✨”\n\n"
+        "[Click here to start and get episode]({link})\n"
+        "[Click here to start and get episode]({link})"
+    ),
     "templates.episode_button": "❐ 𝗪𝗮𝘁𝗰𝗵/𝗗𝗼𝘄𝗻𝗹𝗼𝗮𝗱 ❐ - {storage_link}",
     "templates.episode_button_multi": "❐ 𝗪𝗮𝘁𝗰𝗵/𝗗𝗼𝘄𝗻𝗹𝗼𝗮𝗱 {quality} ❐ - {storage_link}",
     "templates.season_button": "❐ 𝗪𝗮𝘁𝗰𝗵/𝗗𝗼𝘄𝗻𝗹𝗼𝗮𝗱 ❐ - {storage_link}",

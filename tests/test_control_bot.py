@@ -475,7 +475,11 @@ async def test_status_names_the_updates_channel_state() -> None:
     db2.config_rows.update({"updates.channel": "@yc_updates", "updates.per_episode": True})
     control2, _api2, _db2 = bot(db=db2)
     (text2,) = await say(control2, "/status")
-    assert "@yc_updates" in text2 and "NOT an approved caption box" in text2, text2
+    assert "@yc_updates" in text2, text2
+    # Approved is not wired. The line has to carry both halves or the operator reads "approved" as
+    # "announcements are going out", which is the one thing this status must never imply.
+    assert "the box is approved" in text2 and "unwired" in text2, text2
+    assert "not set" not in text2
 
 
 @pytest.mark.asyncio

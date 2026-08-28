@@ -37,7 +37,12 @@ from app.captions import (
 )
 
 ROOT = Path(__file__).resolve().parents[1]
-MIGRATION = (ROOT / "supabase/migrations/0004_approved_captions.sql").read_text(encoding="utf-8")
+# Every migration, in filename order: an approved box may be seeded by 0004 (where the first four
+# live) or by a later file (0008's two, 0009's announcement), and "is it seeded anywhere, with the
+# text the renderer uses" is the question. Naming one file would have quietly made 0009 uncheckable.
+MIGRATION = "\n".join(
+    path.read_text(encoding="utf-8") for path in sorted((ROOT / "supabase" / "migrations").glob("*.sql"))
+)
 
 # Exactly the operator's archive sample, modulo the documented normalisations:
 # single-newline box, and one stored title for both surfaces.
@@ -243,7 +248,17 @@ def test_unknown_placeholders_in_a_template_are_visible() -> None:
 def test_every_placeholder_a_template_uses_has_a_value_source() -> None:
     """Guards the reverse direction too: a template that asks for `{quality_list}`
     on an archive caption would silently print the braces forever."""
-    known = set(post_values(title="x")) | set(archive_values(title="x")) | {"storage_link", "quality_list"}
+    # Every set here is a real payload builder, so "known" is what the code can fill in, not a list
+    # of names someone typed. The announcement box is checked the same way as the others: its builder
+    # must actually produce `link`, or the box asks for something nobody can give it.
+    from app.linkprovider import announcement_values, deep_link
+
+    known = (
+        set(post_values(title="x"))
+        | set(archive_values(title="x"))
+        | set(announcement_values("x", 1, 1, deep_link("TOKEN")))
+        | {"storage_link", "quality_list"}
+    )
     for key, template in APPROVED_TEMPLATES.items():
         for name in placeholder_keys(template):
             assert name in known, f"{key} asks for {{{name}}}, which no payload provides"
@@ -358,12 +373,17 @@ def test_new_keys_never_clobber_an_operator_value() -> None:
         assert "on conflict (key) do nothing" in block, block
 
 
+CAPTIONS_MIGRATION = (ROOT / "supabase/migrations/0004_approved_captions.sql").read_text(encoding="utf-8")
+
+
 def test_the_subtitle_column_lives_on_series_not_season() -> None:
     """The alternate title is a property of the show. Putting it on the season would
     make it editable per season and re-derive per post, which is how a series ends
     up spelled three ways in one channel."""
-    assert "alter table app.series add column if not exists subtitle text;" in MIGRATION
-    assert "app.season" not in MIGRATION
+    # Scoped to 0004 on purpose: the union of every migration legitimately mentions `app.season`
+    # (0001 creates it), and "the caption migration did not put the subtitle there" is the claim.
+    assert "alter table app.series add column if not exists subtitle text;" in CAPTIONS_MIGRATION
+    assert "app.season" not in CAPTIONS_MIGRATION
 
 
 @pytest.mark.parametrize("key", sorted(APPROVED_TEMPLATES))

@@ -138,34 +138,51 @@ def parse_reply(text: str | None, *, bot: str = BOT_USERNAME) -> dict[str, Any]:
     return out
 
 
-def card_caption(invite_link: str, *, repeats: int = LINK_LINES, words: str = "Channel link") -> str:
+def card_caption(
+    invite_link: str,
+    *,
+    style: str = "text",
+    repeats: int = LINK_LINES,
+    words: str = "Channel link",
+) -> str:
     """The caption of the card post inside a destination channel (image 2's shape).
 
     ``words`` is the only part of that line this module claims to know; the pointing-hand emoji that
     follow it are visible in the screenshot but their exact count is listed as unread, so they are
     left to the operator's own post rather than invented here.
+
+    ``style`` exists to refuse one thing. The operator's own words for this caption are "plain text
+    with a link", so ``"markdown"`` — wrapping the link in ``[]()``, which is how the *announcement*
+    carries it — raises instead of producing a caption whose square brackets would be visible. A
+    default that silently produces the wrong format in a private channel is worse than no default.
     """
+    if style == "markdown":
+        raise ValueError(
+            "a card caption is plain text with a link: `[]()` in a text field shows as brackets, not "
+            "as a hyperlink — keep style='text' and let the announcement carry the markdown form"
+        )
+    if style != "text":
+        raise ValueError(f"unknown link style {style!r}: 'markdown' or 'text'")
     link = str(invite_link or "").strip()
     if not _INVITE_RE.fullmatch(link):
         raise ValueError("a card caption carries a t.me/+ invite link, nothing else")
     return "\n".join([words, ""] + [link] * max(1, int(repeats)))
 
 
-def announcement_caption(
+def announcement_values(
     series: str,
     season: int | str | None,
     episode: int | str | None,
     link: str,
     *,
-    style: str = "markdown",
-    repeats: int = LINK_LINES,
-) -> str:
-    """The updates-channel post, in the shape both samples had.
+    subtitle: str | None = None,
+) -> dict[str, str]:
+    """The values an announcement needs, checked before anything is rendered.
 
-    Two things this refuses to do. It does not accept an empty ``season``: every sampled heading
-    carried ``(S1)``/``(S4)``, and a bare series line in an announcement reads like the whole show
-    was added. And it does not emit a link it has not recognised: the announcement is the one place
-    where a hallucinated URL reaches strangers, so ``link`` must be a real ``?start=`` deep link.
+    Two refusals, both learned from the samples. An empty ``season`` is refused: every heading
+    carried ``(S1)``/``(S4)``, so a bare series line reads as a claim that the whole show was added.
+    And an unrecognised ``link`` is refused: this is the one place a hallucinated URL reaches
+    33k people, so it has to be a real ``?start=`` deep link, not merely a URL.
     """
     name = str(series or "").strip()
     if not name:
@@ -178,18 +195,65 @@ def announcement_caption(
     number = str(episode).strip().zfill(2) if str(episode or "").strip().isdigit() else str(episode or "").strip()
     if not number:
         raise ValueError("an announcement says which episode was added")
-    url = deep_link(token)
-    if style == "markdown":
-        lines = [f"[{LINK_LABEL}]({url})"] * max(1, int(repeats))
-    elif style == "text":
-        lines = [LINK_LABEL, url] * max(1, int(repeats))
-    else:
-        raise ValueError(f"unknown link style {style!r}: 'markdown' or 'text'")
-    return (
-        f"{HEADING_MARK} {name} (S{str(season).strip().lstrip('Ss')})\n\n"
-        f"{NOTE_MARK} Episode {number} Added...{NOTE_TAIL}\n\n"
-        + "\n".join(lines)
+    from .captions import title_with_subtitle  # same helper the episode captions use
+
+    return {
+        # `{title_full}` means one thing across every template in this project: the series with its
+        # alternate title when it has one. The announcement is the exception only when the caller has
+        # no subtitle to pass, because `title_with_subtitle` drops the separator rather than printing
+        # a dangling colon into a channel of 33k people.
+        "title_full": title_with_subtitle(name, subtitle),
+        "season": str(season).strip().lstrip("Ss"),
+        "episode": number,
+        "link": deep_link(token),
+    }
+
+
+_MD_LINK_RE = re.compile(r"\[(?P<label>[^\]]*)\]\((?P<url>https?://[^)\s]+)\)")
+
+
+def announcement_caption(
+    series: str,
+    season: int | str | None,
+    episode: int | str | None,
+    link: str,
+    *,
+    style: str = "markdown",
+    subtitle: str | None = None,
+    template: str | None = None,
+) -> str:
+    """Render the announcement through the approved box, and refuse anything the box cannot fill.
+
+    ``app.captions.render_caption`` is the only way a caption is ever built here, approved box or
+    not, so the operator can change this post in one ``app.config`` row — including deleting the
+    repeated link line, which is the other thing they might well decide to do.
+
+    A placeholder the values cannot fill raises with the name of it rather than rendering a post
+    that says ``{title_full}`` to 33k people: this function is called once per episode, so the
+    caller's error handling is one ``try`` around the loop, and a queue that dies on the first bad
+    row is a queue that never reaches the good ones. ``build``-style soft failure belongs to the
+    caption paths that scan hundreds of messages at once (``app/inplace/caption_for``), not here.
+
+    ``style`` is a rendering of the *same* text, not a second template: ``"text"`` rewrites each
+    ``[label](url)`` into a label line over the bare url, which is what a plain-text post in a
+    private channel looks like when the client is not asked to parse markdown.
+    """
+    # Local import: captions owns the approved boxes, and this module is imported by the probe.
+    from .captions import APPROVED_TEMPLATES, render_caption
+
+    values = announcement_values(series, season, episode, link, subtitle=subtitle)
+    text, missing = render_caption(
+        template or APPROVED_TEMPLATES["templates.announcement_post"],
+        values,
+        key="templates.announcement_post",
     )
+    if missing:
+        raise ValueError(f"the announcement box wants {', '.join(missing)} and the caller passed none")
+    if style == "text":
+        text = _MD_LINK_RE.sub(lambda m: f"{m.group('label')}\n{m.group('url')}", text)
+    elif style != "markdown":
+        raise ValueError(f"unknown link style {style!r}: 'markdown' or 'text'")
+    return text
 
 
 def announcement_matches_shape(text: str) -> dict[str, Any]:
@@ -201,7 +265,12 @@ def announcement_matches_shape(text: str) -> dict[str, Any]:
     """
     body = str(text or "")
     heading = next((line for line in body.splitlines() if line.strip().startswith(HEADING_MARK)), None)
-    note = next((line for line in body.splitlines() if NOTE_MARK in line), None)
+    # The tail is part of the recognition, not decoration: the note line ends with the sparkle and
+    # the stray quote in both samples, so a message that merely mentions an episode is not ours.
+    note = next(
+        (line for line in body.splitlines() if NOTE_MARK in line and NOTE_TAIL in line),
+        None,
+    )
     return {
         "is_ours": bool(heading and note and LINK_LABEL in body),
         "series_line": (heading or "")[len(HEADING_MARK) :].strip() or None,
@@ -215,21 +284,20 @@ def still_unknown() -> tuple[str, ...]:
 
     Kept as data because the doc prints this list and ``tests/test_linkprovider.py`` fails if the
     two drift apart: an honest "we do not know yet" is the difference between a blocked job and a
-    guessed one.
+    guessed one. Four questions from the earlier list were answered on 2026-08-28 (who posts, whether
+    the link survives editing the card, one channel for every series, one announcement per episode);
+    they live as ``app.config`` rows now, because a thing we know does not belong in a list of
+    unknowns and a thing we merely believe does not belong in code that posts to 33k people.
     """
     return (
-        "who posts the announcement: your own account, @chelpbot, or the app's session — the sampled "
-        "posts carry text links and no button row, which is not how Channel Help composes one",
-        "whether the shareable link lives forever, or dies with the card message it was made from "
-        "(this decides whether the app may ever delete a card, and the answer is presumably no)",
         "whether the link expires, is rate-limited, or stops working when the private invite it shows is "
-        "revoked and regenerated",
+        "revoked and regenerated — the question that decides whether an old announcement is a dead end",
         "what @Link_providerobot's /start menu holds besides /genlink, and whether it has the same "
         "moderation verbs as the storage bot's menu (broadcast, ban, unban)",
         "the exact emoji run in the card caption after the words 'Channel link' — visible, not counted",
-        "whether one updates channel serves every series (as it appears to now) or one per show, and "
-        "which channel it is by handle: the screenshots show it open by id, not by username",
-        "whether the announcement is owed per episode, per batch, or only when you say so",
+        "whether this session's account can post in the updates channel at all: /probe reads our own "
+        "rights from the dialog list (app/rights.py) and writes them, and until that has run, the first "
+        "announcement is a guess about a channel this account may only be able to read",
     )
 
 
@@ -244,8 +312,15 @@ def status_line(channel: Any, per_episode: Any = True) -> str:
     from .captions import APPROVED_TEMPLATES  # local import: captions owns the approval set
 
     approved = "templates.announcement_post" in APPROVED_TEMPLATES
-    named = str(channel or "").strip()
-    where = f"{named}" if named.startswith("@") else (f"@{named}" if named else "not set")
+    named = str(channel or "").strip().lstrip("@")
+    if not named:
+        where = "not set"
+    elif named.lstrip("-").isdigit():
+        # A private channel has no @handle to name it by, so a number is the *expected* spelling
+        # here, not a mistake to correct: the operator's own updates channel is private.
+        where = f"private channel {named} (no @handle, which is what private means)"
+    else:
+        where = f"@{named}"
     rhythm = "one announcement per episode" if str(per_episode).casefold() in {"true", "1", "yes"} else "one per batch"
     if not named:
         return (
@@ -255,7 +330,8 @@ def status_line(channel: Any, per_episode: Any = True) -> str:
     return (
         f"updates channel: {where}, {rhythm}, sent by your own account as plain text "
         + (
-            "with a link; the box is approved, so posts may go out"
+            "with a link; the box is approved, and the send path is still unwired, so nothing goes out on "
+            "its own"
             if approved
             else "with a link; the announcement text is recorded but NOT an approved caption box, so nothing sends yet"
         )

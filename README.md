@@ -19,6 +19,7 @@ short list of what needs your accounts.
 * What exists and where each rule is enforced: [`docs/architecture.md`](docs/architecture.md)
 * Setup: [`docs/setup-supabase.md`](docs/setup-supabase.md) · [`docs/setup-render.md`](docs/setup-render.md)
 * Starting out, in order, click by click: [`docs/launch-checklist.md`](docs/launch-checklist.md)
+* What Channel Help's own guide says, and which of it we may depend on: [`docs/channel-help.md`](docs/channel-help.md)
   From your phone: [`docs/control-bot.md`](docs/control-bot.md) — and the published wording
   you approved, rendered: [`docs/captions-approved.md`](docs/captions-approved.md)
 * How a destination channel is created and furnished, and how a new season is recognised:
@@ -48,7 +49,7 @@ Owner private Telegram chat  (control commands, review queues, approvals)
 
 | Component | State |
 | --- | --- |
-| Postgres schema: 23 tables + 4 views, constraints, RLS, 38 seeded config keys | built, executed against real Postgres in tests |
+| Postgres schema: 23 tables + 4 views (27 relations), constraints, RLS, 44 seeded config rows (`docs/setup-supabase.md` says which ones the app reads) | built, executed against real Postgres in tests |
 | Queue: lease-based claim, stage checkpoints, exponential retry, blocked state | built, tested |
 | Restart recovery (`release_expired_locks` + boot reconciliation) | built, tested, verified live |
 | HTTP surface: `/health` `/ready` `/status` `/control/pause\|resume\|reconcile\|shutdown` | built, tested, verified live |
@@ -62,7 +63,9 @@ Owner private Telegram chat  (control commands, review queues, approvals)
 | Thumbnail screening (allowlist: `@YCAnime`, `@india_crunchyroll`) | built as a **gate** (`thumbnails.py`): with no image evidence it parks for review. Your correction — screening should rank and flag rather than block — is **not built yet** |
 | In-place publishing: caption the file post that is already there, pipeline unchanged (`/inplace`, [docs](docs/seasons-and-channels.md)) | policy, plan, mode and command built and tested; the `EditMessage` call itself is the unwired write layer |
 | Storage bot verbs (`/genlink`, `/batch`, `/custom_batch`, `/special_link`, `/universal_link`) | observed and recorded, with a drift check and an unsendable list ([docs](docs/storage-bot.md)) |
-| Updates channel: card post → forward to `@Link_providerobot` → one shareable link → announcement ([docs](docs/updates-channel.md)) | flow and both post shapes recorded and tested; one global target channel and a per-episode rhythm are now settings (`updates.channel`, `updates.per_episode`, both read by `/status`); the probe may read that bot but never mint a link, and the announcement box is deliberately **not** approved yet |
+| Updates channel: card post → forward to `@Link_providerobot` → one shareable link → announcement ([docs](docs/updates-channel.md)) | flow and both post shapes recorded and tested; one global target channel, a per-episode rhythm, and a private channel named by id are settings (`updates.channel`, `updates.per_episode`, both read by `/status`); the announcement box is approved as `templates.announcement_post`; the probe may read that bot but never mint a link; the send itself is the unwired write layer |
+| Channel Help's documented behaviour — flow, buttons, plans, the 48-hour deletion limit ([docs](docs/channel-help.md)) | transcribed from the official guide on 2026-08-28 with sources, and separated from what this account has observed |
+| Our own rights in a channel, detected instead of typed (`app/rights.py`, run by `/probe`) | built and tested against fakes; the dialog walk is the only evidence it accepts, and a channel it cannot see stays unread and is named |
 | Archive copy, the storage bot's *reply protocol*, Channel Help adapter | **not built** — the menu is known; what each command asks for next is not, and one authenticated run (`/probe`) settles it. `@Link_providerobot` answering `/genlink` with a forwarded-message-then-link is a hint about that verb, recorded as a hint |
 | Season sticker *posting*, join-request campaigns | **not built** — the pack's document ids and the request template are still open; the boundary logic above is not |
 

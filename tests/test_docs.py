@@ -306,3 +306,35 @@ def test_architecture_lists_the_new_modules() -> None:
     ):
         assert name in doc, f"{name} exists but is not in the layout map"
     assert "getUpdates" in doc and "webhook" in doc.lower(), "the polling choice needs its reason on record"
+
+
+def test_the_channel_help_notes_cite_their_source_and_draw_the_free_tier_line() -> None:
+    """The operator's instruction was that Channel Help is documented on the internet, so the notes
+    have to look like research and not like a guess: a source, a date, the price tier each feature sits
+    on, and the two things we are *not* allowed to depend on.
+
+    The 48-hour deletion limit and the button syntax are here because our own rules were written
+    against them: zero-deletion is only honest if it is also what the tool can do, and `#g #r #p` in
+    `app/captions.py` is only defensible if someone can point at where it came from.
+    """
+    doc = read("docs/channel-help.md")
+    assert "botguide.me" in doc, "the notes stopped citing the guide"
+    assert "2026-08-28" in doc, "and stopped dating the reading"
+    assert "\n## Sources" in doc, "the source list has to be its own section, not a stray link"
+    for claim in ("free", "PLUS", "48 hours", "Auto-complete", "no buttons", "Add members", "Attach Media"):
+        assert claim in doc, f"the note about {claim!r} is gone, and our design leans on it"
+    # The two facts that change what we may build, said in the words a reader will search for.
+    assert "never replaces" in doc, "auto-complete adds: that is why in-place captioning is our own code"
+    assert "the guide's change, not this repo's guess" in doc, "the notes admit they are secondary sources"
+
+
+def test_channel_help_is_named_as_the_reason_two_job_kinds_are_blocked() -> None:
+    """A blocked job must name the document that says what the finished thing looks like."""
+    from app.handlers import DEPENDENCIES
+
+    for kind in ("publish_post", "edit_post"):
+        assert "docs/channel-help.md" in DEPENDENCIES[kind]
+    doc = read("docs/channel-help.md")
+    for kind in ("publish_post", "edit_post"):
+        assert f"`{kind}`" in doc, f"{kind} is blocked and the note does not say so"
+    assert "no code drives its menu" in doc, "and the note must not imply the bot is automated"

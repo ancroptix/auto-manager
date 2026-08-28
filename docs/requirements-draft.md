@@ -124,16 +124,21 @@ episodes as files, each message saying nothing but `episode 7`. In that shape th
   ```
 
 - On creation, add `@chelpbot` (Channel Help) as administrator with the permissions its documentation requires:
-  post messages, edit messages, delete messages, invite/add users. If confirmation is not received, remove and
-  re-add once, then alert the owner.
+  post messages, edit messages, delete messages, invite/add users (the guide's list, transcribed in
+  docs/channel-help.md; the first draft of that file was written before it was fetched, and said only that a channel
+  has to add the bot first). If confirmation is not received, remove and re-add once, then alert the owner.
   - **Unresolved tension, made configurable rather than decided for the operator:** the implementation's default
     withholds `can_invite_users` (a publisher that can invite is a publisher that can be used to spam the channel).
     `bots.channel_help_rights` in `app.config` lists the rights to grant, so following Channel Help's own setup
     instructions is a config edit; `channels.setup_plan()` reads it and stamps the resulting permission dict onto
     both admin steps, which is the only place the row is read. `can_add_admins` and `can_ban_users` are refused whatever that row says, and an
     unrecognised right is an error rather than a silent no-op.
+  - The right this project is least comfortable about is `can_delete_messages`, and it is here on the strength of
+    Channel Help's own setup instructions (docs/channel-help.md), which require it so the bot can manage a post it
+    did not write. Nothing else may hold it: no publisher, no storage assistant, and this app's own session, whose
+    zero-deletion rule is also the tool's real limit — a message older than 48 hours cannot be deleted by anyone.
 - Create a short-lived, **one-use** invitation link and send it to the configured main Telegram account. Promote
-  only the exact configured numeric `MAIN_ADMIN_USER_ID` with all supported channel admin rights, then revoke the
+  only the exact configured numeric id in `telegram.main_admin_user_id` with all supported channel admin rights, then revoke the
   invite immediately. An unexpected account using the link is never promoted and the owner is notified.
 - The spare automation account remains the channel creator; administrator promotion is not ownership transfer.
 
