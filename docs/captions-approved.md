@@ -23,7 +23,7 @@ lines the parser recognises, which is why they are kept on their own line each.
 ╰────────────────────
 
 ‣ Powered By: @india_crunchyroll
-@YC_Anime
+@YCAnime
 ```
 
 ## Per-episode destination post — `templates.episode_post`
@@ -38,7 +38,7 @@ Posted by Channel Help into `{TITLE} Anime in Hindi`.
 ❍ 𝗘𝗽𝗶𝘀𝗼𝗱𝗲: 01
 〄 𝗔𝘂𝗱𝗶𝗼: Hindi
 ◎ 𝗧𝗼𝘁𝗮𝗹 𝗘𝗽𝗶𝘀𝗼𝗱𝗲𝘀: 12
-♡ 𝗣𝗼𝘄𝗲𝗿𝗲𝗱 𝗯𝘆: @YC_Anime , @India_crunchyroll
+♡ 𝗣𝗼𝘄𝗲𝗿𝗲𝗱 𝗯𝘆: @YCAnime , @India_crunchyroll
 ╚━━━━━━━━━━━━━━━━━━━━━╝
 ```
 
@@ -60,7 +60,7 @@ episode posts are never deleted when this one appears.
 ❍ 𝗘𝗽𝗶𝘀𝗼𝗱𝗲: 01 - 12
 〄 𝗔𝘂𝗱𝗶𝗼: Hindi
 ◎ 𝗧𝗼𝘁𝗮𝗹 𝗘𝗽𝗶𝘀𝗼𝗱𝗲𝘀: 12
-♡ 𝗣𝗼𝘄𝗲𝗿𝗲𝗱 𝗯𝘆: @YC_Anime , @India_crunchyroll
+♡ 𝗣𝗼𝘄𝗲𝗿𝗲𝗱 𝗯𝘆: @YCAnime , @India_crunchyroll
 ╚━━━━━━━━━━━━━━━━━━━━━╝
 ```
 
@@ -98,17 +98,17 @@ name instead of being published literally — a caption is never posted containi
 
 Set `caption.button_rows` to `pair` to join buttons two-to-a-row with `&&` instead.
 
-## Two things to confirm
+## One thing to confirm, and one thing already corrected
 
-1. **Handle spelling.** Your captions say `@YC_Anime` and `@India_crunchyroll`; the
-   allow-list the thumbnail gate matches against still says `@ycanime` and
-   `@india_crunchyroll`. Case does not matter to Telegram or to the gate — the
-   underscore does. If `@YC_Anime` is the same channel as `@ycanime`, one of the two
-   spellings is wrong and the footer in these templates is pointing at it. If they
-   are two different channels, the allow-list needs your decision about whether the
-   third one is approved, because "any handle outside the allow-list ⇒ reject +
-   review" is what currently protects you from a leech's watermark surviving into a
-   published post.
+1. **Handle spelling — settled.** The captions as first sent said `@YC_Anime`; you
+   confirmed the same day that the handle is **`@YCAnime`**. That matters more than
+   appearance: `branding.primary_handles` holds `ycanime` and `india_crunchyroll`, the
+   gate compares case-insensitively, so `@YCAnime` is recognised as ours while
+   `@YC_Anime` would have read as a *third*, unapproved channel — the very test a
+   leech's watermark has to fail. The allow-list was therefore not widened. The
+   display footer (`branding.footer`, now `@YCAnime | @India_crunchyroll`) and both
+   template footers were corrected in the same migration; `@India_crunchyroll` was
+   always fine, differing from the stored `india_crunchyroll` only in case.
 2. **The subtitle's case.** The archive sample said `: The earthbound mole`, the post
    sample said `: the earthbound mole`. One stored value is printed in both places
    now, so they cannot disagree — the version published is whatever the source

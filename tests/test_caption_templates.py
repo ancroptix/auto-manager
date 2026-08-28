@@ -19,7 +19,9 @@ from pathlib import Path
 
 import pytest
 
+from app import captions as captions_module
 from app.captions import (
+    APPROVED_FOOTER,
     APPROVED_TEMPLATES,
     TOTAL_UNKNOWN,
     archive_values,
@@ -48,7 +50,7 @@ ARCHIVE_SAMPLE = """‣ Dekin no mogura: The earthbound mole (S - 01)
 ╰────────────────────
 
 ‣ Powered By: @india_crunchyroll
-@YC_Anime"""
+@YCAnime"""
 
 EPISODE_SAMPLE = """✦ Dekin no mogura: The earthbound mole ✦
 
@@ -57,7 +59,7 @@ EPISODE_SAMPLE = """✦ Dekin no mogura: The earthbound mole ✦
 ❍ 𝗘𝗽𝗶𝘀𝗼𝗱𝗲: 01
 〄 𝗔𝘂𝗱𝗶𝗼: Hindi
 ◎ 𝗧𝗼𝘁𝗮𝗹 𝗘𝗽𝗶𝘀𝗼𝗱𝗲𝘀: 12
-♡ 𝗣𝗼𝘄𝗲𝗿𝗲𝗱 𝗯𝘆: @YC_Anime , @India_crunchyroll
+♡ 𝗣𝗼𝘄𝗲𝗿𝗲𝗱 𝗯𝘆: @YCAnime , @India_crunchyroll
 ╚━━━━━━━━━━━━━━━━━━━━━╝"""
 
 BATCH_SAMPLE = """✦ Dekin no mogura: The earthbound mole ✦
@@ -67,7 +69,7 @@ BATCH_SAMPLE = """✦ Dekin no mogura: The earthbound mole ✦
 ❍ 𝗘𝗽𝗶𝘀𝗼𝗱𝗲: 01 - 12
 〄 𝗔𝘂𝗱𝗶𝗼: Hindi
 ◎ 𝗧𝗼𝘁𝗮𝗹 𝗘𝗽𝗶𝘀𝗼𝗱𝗲𝘀: 12
-♡ 𝗣𝗼𝘄𝗲𝗿𝗲𝗱 𝗯𝘆: @YC_Anime , @India_crunchyroll
+♡ 𝗣𝗼𝘄𝗲𝗿𝗲𝗱 𝗯𝘆: @YCAnime , @India_crunchyroll
 ╚━━━━━━━━━━━━━━━━━━━━━╝"""
 
 BUTTON_ONE = "❐ 𝗪𝗮𝘁𝗰𝗵/𝗗𝗼𝘄𝗻𝗹𝗼𝗮𝗱 ❐ - https://t.me/anime_hindifilesbot/111"
@@ -347,6 +349,40 @@ def test_no_approved_template_exceeds_telegrams_caption_budget(key: str) -> None
     values = post(title="A very long anime title indeed with extra words", last_episode=1000)
     text, _ = render_caption(APPROVED_TEMPLATES[key], values, key=key)
     assert len(text) < 1024, f"{key} is {len(text)} chars"
+
+
+def test_every_handle_in_the_approved_text_is_an_allowed_handle() -> None:
+    """The footer can only name channels the publish gate already accepts.
+
+    This is not cosmetic. A caption's footer is fixed template text, but the *values*
+    interpolated into it go through ``clean_handles``, which rewrites any ``@handle``
+    outside ``branding.primary_handles`` — so an approved footer naming a handle the
+    allow-list does not contain means one of two things already went wrong: either our
+    own signature is treated as a leech's watermark, or the allow-list is missing a
+    channel and a real watermark is passing screening. The first version of these
+    captions said ``@YC_Anime``, which would have been that bug.
+
+    So the two lists are compared here, in the direction that matters: every handle we
+    print must be one we accept. Not the reverse — an allowed handle nobody prints is
+    merely unused.
+    """
+    printed = set()
+    for key, text in APPROVED_TEMPLATES.items():
+        printed.update(h.casefold() for h in re.findall(r"@([A-Za-z][A-Za-z0-9_]{4,31})", text))
+    allowed = {h.casefold() for h in captions_module.PRIMARY_HANDLES}
+    assert printed, "the approved templates mention no handles at all — did the footers vanish?"
+    assert printed <= allowed, f"published handles outside the allow-list: {sorted(printed - allowed)}"
+
+
+def test_the_footer_and_the_templates_name_the_same_channels() -> None:
+    """``branding.footer`` is what a *cleaned* caption gets; the templates have their own
+    footer text. If those two spell the channels differently, the channel shows two
+    identities depending on whether a foreign handle happened to be in the source."""
+    footer_handles = {h.strip().lstrip("@").casefold() for h in APPROVED_FOOTER.split("|")}
+    template_handles: set[str] = set()
+    for text in APPROVED_TEMPLATES.values():
+        template_handles.update(h.casefold() for h in re.findall(r"@([A-Za-z][A-Za-z0-9_]{4,31})", text))
+    assert footer_handles == template_handles
 
 
 def test_docs_show_the_same_text_the_code_renders() -> None:

@@ -8,7 +8,14 @@ test is one of those sentences with the code on the other side.
 from __future__ import annotations
 
 from app import thumbnails
-from app.captions import clean_handles, placeholder_keys, primary_footer, render_template, safe_filename
+from app.captions import (
+    APPROVED_FOOTER,
+    clean_handles,
+    placeholder_keys,
+    primary_footer,
+    render_template,
+    safe_filename,
+)
 from app.channels import (
     SETUP_STEPS,
     channel_help_rights,
@@ -28,7 +35,7 @@ class TestCaptionHygiene:
         result = clean_handles("Episode 12 out now, from @some_leech_group")
         assert result.changed
         assert "@some_leech_group" not in result.text
-        assert "@ycanime | @india_crunchyroll" in result.text
+        assert APPROVED_FOOTER in result.text
         assert result.removed == ("some_leech_group",)
 
     def test_bare_t_me_handle_link_is_treated_as_a_handle(self) -> None:
@@ -54,7 +61,7 @@ class TestCaptionHygiene:
 
     def test_several_foreign_handles_produce_one_footer(self) -> None:
         result = clean_handles("leak from @aaa_leech, @bbb_leech, @ccc_leech")
-        assert result.text.count("@ycanime | @india_crunchyroll") == 1
+        assert result.text.count(APPROVED_FOOTER) == 1
         assert len(result.removed) == 3
 
     def test_no_stray_whitespace_left_behind(self) -> None:
@@ -95,7 +102,10 @@ class TestTemplates:
         assert placeholder_keys("🎬 {title} {quality_list}") == ("title", "quality_list")
 
     def test_footer_matches_the_branding_pair(self) -> None:
-        assert primary_footer() == "@ycanime | @india_crunchyroll"
+        # the operator's own spelling, not a lowercased rebuild of the allow-list
+        assert primary_footer() == APPROVED_FOOTER
+        assert primary_footer(("@YCAnime", "@India_crunchyroll")) == "@YCAnime | @India_crunchyroll"
+        assert primary_footer(["ycanime"]) == "@ycanime"
 
     def test_filename_separator_handles_the_footer_pipe(self) -> None:
         # The footer contains '|', which is illegal in a filename: hence the

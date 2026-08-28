@@ -259,8 +259,12 @@ def test_config_seeds_present(conn):
 def test_branding_defaults_match_the_agreement(conn):
     handles = val(conn, "select value from app.config where key = 'branding.primary_handles'")
     assert sorted(handles) == ["india_crunchyroll", "ycanime"]
+    # 0004 replaces 0002's lowercase footer with the operator's own casing; the
+    # allow-list itself is untouched, because matching is casefolded.
     footer = val(conn, "select value from app.config where key = 'branding.footer'")
-    assert footer == "@ycanime | @india_crunchyroll"
+    from app.captions import APPROVED_FOOTER
+
+    assert footer == APPROVED_FOOTER
     order = val(conn, "select value from app.config where key = 'quality.order'")
     assert order == ["360p", "480p", "720p", "1080p", "2160p"]
 

@@ -160,7 +160,7 @@ Archive file caption:
 ╰────────────────────
 
 ‣ Powered By: @india_crunchyroll
-@YC_Anime
+@YCAnime
 ```
 
 Individual episode destination post:
@@ -173,7 +173,7 @@ Individual episode destination post:
 ❍ 𝗘𝗽𝗶𝘀𝗼𝗱𝗲: 01
 〄 𝗔𝘂𝗱𝗶𝗼: Hindi
 ◎ 𝗧𝗼𝘁𝗮𝗹 𝗘𝗽𝗶𝘀𝗼𝗱𝗲𝘀: 12
-♡ 𝗣𝗼𝘄𝗲𝗿𝗲𝗱 𝗯𝘆: @YC_Anime , @India_crunchyroll
+♡ 𝗣𝗼𝘄𝗲𝗿𝗲𝗱 𝗯𝘆: @YCAnime , @India_crunchyroll
 ╚━━━━━━━━━━━━━━━━━━━━━╝
 ```
 
@@ -187,7 +187,7 @@ Complete-season batch post:
 ❍ 𝗘𝗽𝗶𝘀𝗼𝗱𝗲: 01 - 12
 〄 𝗔𝘂𝗱𝗶𝗼: Hindi
 ◎ 𝗧𝗼𝘁𝗮𝗹 𝗘𝗽𝗶𝘀𝗼𝗱𝗲𝘀: 12
-♡ 𝗣𝗼𝘄𝗲𝗿𝗲𝗱 𝗯𝘆: @YC_Anime , @India_crunchyroll
+♡ 𝗣𝗼𝘄𝗲𝗿𝗲𝗱 𝗯𝘆: @YCAnime , @India_crunchyroll
 ╚━━━━━━━━━━━━━━━━━━━━━╝
 ```
 
@@ -353,8 +353,11 @@ Rules agreed for the bot:
 3. Storage bot command protocol — requires authenticated integration testing.
 4. ~~Template refinements beyond the §12 defaults~~ — the operator dictated the three caption formats and
    the button label on 2026-08-28; §12 and `0004_approved_captions.sql` carry them.
-5. **New:** whether `@YC_Anime` (in the approved footers) and `@ycanime` (in `branding.primary_handles`, the
-   thumbnail gate's allow-list) are the same channel. The underscore is significant to Telegram.
+5. ~~whether `@YC_Anime` and `@ycanime` are the same channel~~ — **answered 2026-08-28:** the
+   handle is `@YCAnime`, which casefold-matches `branding.primary_handles`, so the footers and the
+   publish gate agree and the allowlist did not need widening. `@India_crunchyroll` differs from
+   the stored `india_crunchyroll` in case only, which Telegram ignores; `branding.footer` was
+   updated to the operator's casing in the same migration.
 6. **New:** hashtag policy. The old draft had `#S01E01`-style tags per caption; the approved samples carry none,
    so no tags are emitted. If hashtags are wanted they belong in the template text, not in code.
 

@@ -26,6 +26,8 @@ __all__ = [
     "archive_values",
     "audio_label",
     "button_lines",
+    "APPROVED_FOOTER",
+    "PRIMARY_HANDLES",
     "clean_handles",
     "episode_range",
     "pad_number",
@@ -39,7 +41,17 @@ __all__ = [
     "total_episodes",
 ]
 
+#: Canonical spellings, casefolded, for *matching*: a caption's handle is allowed or
+#: rejected against this set. Telegram handles are case-insensitive, so the stored
+#: form is lowercase even where the channel's own writing is not.
 PRIMARY_HANDLES = ("ycanime", "india_crunchyroll")
+
+#: The footer as the operator writes it. Display casing only — it must keep matching
+#: ``PRIMARY_HANDLES`` casefolded, which is why it is a separate constant instead of a
+#: change to the allow-list. ``@YC_Anime`` (an underscore) was a typo, corrected
+#: 2026-08-28; had it been real, the allow-list would have needed the operator's
+#: decision rather than mine.
+APPROVED_FOOTER = "@YCAnime | @India_crunchyroll"
 
 #: Anything that looks like a URL, including bare ``t.me/<bot>/<message>`` deep
 #: links. These are left completely alone — a "cleaned" caption with a broken
@@ -71,7 +83,7 @@ def clean_handles(
     text: str | None,
     *,
     allowed: tuple[str, ...] | list[str] = PRIMARY_HANDLES,
-    replacement: str = "@ycanime | @india_crunchyroll",
+    replacement: str = APPROVED_FOOTER,
 ) -> Cleaned:
     """Replace every non-allowed handle with the primary pair, exactly once.
 
@@ -187,9 +199,17 @@ def safe_filename(name: str | None, *, separator: str = "_", limit: int = 120) -
     return text or "untitled"
 
 
-def primary_footer(handles: Sequence[str] | tuple[str, ...] | list[str] = PRIMARY_HANDLES) -> str:
-    """The one-line signature every caption ends with."""
-    return " | ".join("@" + h for h in handles)
+def primary_footer(handles: Sequence[str] | tuple[str, ...] | list[str] | None = None) -> str:
+    """The one-line signature every caption ends with.
+
+    With no argument this returns the approved footer verbatim. Given handles — the
+    operator editing ``branding.primary_handles`` in the dashboard — it builds the
+    same shape from what they typed, casing and all, because a handle list is also
+    how they want it spelled.
+    """
+    if handles is None:
+        return APPROVED_FOOTER
+    return " | ".join(h if h.startswith("@") else "@" + h for h in handles)
 
 
 # ---------------------------------------------------------------------------
@@ -222,7 +242,7 @@ APPROVED_TEMPLATES: dict[str, str] = {
         "┣Audio: {audio} #O𝖿𝖿𝗂𝖼𝗂𝖺𝗅\n"
         "╰────────────────────\n\n"
         "‣ Powered By: @india_crunchyroll\n"
-        "@YC_Anime"
+        "@YCAnime"
     ),
     "templates.episode_post": (
         "✦ {title_full} ✦\n\n"
@@ -231,7 +251,7 @@ APPROVED_TEMPLATES: dict[str, str] = {
         "❍ 𝗘𝗽𝗶𝘀𝗼𝗱𝗲: {episode}\n"
         "〄 𝗔𝘂𝗱𝗶𝗼: {audio}\n"
         "◎ 𝗧𝗼𝘁𝗮𝗹 𝗘𝗽𝗶𝘀𝗼𝗱𝗲𝘀: {total_episodes}\n"
-        "♡ 𝗣𝗼𝘄𝗲𝗿𝗲𝗱 𝗯𝘆: @YC_Anime , @India_crunchyroll\n"
+        "♡ 𝗣𝗼𝘄𝗲𝗿𝗲𝗱 𝗯𝘆: @YCAnime , @India_crunchyroll\n"
         "╚━━━━━━━━━━━━━━━━━━━━━╝"
     ),
     "templates.season_post": (
@@ -241,7 +261,7 @@ APPROVED_TEMPLATES: dict[str, str] = {
         "❍ 𝗘𝗽𝗶𝘀𝗼𝗱𝗲: {episode_range}\n"
         "〄 𝗔𝘂𝗱𝗶𝗼: {audio}\n"
         "◎ 𝗧𝗼𝘁𝗮𝗹 𝗘𝗽𝗶𝘀𝗼𝗱𝗲𝘀: {total_episodes}\n"
-        "♡ 𝗣𝗼𝘄𝗲𝗿𝗲𝗱 𝗯𝘆: @YC_Anime , @India_crunchyroll\n"
+        "♡ 𝗣𝗼𝘄𝗲𝗿𝗲𝗱 𝗯𝘆: @YCAnime , @India_crunchyroll\n"
         "╚━━━━━━━━━━━━━━━━━━━━━╝"
     ),
     # Channel Help's inline-button syntax is "text - url"; "&&" puts buttons on

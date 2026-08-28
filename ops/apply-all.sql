@@ -1236,10 +1236,21 @@ comment on column app.series.subtitle is
   'Alternate/English title as it appears in the source, e.g. "The earthbound mole". '
   'Never guessed, never translated: the caption prints it or omits it.';
 
+-- branding.footer
+insert into app.config (key, value, description) values
+  ('branding.footer',
+   '"@YCAnime | @India_crunchyroll"',
+   'Display casing of the signature that replaces a foreign handle in an edited caption. Matching stays casefolded against branding.primary_handles; the underscore in @YC_Anime was a typo, corrected by the operator 2026-08-28.')
+on conflict (key) do update set
+  value = excluded.value,
+  description = excluded.description,
+  updated_at = now()
+ where app.config.value = '"@ycanime | @india_crunchyroll"'::jsonb;  -- only replaces the placeholder 0002 shipped
+
 -- templates.archive_caption
 insert into app.config (key, value, description) values
   ('templates.archive_caption',
-   '"‣ {title_full} (S - {season})\n\n╭────────────────────\n┣Quality: {quality}\n┣Episode: {episode}\n┣Audio: {audio} #O𝖿𝖿𝗂𝖼𝗂𝖺𝗅\n╰────────────────────\n\n‣ Powered By: @india_crunchyroll\n@YC_Anime"',
+   '"‣ {title_full} (S - {season})\n\n╭────────────────────\n┣Quality: {quality}\n┣Episode: {episode}\n┣Audio: {audio} #O𝖿𝖿𝗂𝖼𝗂𝖺𝗅\n╰────────────────────\n\n‣ Powered By: @india_crunchyroll\n@YCAnime"',
    'Approved 2026-08-28 from the operator''s sample: title line, light box with Quality/Episode/Audio, then the two handles. Editable here.')
 on conflict (key) do update set
   value = excluded.value,
@@ -1250,7 +1261,7 @@ on conflict (key) do update set
 -- templates.episode_post
 insert into app.config (key, value, description) values
   ('templates.episode_post',
-   '"✦ {title_full} ✦\n\n╔━━━━━━━━━━━━━━━━━━━━━╗\n⌲ 𝗦𝗲𝗮𝘀𝗼𝗻: {season}\n❍ 𝗘𝗽𝗶𝘀𝗼𝗱𝗲: {episode}\n〄 𝗔𝘂𝗱𝗶𝗼: {audio}\n◎ 𝗧𝗼𝘁𝗮𝗹 𝗘𝗽𝗶𝘀𝗼𝗱𝗲𝘀: {total_episodes}\n♡ 𝗣𝗼𝘄𝗲𝗿𝗲𝗱 𝗯𝘆: @YC_Anime , @India_crunchyroll\n╚━━━━━━━━━━━━━━━━━━━━━╝"',
+   '"✦ {title_full} ✦\n\n╔━━━━━━━━━━━━━━━━━━━━━╗\n⌲ 𝗦𝗲𝗮𝘀𝗼𝗻: {season}\n❍ 𝗘𝗽𝗶𝘀𝗼𝗱𝗲: {episode}\n〄 𝗔𝘂𝗱𝗶𝗼: {audio}\n◎ 𝗧𝗼𝘁𝗮𝗹 𝗘𝗽𝗶𝘀𝗼𝗱𝗲𝘀: {total_episodes}\n♡ 𝗣𝗼𝘄𝗲𝗿𝗲𝗱 𝗯𝘆: @YCAnime , @India_crunchyroll\n╚━━━━━━━━━━━━━━━━━━━━━╝"',
    'Approved 2026-08-28 from the operator''s sample: heavy box, season bare, episode zero-padded, total episodes, footer handles. Editable here.')
 on conflict (key) do update set
   value = excluded.value,
@@ -1261,7 +1272,7 @@ on conflict (key) do update set
 -- templates.season_post
 insert into app.config (key, value, description) values
   ('templates.season_post',
-   '"✦ {title_full} ✦\n\n╔━━━━━━━━━━━━━━━━━━━━━╗\n⌲ 𝗦𝗲𝗮𝘀𝗼𝗻: {season}\n❍ 𝗘𝗽𝗶𝘀𝗼𝗱𝗲: {episode_range}\n〄 𝗔𝘂𝗱𝗶𝗼: {audio}\n◎ 𝗧𝗼𝘁𝗮𝗹 𝗘𝗽𝗶𝘀𝗼𝗱𝗲𝘀: {total_episodes}\n♡ 𝗣𝗼𝘄𝗲𝗿𝗲𝗱 𝗯𝘆: @YC_Anime , @India_crunchyroll\n╚━━━━━━━━━━━━━━━━━━━━━╝"',
+   '"✦ {title_full} ✦\n\n╔━━━━━━━━━━━━━━━━━━━━━╗\n⌲ 𝗦𝗲𝗮𝘀𝗼𝗻: {season}\n❍ 𝗘𝗽𝗶𝘀𝗼𝗱𝗲: {episode_range}\n〄 𝗔𝘂𝗱𝗶𝗼: {audio}\n◎ 𝗧𝗼𝘁𝗮𝗹 𝗘𝗽𝗶𝘀𝗼𝗱𝗲𝘀: {total_episodes}\n♡ 𝗣𝗼𝘄𝗲𝗿𝗲𝗱 𝗯𝘆: @YCAnime , @India_crunchyroll\n╚━━━━━━━━━━━━━━━━━━━━━╝"',
    'Approved 2026-08-28: the same box as the episode post with ''{episode_range}'' instead of ''{episode}''. Editable here.')
 on conflict (key) do update set
   value = excluded.value,

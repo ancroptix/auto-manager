@@ -27,7 +27,12 @@ sys.path.insert(0, ROOT)
 
 OUT = "supabase/migrations/0004_approved_captions.sql"
 
-from app.captions import APPROVED_TEMPLATES, BUTTON_ROWS, TOTAL_UNKNOWN  # noqa: E402,F401
+from app.captions import (  # noqa: E402,F401
+    APPROVED_FOOTER,
+    APPROVED_TEMPLATES,
+    BUTTON_ROWS,
+    TOTAL_UNKNOWN,
+)
 
 
 def sql_quote(text: str) -> str:
@@ -46,6 +51,11 @@ def seeded_values() -> dict[str, str]:
 OLD = seeded_values()
 
 DESCRIPTIONS = {
+    "branding.footer": (
+        "Display casing of the signature that replaces a foreign handle in an edited "
+        "caption. Matching stays casefolded against branding.primary_handles; the "
+        "underscore in @YC_Anime was a typo, corrected by the operator 2026-08-28."
+    ),
     "templates.archive_caption": (
         "Approved 2026-08-28 from the operator's sample: title line, light box with "
         "Quality/Episode/Audio, then the two handles. Editable here."
@@ -123,6 +133,7 @@ comment on column app.series.subtitle is
 
 
 EXTRA_VALUES = {
+    "branding.footer": APPROVED_FOOTER,
     "caption.button_rows": BUTTON_ROWS,
     "caption.total_episodes_unknown": TOTAL_UNKNOWN,
 }
@@ -153,6 +164,7 @@ def statement(key: str) -> str:
 
 
 KEY_ORDER = [
+    "branding.footer",
     "templates.archive_caption",
     "templates.episode_post",
     "templates.season_post",
