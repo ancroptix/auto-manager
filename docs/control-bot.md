@@ -122,6 +122,7 @@ at boot; if it comes back with `authorized: true`, that is the whole proof.
 | `/resume` | claims again on the next poll |
 | `/reconcile` | reclaims expired leases and queues a reconciliation pass |
 | `/probe` | read-only discovery against the storage bot and Channel Help; the report arrives in this chat |
+| `/source <@handle\|channel id> [series <name>] [audio <kind>] [season <n>]` | what a *files-only* source channel carries, stated once for the whole channel instead of guessed per file. With no arguments it shows what is declared; `clear` stops assuming. It never re-decides a file that was already decided — parked ones are re-read on the next scan |
 | `/declare <series> <season> <episodes>` | state how long a season is — the only thing that can fill **◎ Total Episodes**, and the only thing that can make a season count as complete. It publishes nothing itself; the batch post stays the publisher's decision. `/declare bleach 2 tba` takes the claim back |
 | `/sessions` | name, kind, account, age, character count — never contents |
 | `/use backup` | make another stored session the live one |

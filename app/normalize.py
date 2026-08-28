@@ -148,6 +148,22 @@ class Disposition:
     SUPERSEDED = "superseded"
 
 
+#: Language tokens used for *identity* when a file's own text named none. A file archived
+#: under a channel-level audio declaration is a different release from a subbed copy of the
+#: same episode, so it must not share a canonical key with it — but the token must not
+#: pretend the file said something either. These markers only appear when ``languages`` is
+#: empty, i.e. when ``audio_source`` is not ``caption``, and :func:`_language_tag` in
+#: :mod:`app.ingest` writes the same value into the candidate row so the episode's language
+#: column and its dedup key can never disagree.
+_IDENTITY_LANGUAGES: dict[str, tuple[str, ...]] = {
+    AudioKind.HINDI: ("hindi",),
+    AudioKind.DUAL_AUDIO: ("hindi", "dual_audio"),
+    AudioKind.MULTI_AUDIO: ("hindi", "multi_audio"),
+    AudioKind.SUBBED_ONLY: ("subbed_only",),
+    AudioKind.NON_HINDI_DUB: ("non_hindi_dub",),
+}
+
+
 @dataclass(frozen=True, slots=True)
 class ParsedEpisode:
     """One source message, read. ``accepted`` is the only field that gates a
@@ -171,6 +187,18 @@ class ParsedEpisode:
     season_source: str = "none"
     file_name: str | None = None
     file_size_bytes: int | None = None
+    #: Provenance for the three fields a caption prints but a bare file cannot state.
+    #: ``series_source``: ``caption`` (the file named the show), ``channel_declaration``
+    #: (the operator named the channel once), ``channel_name`` (we are reading the
+    #: channel's own title — one signal, not the two the spec asks for),
+    #: ``caption_and_channel`` (both agree), or ``none``.
+    #: ``audio_source`` / ``quality_source``: ``caption``, ``channel_declaration``,
+    #: ``dimensions``, or ``none``. A channel's declaration is a *statement by you*; a
+    #: missing value is not a statement by anyone, and the two must stay tellable apart
+    #: months later when something looks wrong.
+    series_source: str = "none"
+    audio_source: str = "none"
+    quality_source: str = "none"
     detected_handles: tuple[str, ...] = ()
     accepted: bool = False
     disposition: str = Disposition.PENDING
@@ -180,6 +208,24 @@ class ParsedEpisode:
     @property
     def needs_review(self) -> bool:
         return self.disposition == Disposition.PENDING
+
+    @property
+    def identity_languages(self) -> tuple[str, ...]:
+        return self.languages or _IDENTITY_LANGUAGES.get(self.audio_kind, ())
+
+    @property
+    def series_confirmed(self) -> bool:
+        """True when the series identity does not rest on the channel's own name alone.
+
+        The spec requires *two* signals to agree before a destination channel is named
+        ("cross-checking the source channel name against captions and filenames"). In a
+        files-only channel — no titles, no captions, just ``episode 7`` and an mp4 — there
+        is only the channel name, and channel names are frequently junk (``anime uploads
+        4u``, a dated group, a renamed leech). Naming a 30k-member channel after that is
+        permanent and public, so this is the flag the creation path must consult.
+        ``accepted`` stays true: storing the file is safe, naming a channel is not.
+        """
+        return self.series_source in {"caption", "caption_and_channel", "channel_declaration"}
 
     @property
     def season_declared(self) -> bool:
@@ -218,7 +264,7 @@ class ParsedEpisode:
             self.series or "unknown",
             season if season is not None else (self.season if self.season is not None else 1),
             self.episode if episode is None else episode,
-            list(self.languages),
+            list(self.identity_languages),
             self.release_variant,
         )
 
@@ -237,7 +283,11 @@ class ParsedEpisode:
             "file_kind": self.file_kind,
             "languages": list(self.languages),
             "audio_kind": self.audio_kind,
+            "audio_source": self.audio_source,
             "quality": self.quality,
+            "quality_source": self.quality_source,
+            "series_source": self.series_source,
+            "series_confirmed": self.series_confirmed,
             "quality_rank": self.quality_rank_value,
             "release_variant": self.release_variant,
             "detected_handles": list(self.detected_handles),
@@ -297,6 +347,82 @@ def detect_languages(text: str) -> tuple[frozenset[str], bool, bool]:
     )
     has_sub = any(re.search(rf"\b{re.escape(t)}\b", flat) for t in _SUB_TOKENS)
     return frozenset(found), has_dub, has_sub
+
+
+#: The words an operator may use for a channel's audio, mapped to ``AudioKind``.
+#: ``app.source_channel.declared_audio`` has a CHECK over the same left-hand column, so
+#: the database and this map cannot drift into accepting different values.
+DECLARED_AUDIO: dict[str, str] = {
+    "hindi": AudioKind.HINDI,
+    "dual": AudioKind.DUAL_AUDIO,
+    "dual_audio": AudioKind.DUAL_AUDIO,
+    "multi": AudioKind.MULTI_AUDIO,
+    "multi_audio": AudioKind.MULTI_AUDIO,
+    "subbed": AudioKind.SUBBED_ONLY,
+    "subbed_only": AudioKind.SUBBED_ONLY,
+    "unknown": AudioKind.UNKNOWN,
+}
+
+
+def declared_audio_kind(value: object) -> str:
+    """Normalise one declared-audio token, refusing anything not on the list.
+
+    Raising matters here: a typo like ``hindi `` or ``Eng`` stored in the config column
+    would otherwise be read as "no declaration", and the difference between those two
+    states is whether five hundred files are archived or parked.
+    """
+    token = str(value or "").strip().casefold().replace("-", "_")
+    if not token:
+        return AudioKind.UNKNOWN
+    try:
+        return DECLARED_AUDIO[token]
+    except KeyError:
+        raise ValueError(
+            f"unknown declared audio {value!r}; use one of {', '.join(sorted(DECLARED_AUDIO))}"
+        ) from None
+
+
+def quality_from_dimensions(height: object, width: object = None) -> str | None:
+    """``1080`` -> ``1080p`` from a video's own pixels, no caption required.
+
+    Two numbers are accepted because one is not enough to be safe: the "height" of a
+    vertical clip is its long side, and a scanner that forwards Telethon's
+    ``DocumentAttributeVideo`` without thinking hands over ``1920`` for a 1080-tall video.
+    So when both are given, the *smaller* side wins — which is the side 1080p always
+    meant.
+
+    A files-only channel says nothing about quality, but Telegram does: a video document
+    carries its ``DocumentAttributeVideo`` height, which is the one quality fact that needs
+    no OCR and no download. Buckets are floors, because a 1080-tall encode is what people
+    mean by 1080p even when it is 1070; a height below 240 is either junk or a thumbnail,
+    and ``None`` keeps it out of the variant table rather than inventing a ``144p`` row.
+    """
+    sides: list[int] = []
+    for value in (height, width):
+        try:
+            sides.append(int(value))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            continue
+    if not sides:
+        return None
+    pixels = min(sides)
+    if pixels < 240:
+        return None
+    for floor, label in _DIMENSION_BUCKETS:
+        if pixels >= floor:
+            return label
+    return None
+
+
+_DIMENSION_BUCKETS: tuple[tuple[int, str], ...] = (
+    (2160, "2160p"),
+    (1440, "1440p"),
+    (1080, "1080p"),
+    (720, "720p"),
+    (480, "480p"),
+    (360, "360p"),
+    (240, "240p"),
+)
 
 
 def detect_quality(text: str) -> str | None:
@@ -484,8 +610,12 @@ def parse_episode(
     file_name: str | None = None,
     raw_caption: str | None = None,
     source_series: str | None = None,
+    source_series_declared: bool = False,
     season_hint: int | None = None,
+    declared_audio: str | None = None,
     file_size_bytes: int | None = None,
+    video_height: int | None = None,
+    video_width: int | None = None,
     quality_order: tuple[str, ...] | list[str] | None = None,
     require_hindi_audio: bool = True,
     include_subbed_only: bool = False,
@@ -495,17 +625,47 @@ def parse_episode(
     Policy arguments mirror ``app.config`` (``ingest.require_hindi_audio``,
     ``ingest.include_subbed_only``, ``quality.order``); the caller reads the
     operator's settings from the database, which keeps this a pure function.
+
+    ``source_series_declared`` / ``declared_audio`` carry the *channel-level statements* the
+    operator makes with ``/source`` — which channel this is, and what its files carry. They
+    exist for the case where a source channel is a shelf of bare mp4s captioned ``episode 7``
+    and nothing else: there is no text to read a series or a language out of, so without a
+    statement every one of those files parks as "cannot determine whether the file carries
+    Hindi audio". A declaration is not a file's claim, so it is recorded as
+    ``*_source = "channel_declaration"`` and stays distinguishable from "the caption said so"
+    — including here, where a channel-wide statement must not outvote a file's own words.
     """
     combined = "\n".join(part for part in (file_name, raw_caption) if part)
     flags: list[str] = []
 
     languages, saw_dub, saw_sub = detect_languages(combined)
     audio_kind = _classify_audio(languages, saw_dub, saw_sub)
+    declared = declared_audio_kind(declared_audio) if declared_audio is not None else AudioKind.UNKNOWN
+    audio_source = "caption" if audio_kind != AudioKind.UNKNOWN else "none"
+    if audio_kind == AudioKind.UNKNOWN and declared != AudioKind.UNKNOWN:
+        audio_kind = declared
+        audio_source = "channel_declaration"
+        flags.append("audio_from_channel_declaration")
+    elif audio_kind != AudioKind.UNKNOWN and declared not in (AudioKind.UNKNOWN, audio_kind):
+        # The file's own words are kept and only the disagreement is recorded. The
+        # eligibility block below still rejects a subbed-only file the channel claimed was
+        # Hindi, which is the direction that actually damages the destination.
+        flags.append(f"audio_disagrees_with_channel_declaration:{declared}")
     episodes, ep_origin, ranged = detect_episode_numbers(combined)
     season = _detect_season(combined)
     if season is None:
         season = season_hint
     quality = detect_quality(combined)
+    derived_quality = quality_from_dimensions(video_height, video_width)
+    quality_source = "caption" if quality else ("dimensions" if derived_quality else "none")
+    if quality is None and derived_quality:
+        quality = derived_quality
+        flags.append(f"quality_from_dimensions:{video_height}")
+    elif quality and derived_quality and derived_quality != quality:
+        # The label wins, because that is what the uploader chose to call the file, but a
+        # "720p" that is 1080 tall is either a mislabel or a re-encode — worth knowing
+        # before a caption prints the label to thirty thousand people.
+        flags.append(f"quality_label_disagrees_with_dimensions:{derived_quality}")
     variant = _detect_variant(combined)
     title = extract_series_title(file_name, raw_caption)
     handles = detect_handles(file_name or "", raw_caption or "")
@@ -529,6 +689,23 @@ def parse_episode(
             title = " ".join(words[:-1]).strip() or None
 
     series = _reconcile_title(title, source_series, flags)
+    both_agree = bool(
+        title and source_series and normalize_title(title) == normalize_title(source_series)
+    )
+    if series is None:
+        series_source = "none"
+    elif both_agree:
+        series_source = "caption_and_channel"
+    elif title and series == title and not source_series:
+        series_source = "caption"
+    elif source_series and series == source_series and source_series_declared:
+        series_source = "channel_declaration"
+    else:
+        # We are reading the channel's own title or @handle. That is one signal, and the
+        # spec asks for two before a destination is named after it.
+        series_source = "channel_name"
+        if not title:
+            flags.append("series_from_channel_name_only")
 
     # -------- eligibility ------------------------------------------------
     subbed_only = audio_kind == AudioKind.SUBBED_ONLY
@@ -572,6 +749,7 @@ def parse_episode(
     return ParsedEpisode(
         series=series,
         series_slug=normalize_title(series) if series else None,
+        series_source=series_source,
         season=season if season is not None else (1 if accepted else None),
         season_source=("caption" if _detect_season(combined) is not None else ("hint" if season_hint is not None else "none")),
         episode=episodes[0] if episodes else None,
@@ -579,7 +757,9 @@ def parse_episode(
         file_kind=file_kind,
         languages=tuple(sorted(languages)),
         audio_kind=audio_kind,
+        audio_source=audio_source,
         quality=quality,
+        quality_source=quality_source,
         quality_rank_value=quality_rank(quality, quality_order) if quality else None,
         release_variant=variant,
         file_name=file_name,

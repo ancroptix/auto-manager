@@ -50,6 +50,8 @@ async def record_message(
     file_name: str | None = None,
     raw_caption: str | None = None,
     file_size_bytes: int | None = None,
+    video_height: int | None = None,
+    video_width: int | None = None,
     fingerprint: str | None = None,
     quality_order: list[str] | tuple[str, ...] | None = None,
     require_hindi_audio: bool | None = None,
@@ -63,7 +65,8 @@ async def record_message(
     channel = await db.fetchrow(
         """
         select id, series_id, username, title, mode, priority,
-               require_hindi_audio, include_subbed
+               require_hindi_audio, include_subbed,
+               declared_series, declared_audio, declared_season
           from app.source_channel
          where id = $1
         """,
@@ -77,10 +80,26 @@ async def record_message(
     # The channel's own flags beat the global defaults: which releases count as
     # in scope is decided per source, since one channel is subs-only and another
     # is dual-audio.
+    # Two different kinds of "this channel is Bleach": the operator said so (0006's
+    # declared columns, set from /source), and we are reading the channel's own title or
+    # handle. The first is a statement and may name a destination channel; the second is one
+    # signal where the spec asks for two, so it may archive files but not found a channel.
+    declared_series = channel["declared_series"]
+    # The global veto on the whole idea: with this off, a channel's audio declaration is
+    # still recorded (and reported as ignored, below) but it no longer decides whether a file
+    # with no language text is in scope. Turning it off must not require editing twenty
+    # channel rows, and undoing it must not require a re-scan either.
+    trust_declaration = bool(await db.config("ingest.accept_channel_audio_declaration", True))
+    declared_audio = channel["declared_audio"] if trust_declaration else None
     parsed = normalize.parse_episode(
         file_name=file_name,
         raw_caption=raw_caption,
-        source_series=channel["title"] or _strip_at(channel["username"]),
+        source_series=declared_series or channel["title"] or _strip_at(channel["username"]),
+        source_series_declared=bool(declared_series),
+        season_hint=channel["declared_season"],
+        declared_audio=declared_audio,
+        video_height=video_height,
+        video_width=video_width,
         quality_order=quality_order,
         require_hindi_audio=channel["require_hindi_audio"] if require_hindi_audio is None else require_hindi_audio,
         include_subbed_only=bool(channel["include_subbed"])
@@ -99,7 +118,23 @@ async def record_message(
             $7::jsonb, $8, $9, $10, $11, $12, $13, $14,
             'unchecked', $15::app.candidate_disposition, $16
         )
-        on conflict (source_channel_id, message_id, media_idx) do nothing
+        on conflict (source_channel_id, message_id, media_idx) do update set
+            file_name = excluded.file_name,
+            raw_caption = excluded.raw_caption,
+            parsed = excluded.parsed,
+            season_number = excluded.season_number,
+            episode_number = excluded.episode_number,
+            language_tag = excluded.language_tag,
+            quality = excluded.quality,
+            quality_rank = excluded.quality_rank,
+            disposition = excluded.disposition,
+            reason = excluded.reason
+          -- Only a row that is *still parked for want of information* may be re-read, and
+          -- the thumbnail verdict is never reset by a rescan. That single condition is what
+          -- makes "declare the channel, then rescan" a way to file a 400-file backlog
+          -- without letting any later scan quietly rewrite what has already been decided —
+          -- or silently remove the publish gate by marking a screened image unchecked.
+        where app.source_candidate.disposition = 'pending'
         returning id
         """,
         source_channel_id,
@@ -130,7 +165,10 @@ async def record_message(
             media_idx,
         )
         return {
-            "skipped": "already ingested (this channel, message and media index)",
+            # The difference between this and a bug is the word *decided*: a parked row is
+            # re-read on the next scan, a decided row is not, and `/source` relies on that to
+            # un-park a backlog without rewriting history.
+            "skipped": "already ingested and decided (only a parked row is re-read)",
             "candidate_id": existing["id"] if existing else None,
             "disposition": existing["disposition"] if existing else None,
         }
@@ -141,6 +179,13 @@ async def record_message(
         "reason": parsed.reason,
         "file_kind": parsed.file_kind,
         "flags": list(parsed.flags),
+        "series_source": parsed.series_source,
+        "series_confirmed": parsed.series_confirmed,
+        "audio_source": parsed.audio_source,
+        "quality_source": parsed.quality_source,
+        # Only when a declaration existed and was deliberately not used, so /status can
+        # say "340 files parked because the audio knob is off" instead of looking broken.
+        "audio_declaration_ignored": bool(declared_audio is None and channel["declared_audio"]),
         "episodes": [],
         "variants": [],
     }
@@ -161,11 +206,17 @@ async def record_message(
     # Is this the start of a new season? Answered before any row is written, because
     # the season number is part of every episode's canonical key: file one season-2
     # episode 1 into season 1 and the damage is a duplicate post, not a typo.
-    stream = await season_stream(db, series_id)
+    # A channel that states "everything here is season 2" (0006's declared_season, or a
+    # configured season_hint) is a *starting point*, not a boundary: look at that shelf's
+    # arithmetic instead of "wherever we got to", or its episode 1 is filed as a duplicate
+    # copy of season 1's episode 1 and the canonical key never complains.
+    hinted_season = parsed.season if parsed.season_source == "hint" else None
+    stream = await season_stream(db, series_id, season_number=hinted_season)
     boundary = seasons.classify(
         episode=parsed.episode,
         labelled_season=parsed.season if parsed.season_declared else None,
         current_season=stream["current_season"],
+        default_season=parsed.season if parsed.season_source == "hint" else None,
         highest=stream["highest"],
         populated=stream["populated"],
         file_kind=parsed.file_kind,
@@ -292,7 +343,7 @@ async def _resolve_series(db: Any, channel_series_id: int | None, parsed: normal
     )
 
 
-async def season_stream(db: Any, series_id: int) -> dict[str, Any]:
+async def season_stream(db: Any, series_id: int, *, season_number: int | None = None) -> dict[str, Any]:
     """What this series looks like from the filing cabinet's point of view.
 
     One query, because ingest runs per message and must not fan out into three: the
@@ -301,6 +352,13 @@ async def season_stream(db: Any, series_id: int) -> dict[str, Any]:
     the highest *season number* rather than "the most recently touched" — after a
     restart mid-backfill, recency would point at whatever the sweep reached last and a
     season could be opened twice.
+
+    ``season_number`` retargets the arithmetic at one season. It exists for the channel
+    whose entire backlog is season 2 while the cabinet already holds season 1: asking
+    "where are we?" would answer 1, and its episode 1 would be filed as a *duplicate copy*
+    of season 1's episode 1 — the canonical key is what makes that collision silent, so the
+    query has to be able to look at the right shelf. A season with no row yet reports
+    ``highest=None`` and zero episodes, which is how the caller learns it is starting one.
     """
     rows = await db.fetch(
         """
@@ -316,11 +374,24 @@ async def season_stream(db: Any, series_id: int) -> dict[str, Any]:
         series_id,
     )
     if not rows:
-        return {"current_season": 1, "highest": None, "populated": [], "seasons": []}
+        return {
+            "current_season": int(season_number) if season_number is not None else 1,
+            "highest": None,
+            "episodes_in_current": 0,
+            "populated": [],
+            "seasons": [],
+        }
     seasons_ = [dict(row) for row in rows]
     numbers = [int(row["season_number"]) for row in seasons_]
-    current = max(numbers)
-    row = next(r for r in seasons_ if int(r["season_number"]) == current)
+    if season_number is not None:
+        current = int(season_number)
+        row = next(
+            (r for r in seasons_ if int(r["season_number"]) == current),
+            {"season_number": current, "episodes": 0, "highest": None},
+        )
+    else:
+        current = max(numbers)
+        row = next(r for r in seasons_ if int(r["season_number"]) == current)
     return {
         "current_season": current,
         "highest": int(row["highest"]) if row["highest"] is not None else None,
@@ -460,7 +531,12 @@ async def _resolve_episode(
             number,
             parsed.canonical_key(number, season=season_number),
             parsed.series,
-            list(parsed.languages),
+            # Not ``parsed.languages``: an episode filed under a channel-level audio
+            # declaration has no language *text*, and `app.episode.languages` is NOT NULL,
+            # so writing the raw tuple would crash the ingest of every bare file. The
+            # identity tuple is the one the canonical key used, so the columns and the key
+            # can never disagree about which release this is.
+            list(parsed.identity_languages),
             parsed.audio_kind,
         )
     )
@@ -515,9 +591,17 @@ async def _resolve_variant(
 
 
 def _language_tag(parsed: normalize.ParsedEpisode) -> str | None:
-    if not parsed.languages:
+    """The candidate's language column, from the same tokens as its dedup key.
+
+    Reading ``parsed.languages`` directly would leave a file archived under a channel-level
+    audio declaration with no language tag while its canonical key carried one — two views
+    of the same episode disagreeing, which is how "duplicate" and "missing" both get
+    reported about the same file.
+    """
+    languages = parsed.identity_languages
+    if not languages:
         return None
-    return "+".join(parsed.languages)[:32]
+    return "+".join(languages)[:32]
 
 
 def _strip_at(username: str | None) -> str | None:

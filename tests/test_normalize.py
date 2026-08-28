@@ -10,6 +10,8 @@ from __future__ import annotations
 import pytest
 
 from app.normalize import (
+    declared_audio_kind,
+    quality_from_dimensions,
     AudioKind,
     Disposition,
     detect_episode_numbers,
@@ -236,3 +238,123 @@ class TestPayload:
         assert parsed.audio_kind == AudioKind.UNKNOWN
         assert parsed.accepted is False
         assert parsed.disposition == Disposition.PENDING  # a human decides, not the parser
+
+
+class TestChannelDeclarations:
+    """What a *channel-level statement* may and may not do.
+
+    These exist for one scenario: a source channel that is a shelf of mp4s, each message
+    saying ``episode 7`` and nothing else. There is no caption to read a show name or a
+    language out of, and the file cannot be asked (no download on a free tier), so the facts
+    have to arrive from the operator — as a statement, recorded as such, and never promoted
+    into "the file said it".
+    """
+
+    def test_quality_from_the_pixels_when_no_label_exists(self) -> None:
+        assert quality_from_dimensions(1080) == "1080p"
+        assert quality_from_dimensions(719) == "480p"
+        assert quality_from_dimensions(None) is None
+        assert quality_from_dimensions(0) is None
+        # Below the smallest bucket a video can plausibly be, the honest answer is "unknown"
+        # rather than inventing a 144p row in a table the manifest orders by rank.
+        assert quality_from_dimensions(120) is None
+
+    def test_the_shorter_side_wins_so_a_vertical_clip_cannot_lie(self) -> None:
+        assert quality_from_dimensions(1920, 1080) == "1080p"
+        assert quality_from_dimensions(1080, 1920) == "1080p"
+        assert quality_from_dimensions("1080", "not a number") == "1080p"
+
+    def test_dimensions_are_used_only_when_the_text_said_nothing(self) -> None:
+        labelled = parse_episode(file_name="Bleach - 07.mp4", raw_caption="Bleach 07 720p", video_height=1080)
+        assert labelled.quality == "720p", "the uploader's own label outranks the pixels"
+        assert labelled.quality_source == "caption"
+        assert "quality_label_disagrees_with_dimensions:1080p" in labelled.flags
+
+        bare = parse_episode(file_name="episode 7.mp4", raw_caption="episode 7", video_height=1080)
+        assert bare.quality == "1080p" and bare.quality_source == "dimensions"
+        assert "quality_from_dimensions:1080" in bare.flags
+
+    def test_a_bare_file_without_a_declaration_parks_rather_than_being_guessed(self) -> None:
+        parsed = parse_episode(file_name="episode 1.mp4", raw_caption="episode 1", source_series="Bare Shelf")
+        assert parsed.disposition == Disposition.PENDING
+        assert "Hindi audio" in parsed.reason
+        assert parsed.audio_source == "none"
+        # the channel's own title is one signal where the spec wants two, so it may not
+        # found a destination channel name
+        assert parsed.series_source == "channel_name"
+        assert parsed.series_confirmed is False
+        assert "series_from_channel_name_only" in parsed.flags
+
+    def test_a_declared_series_makes_the_channel_name_trustworthy(self) -> None:
+        parsed = parse_episode(
+            file_name="episode 1.mp4",
+            raw_caption="episode 1",
+            source_series="Bleach",
+            source_series_declared=True,
+            declared_audio="hindi",
+        )
+        assert parsed.accepted and parsed.series == "Bleach"
+        assert parsed.series_source == "channel_declaration" and parsed.series_confirmed is True
+        assert parsed.audio_kind == AudioKind.HINDI
+        assert parsed.audio_source == "channel_declaration"
+        # ...and the language still lands in the identity, so a Hindi-only source and a
+        # captioned one agree on what "the same episode" means.
+        assert parsed.identity_languages == ("hindi",)
+        assert parsed.canonical_key(1, season=1) == "bleach|s01|e01|hindi"
+
+    def test_both_signals_agreeing_is_recorded_as_agreeing(self) -> None:
+        parsed = parse_episode(
+            file_name="Bleach - 07 [720p] [Dual Audio].mkv",
+            raw_caption="Bleach episode 7",
+            source_series="Bleach",
+            source_series_declared=True,
+        )
+        assert parsed.series_source == "caption_and_channel"
+
+    def test_the_files_own_words_outvote_the_channel_but_are_not_overridden_silently(self) -> None:
+        """A channel declared Hindi that carries one subbed file is the mistake the whole
+        scope rule exists to prevent, so the file wins *and* the disagreement is flagged."""
+        conflict = parse_episode(
+            file_name="episode 7 subbed.mp4",
+            raw_caption="episode 7 (subbed)",
+            source_series="Bleach",
+            source_series_declared=True,
+            declared_audio="hindi",
+        )
+        assert conflict.accepted is False
+        assert conflict.disposition == Disposition.REJECTED
+        assert "subbed" in conflict.reason
+        assert "audio_disagrees_with_channel_declaration:hindi" in conflict.flags
+
+    def test_a_declared_audio_that_only_widens_the_range_is_a_note_not_a_block(self) -> None:
+        parsed = parse_episode(
+            file_name="episode 7 mp4",
+            raw_caption="episode 7 Hindi",
+            source_series="Bleach",
+            source_series_declared=True,
+            declared_audio="dual",
+        )
+        assert parsed.accepted and parsed.audio_kind == AudioKind.HINDI
+        assert "audio_disagrees_with_channel_declaration:dual_audio" in parsed.flags
+
+    def test_the_declaration_tokens_are_the_same_list_the_database_accepts(self) -> None:
+        assert declared_audio_kind("Hindi") == AudioKind.HINDI
+        assert declared_audio_kind("dual") == AudioKind.DUAL_AUDIO
+        assert declared_audio_kind("subbed_only") == AudioKind.SUBBED_ONLY
+        assert declared_audio_kind(None) == AudioKind.UNKNOWN
+        with pytest.raises(ValueError, match="unknown declared audio"):
+            declared_audio_kind("english")
+
+    def test_the_payload_carries_the_provenance_the_review_queue_needs(self) -> None:
+        parsed = parse_episode(
+            file_name="episode 1.mp4",
+            raw_caption="episode 1",
+            source_series="Bleach",
+            source_series_declared=True,
+            declared_audio="hindi",
+            video_height=720,
+        )
+        payload = parsed.to_payload()
+        assert payload["audio_source"] == "channel_declaration"
+        assert payload["quality_source"] == "dimensions"
+        assert payload["series_confirmed"] is True

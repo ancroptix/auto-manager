@@ -221,3 +221,33 @@ def test_an_absurd_season_label_is_ignored_rather_than_filed() -> None:
 def test_review_reason_is_none_when_nothing_is_blocked() -> None:
     boundary = classify(episode=13, labelled_season=None, current_season=1, highest=12, populated=[1])
     assert boundary.review is None and boundary.verdict is Verdict.CONTINUE
+
+
+def test_a_channels_declared_season_starts_the_series_without_opening_a_boundary() -> None:
+    """``/source @chan season 2`` is a starting point, not a claim that a season began.
+
+    The distinction is the same one the caption rules draw: a season *row* may be created
+    from a channel's declared default, but a farewell sticker and a "S1 ended" statement may
+    not, because the channel saying "everything I hold is season 2" says nothing about what
+    came before it in the archive.
+    """
+    verdict = seasons.classify(episode=1, current_season=1, default_season=2)
+    assert verdict.verdict is seasons.Verdict.FIRST
+    assert verdict.season == 2, "the first file of a declared-season channel starts that season"
+    assert verdict.is_boundary is False, "no stickers and no closing of anything"
+    assert verdict.confident is True
+    assert "declared season 2" in verdict.reason
+
+    # Once the series has a shelf to file into, the default has done its job and the numbers
+    # decide again — otherwise every later episode would be re-anchored to the hint.
+    later = seasons.classify(episode=2, current_season=2, highest=1, populated=[2])
+    assert later.season == 2 and later.verdict is seasons.Verdict.CONTINUE
+
+    # A caption that states a season still outranks the channel's default.
+    labelled = seasons.classify(episode=1, labelled_season=3, current_season=1, default_season=2)
+    assert labelled.season == 3 and labelled.evidence["labelled_season"] == 3
+
+    # With nothing declared, a series starts at 1 exactly as before: the new parameter has
+    # no effect on the ordinary channel, which is the whole point of adding it.
+    plain = seasons.classify(episode=1, current_season=1)
+    assert plain.season == 1 and plain.verdict is seasons.Verdict.FIRST

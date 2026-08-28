@@ -223,6 +223,88 @@ Say it once and the caption stops hedging:
 
 ---
 
+## 3. When the source channel is only files
+
+The third question the operator asked: a channel where the mp4s already sit, captioned
+`episode 1`, `episode 2`, nothing else — no show name, no quality, no language. What can be
+known, what must be told, and what cannot happen at all.
+
+### What the pipeline can read from a bare file
+
+| Field | Source | Honest answer if missing |
+| --- | --- | --- |
+| episode number | the text `episode 7`, `ep 7`, `[07]`, `S02E05` | park: an ingest row needs one |
+| quality | the video's own pixel size — Telegram states it for every video document, and the **shorter** side is used so a vertical clip cannot turn 1080 into 1440 | `quality unknown` → the variant is recorded without a label and the caption's Quality line prints nothing fake |
+| single file or batch archive | filename shape (`[01-12]`, "Batch") | treated as one episode |
+| duplicate copy | file size + fingerprint, never filename | — |
+| season | **only** a stated label (`S2`) | the channel's declared default, which is a starting point, not a claim (see below) |
+| show name | the file's own title, or your `/source … series` | park |
+| audio language | the file's own words, or your `/source … audio` | **park** — this one is not guessable |
+| total episodes | never | `TBA`, until `/declare` |
+
+### What you say once, per channel
+
+```text
+/source @anime_uploads4u series Bleach audio hindi
+```
+
+`/source` takes three facts, and each has a different consequence, which is why they are
+recorded as `series_source` / `audio_source` / `season_source` rather than merged into the
+file's own claims:
+
+* **`series`** — what show this channel carries. This is the statement that lets a
+  destination channel be *named*: reading a name off the channel's own title (`anime
+  uploads 4u`) is one signal where the spec asks for two, so without this the files archive
+  and the naming question is asked instead of answered.
+* **`audio`** — what the files carry: `hindi`, `dual`, `multi`, `subbed`, `unknown`. This is
+  the one that un-parks the backlog. Without it, every bare file lands on *"cannot determine
+  whether the file carries Hindi audio"*, because publishing a subbed release as a Hindi one
+  is the single mistake you named as unacceptable. A file whose own text contradicts the
+  declaration keeps its own wording and is rejected if that wording is out of scope — your
+  channel-wide statement never outvotes the file in front of it.
+* **`season`** — assume this season when a file says nothing. It is a numbering default: it
+  decides *which shelf* the first file goes on, and it can never open a season boundary, post
+  a sticker, or state a length.
+
+`/source @handle` with no key shows what is declared; `clear` stops assuming. Both refuse to
+pick a channel when the name matches two rows. `ingest.accept_channel_audio_declaration`
+turns the whole idea off globally while you work out why a caption says the wrong thing —
+the declarations survive it, so it reverses without a re-scan.
+
+### How the backlog gets filed
+
+1. **Read**: one message → one candidate row, keyed by `(channel, message id, media index)`.
+   A history sweep is the same call as a live message, so a restart resumes where the last
+   message finished instead of starting over. Nothing is re-downloaded: the file stays where
+   it is.
+2. **Decide**: `parse_episode` + `classify`. Parked rows are re-read by the next scan;
+   **decided rows never are** — that single rule is what makes "declare the channel, then
+   rescan" safe on 400 files, and it is enforced by one condition in the upsert, not by
+   discipline.
+3. **Screen**: a bare mp4 usually has no clean cover of its own, and a missing thumbnail is
+   never treated as clean. If another source channel has the same episode with a clean
+   poster, that copy wins the picture; if none does, the file stays un-published and shows up
+   as a review item. `thumbnail.on_no_clean_candidate` is the knob for what to do then.
+4. **Log with the storage bot**: the message is *forwarded* to `@anime_hindifilesbot`, which
+   makes Telegram copy the file server-side — no download, no re-upload, nothing touching the
+   free-tier disk — and the bot's reply (single or batch link) is stored against that exact
+   episode + quality. This is `storage_upload`, and it is one of the still-unwired kinds:
+   the reply format has to be read once from the real bot (`/probe`, or a screenshot of its
+   menu) before any of it is written down as code.
+5. **Post**: Channel Help composes the approved box in the destination, buttons pointing at
+   those stored links. `◎ Total Episodes` prints `TBA` until you `/declare`.
+
+### The part that is not a promise
+
+Steps 1 and 2 run today, tested against a real database. Steps 3–5 are the unwired Telegram
+write layer: the rules, the ordering, the dedup and the refusal to invent anything are all
+implemented and tested, but no message has ever been forwarded and no post has ever been
+published by this code. So a files-only channel is a *solved metadata problem* and an
+*unfinished transport problem*, and the two should not be confused when you decide how much
+of the backlog to point at it first.
+
+---
+
 ## Where each decision is recorded
 
 | Question | Answer lives in |
@@ -233,6 +315,7 @@ Say it once and the caption stops hedging:
 | did the closing sticker already go out? | `app.season.closing_sticker_posted` |
 | how far did channel setup get before the restart? | `app.destination.setup_state` |
 | which picture is on the channel, and why that one? | `app.destination.photo_source` / `photo_candidate_id` |
+| whose words were the series / the language / the quality? | `app.source_channel.declared_*`, mirrored into the candidate's `parsed` as `*_source` |
 
 A decision that is only in a log line is a decision nobody can audit next month, which is
 why every one of these is a column rather than a comment.

@@ -148,6 +148,7 @@ def classify(
     highest: int | None = None,
     populated: Sequence[int] = (),
     file_kind: str = "episode",
+    default_season: int | None = None,
 ) -> Boundary:
     """Decide what an incoming episode number means.
 
@@ -181,6 +182,11 @@ def classify(
     7. Otherwise → ``CONTINUE``.
     """
     current = _as_int(current_season) or 1
+    # Where a series with *nothing* filed starts. A channel that carries only season 2
+    # (renamed leech channels do this constantly) has to be able to say so without that
+    # statement opening a season boundary or claiming a length: it is a starting point, and
+    # the very first file of the series is the only moment it applies.
+    opening = _as_int(default_season) or current
     filled = {n for n in (_as_int(s) for s in populated) if n is not None}
     label = _as_int(labelled_season)
     number = _as_int(episode)
@@ -193,13 +199,18 @@ def classify(
         "current_season": current,
         "highest_in_season": highest,
         "file_kind": file_kind,
+        "default_season": _as_int(default_season),
     }
 
     if highest is None and not filled:
         return Boundary(
             verdict=Verdict.FIRST,
-            season=label if label is not None else current,
-            reason="nothing filed for this series yet",
+            season=label if label is not None else opening,
+            reason=(
+                "nothing filed for this series yet"
+                if opening == current
+                else f"nothing filed for this series yet; starting at the channel's declared season {opening}"
+            ),
             evidence=evidence,
         )
 

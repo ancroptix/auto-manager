@@ -18,6 +18,17 @@ and deduplication rule below assumes the operator holds distribution rights to t
   filename, and known mappings.
 - Ambiguous metadata is held for review instead of being guessed.
 
+## 2b. Files-only sources (added 2026-08-28)
+
+Some source channels carry no captions at all: one message per file, text like `episode 7`.
+For those, three facts may come from the operator's per-channel declaration instead of the
+file — which series, which audio, which season by default (`app.source_channel.declared_*`,
+set with `/source`) — and each is recorded with its provenance so a declaration can never be
+mistaken for the file's own statement. A declaration may not: invent a quality label, state a
+season length, open a season boundary, or outvote a file whose own text contradicts it.
+Quality may come from the video's pixel size (shorter side), because Telegram reports that
+without a download; language may not come from anything but text or a declaration.
+
 ## 3. Destination channels
 
 - One **private** destination channel per complete series.

@@ -619,6 +619,283 @@ def test_campaign_progress_view_counts(conn, seed):
 
 
 # ------------------------------------------------------------------ other views
+# ------------------------------------------------- source declarations (0006)
+def _declare_channel(conn, channel_id: int, **values: object) -> None:
+    """Write the operator's channel-level statements, as /source would."""
+    columns = [f"declared_{name}" for name in values]
+    assignments = ", ".join(f"{name} = %s" for name in columns)
+    with conn.cursor() as cur:
+        cur.execute(
+            f"update app.source_channel set {assignments}, declared_by = 'operator', declared_at = now()"
+            " where id = %s",
+            (*values.values(), channel_id),
+        )
+
+
+def test_a_bare_file_channel_parks_until_the_channel_is_declared(conn):
+    """The scenario the operator described: a channel of mp4s captioned only ``episode 1``.
+
+    Nothing in that text says which show it is or what language the audio is, so the first
+    scan must park the file — the Hindi-in-scope rule and the destination-naming rule are both
+    statements about the *show*, and inventing either one is a public, permanent mistake. One
+    line per channel (``/source``) un-parks the whole backlog, because the re-scan is allowed
+    to re-read a row that is still parked and never a row that has been decided.
+    """
+    import asyncio
+
+    from app.db import Database
+    from app.ingest import record_message
+
+    channel_id, series_id = _ingest_channel(conn, "@yc_bare", -100700098, "Bare Shelf")
+    db = Database(_ingest_settings())
+
+    async def scenario():
+        assert await db.connect(), await db.last_error
+
+        async def scan(message_id: int, **extra):
+            return await record_message(
+                db,
+                source_channel_id=channel_id,
+                message_id=message_id,
+                media_type="document",
+                file_name="episode 1.mp4",
+                raw_caption="episode 1",
+                fingerprint=f"bare-{message_id}",
+                **extra,
+            )
+
+        parked = await scan(8101)
+        assert parked["disposition"] == "pending", parked
+        assert "Hindi audio" in parked["reason"], parked
+        # One signal, from the channel's own title: enough to park on, not enough to name a
+        # destination channel after.
+        assert parked["series_source"] == "channel_name" and parked["series_confirmed"] is False
+        assert parked["episodes"] == [] and parked["variants"] == []
+
+        _declare_channel(conn, channel_id, series="Bleach Bare", audio="hindi")
+        filed = await scan(8101)
+        assert filed["disposition"] == "accepted", filed
+        assert filed["audio_source"] == "channel_declaration", filed
+        assert filed["series_source"] == "channel_declaration" and filed["series_confirmed"] is True
+        assert len(filed["episodes"]) == 1 and len(filed["variants"]) == 1, filed
+
+        row = await db.fetchrow(
+            "select language_tag, disposition, parsed->>'audio_source' as audio_source"
+            "  from app.source_candidate where source_channel_id = $1 and message_id = 8101",
+            channel_id,
+        )
+        assert row["disposition"] == "accepted" and row["audio_source"] == "channel_declaration", dict(row)
+        # The language column and the dedup key are the same fact from the same source: an
+        # episode whose key says hindi and whose column says nothing is a duplicate waiting
+        # to be filed by the next source.
+        assert row["language_tag"] == "hindi", dict(row)
+
+        # And a decision, once made, is not re-litigated by a later declaration — which is
+        # the price of making a rescan safe to run at any time.
+        _declare_channel(conn, channel_id, audio="subbed_only")
+        unchanged = await scan(8101)
+        assert "already ingested and decided" in str(unchanged.get("skipped", "")), unchanged
+        still = await db.fetchrow(
+            "select disposition from app.source_candidate where source_channel_id = $1 and message_id = 8101",
+            channel_id,
+        )
+        assert still["disposition"] == "accepted", dict(still)
+
+        # A file nobody has decided yet *is* affected: the channel now says its files are
+        # subbed-only, so this one is out of scope on the channel's own statement. That is
+        # the whole design in two lines — declarations move the undecided, never the decided.
+        other = await scan(8102)
+        assert other["disposition"] == "rejected", other
+        assert "subbed-only" in other["reason"] and other["audio_source"] == "channel_declaration", other
+        return filed
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        with conn.cursor() as cur:
+            cur.execute(
+                "delete from app.source_candidate where source_channel_id = %s", (channel_id,)
+            )
+            cur.execute("delete from app.processed_message where source_channel_id = %s", (channel_id,))
+            cur.execute(
+                "delete from app.season where series_id = (select id from app.series where title = %s)",
+                ("Bare Shelf",),
+            )
+
+
+def test_video_dimensions_supply_the_quality_when_no_label_exists(conn):
+    """Telegram states a video's pixel height whether or not anyone captioned it, which is the
+    one quality fact a shelf of bare files can give us without a download."""
+    import asyncio
+
+    from app.db import Database
+    from app.ingest import record_message
+
+    channel_id, _series_id = _ingest_channel(conn, "@yc_bare_hd", -100700099, "Bare HD")
+    _declare_channel(conn, channel_id, series="Bare HD", audio="hindi")
+    db = Database(_ingest_settings())
+
+    async def scenario():
+        assert await db.connect(), await db.last_error
+        report = await record_message(
+            db,
+            source_channel_id=channel_id,
+            message_id=8201,
+            media_type="document",
+            file_name="episode 4.mp4",
+            raw_caption="episode 4",
+            video_height=1080,
+            video_width=1920,
+            fingerprint="hd-4",
+        )
+        assert report["disposition"] == "accepted", report
+        assert report["quality_source"] == "dimensions", report
+        variant = await db.fetchrow(
+            "select quality, quality_rank from app.media_variant where episode_id = $1 order by id",
+            report["episodes"][0],
+        )
+        assert variant["quality"] == "1080p", dict(variant)
+        # 1920 is the *width*; a scanner that handed over the long side of a vertical clip
+        # would otherwise label a 1080 file 1440p forever.
+        assert "quality_from_dimensions:1080" in str(report["flags"]), report
+        assert variant["quality_rank"] == 4, dict(variant)
+
+        # The label still outranks the pixels, and the disagreement is recorded rather than
+        # resolved by whichever signal was read last.
+        labelled = await record_message(
+            db,
+            source_channel_id=channel_id,
+            message_id=8202,
+            media_type="document",
+            file_name="episode 5 720p.mp4",
+            raw_caption="episode 5",
+            video_height=1080,
+            video_width=1920,
+            fingerprint="hd-5",
+        )
+        assert "quality_label_disagrees_with_dimensions:1080p" in labelled["flags"], labelled
+        assert labelled["quality_source"] == "caption", labelled
+        return variant
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        with conn.cursor() as cur:
+            cur.execute("delete from app.source_candidate where source_channel_id = %s", (channel_id,))
+            cur.execute("delete from app.processed_message where source_channel_id = %s", (channel_id,))
+
+
+def test_the_audio_declaration_has_a_global_off_switch(conn):
+    """``ingest.accept_channel_audio_declaration`` exists so that "the channel's word
+    licenses a file's language" can be paused while someone works out why a caption says
+    Hindi on a subbed file — without editing twenty channel rows, and without losing the
+    declarations themselves."""
+    import asyncio
+
+    from app.db import Database
+    from app.ingest import record_message
+
+    channel_id, _series_id = _ingest_channel(conn, "@yc_bare_knob", -100700100, "Bare Knob")
+    _declare_channel(conn, channel_id, series="Bare Knob", audio="hindi")
+    db = Database(_ingest_settings())
+    key = "ingest.accept_channel_audio_declaration"
+    original = _config_value(conn, key)
+
+    async def scan(message_id: int):
+        return await record_message(
+            db,
+            source_channel_id=channel_id,
+            message_id=message_id,
+            media_type="document",
+            file_name="episode 9.mp4",
+            raw_caption="episode 9",
+            fingerprint=f"knob-{message_id}",
+        )
+
+    async def scenario():
+        assert await db.connect(), await db.last_error
+        # The accepted path first, with the knob on, so the only difference between the runs
+        # below is the knob itself. One loop, one pool: a Database cannot be reused across
+        # asyncio.run() calls, which is why the toggles happen in here.
+        accepted = await scan(8300)
+        assert accepted["disposition"] == "accepted", accepted
+        with conn.cursor() as cur:
+            cur.execute("update app.config set value = 'false'::jsonb where key = %s", (key,))
+        blocked = await scan(8301)
+        assert blocked["disposition"] == "pending", blocked
+        assert blocked["audio_declaration_ignored"] is True, blocked
+        assert blocked["audio_source"] == "none", blocked
+        with conn.cursor() as cur:
+            cur.execute("update app.config set value = 'true'::jsonb where key = %s", (key,))
+        resumed = await scan(8302)
+        assert resumed["disposition"] == "accepted", resumed
+        assert resumed["audio_declaration_ignored"] is False, resumed
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        with conn.cursor() as cur:
+            cur.execute("update app.config set value = %s::jsonb where key = %s", (json.dumps(original), key))
+        with conn.cursor() as cur:
+            cur.execute("delete from app.source_candidate where source_channel_id = %s", (channel_id,))
+            cur.execute("delete from app.processed_message where source_channel_id = %s", (channel_id,))
+
+
+def test_a_declared_season_is_a_numbering_default_not_a_boundary(conn):
+    """``/source ... season 2`` says "assume season 2 when the file says nothing".
+
+    It must not open a season's sticker sequence or be recorded as a boundary: the season
+    claim belongs to /declare, and the boundary claim belongs to a caption that stated a
+    season. This is the same rule as the old ``season_hint``, asserted against the schema
+    because the difference between a default and a claim is a week of silence at a boundary.
+    """
+    import asyncio
+
+    from app.db import Database
+    from app.ingest import record_message
+
+    channel_id, _series_id = _ingest_channel(conn, "@yc_bare_s2", -100700101, "Bare S2")
+    _declare_channel(conn, channel_id, series="Bare S2", audio="hindi", season=2)
+    db = Database(_ingest_settings())
+
+    async def scenario():
+        assert await db.connect(), await db.last_error
+        report = await record_message(
+            db,
+            source_channel_id=channel_id,
+            message_id=8401,
+            media_type="document",
+            file_name="episode 3.mp4",
+            raw_caption="episode 3",
+            fingerprint="s2-3",
+        )
+        assert report["disposition"] == "accepted", report
+        assert report["season"]["season"] == 2, report
+        assert report["season_number"] == 2, report
+        assert report["season"]["verdict"] in {"first", "continue"}, report
+        season = await db.fetchrow(
+            "select first_episode, last_episode, boundary_kind from app.season"
+            "  where series_id = (select series_id from app.source_channel where id = $1)"
+            "    and season_number = 2",
+            channel_id,
+        )
+        assert season["boundary_kind"] is None, dict(season)
+        assert (season["first_episode"], season["last_episode"]) == (None, None), dict(season)
+        jobs = await db.fetch(
+            "select count(*) as n from app.job where kind = 'season_sticker'"
+            "  and payload->>'season' = '2'"
+        )
+        assert jobs[0]["n"] == 0, "a numbering default must not post a season opening sticker"
+        return season
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        with conn.cursor() as cur:
+            cur.execute("delete from app.source_candidate where source_channel_id = %s", (channel_id,))
+            cur.execute("delete from app.processed_message where source_channel_id = %s", (channel_id,))
+
+
 def test_season_coverage_needs_files_not_just_row_counts(conn):
     """A "Complete Season" post must never be published for an empty season.
 

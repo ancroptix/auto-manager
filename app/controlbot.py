@@ -62,6 +62,7 @@ HELP = """auto-manager control
 /reconcile   reclaim stale leases + queue a reconciliation now
 /probe       ask the storage bot and Channel Help their questions (report arrives here)
 /declare     say how long a season is (Total Episodes, and the batch post)
+/source      say what a source channel carries (series, audio, season) — for bare-file channels
 /sessions    stored Telegram sessions (never their contents)
 /use <name>  make one session the active account
 /forget <n>  delete a stored session from the database
@@ -77,6 +78,30 @@ command.
 
 This bot answers you and nobody else. It cannot read, post or delete anything in
 your channels — the user session it logs in does the pipeline work."""
+
+
+#: Command -> handler method name. The help text is checked against this table by the tests,
+#: so neither a routed-but-undocumented command nor a documented-but-dead one survives a
+#: refactor. Mapped by *name* rather than by bound method because this file is read by a
+#: person more often than by Python, and the router stays three lines long.
+_ROUTES: dict[str, str] = {
+    "start": "_help",
+    "help": "_help",
+    "status": "_status",
+    "pause": "_pause",
+    "resume": "_resume",
+    "reconcile": "_reconcile",
+    "probe": "_probe",
+    "declare": "_declare",
+    "source": "_source",
+    "sessions": "_sessions",
+    "use": "_use",
+    "forget": "_forget",
+    "login": "_login",
+    "code": "_code",
+    "password": "_password",
+    "cancel": "_cancel",
+}
 
 
 def _int_or_none(token: str | None) -> int | None:
@@ -219,28 +244,12 @@ class ControlBot:
         parts = text.split()
         command = parts[0].lstrip("/").split("@", 1)[0].casefold()
         args = parts[1:]
-        handler = {
-            "start": self._help,
-            "help": self._help,
-            "status": self._status,
-            "pause": self._pause,
-            "resume": self._resume,
-            "reconcile": self._reconcile,
-            "probe": self._probe,
-            "declare": self._declare,
-            "sessions": self._sessions,
-            "use": self._use,
-            "forget": self._forget,
-            "login": self._login,
-            "code": self._code,
-            "password": self._password,
-            "cancel": self._cancel,
-        }.get(command)
-        if handler is None:
+        method = _ROUTES.get(command)
+        if method is None:
             # Unknown commands are ignored rather than echoed: an "unknown command"
             # reply is how a bot advertises that it exists and which words work.
             return []
-        return await handler(update, args)
+        return await getattr(self, method)(update, args)
 
     async def _bare(self, update: Update, pending: _Pending, text: str) -> list[Reply]:
         if pending.stage == "phone":
@@ -295,6 +304,23 @@ class ControlBot:
             )
             if pending_review:
                 lines.append(f"thumbnails awaiting your decision: {pending_review}")
+            # The other queue the operator has to drain by hand, grouped by *why*: a
+            # files-only channel parks four hundred candidates for one missing statement,
+            # and "400 × cannot determine Hindi audio" is answered by one /source command,
+            # while 400 separate rows would look like 400 separate problems.
+            parked = await self.db.fetch(
+                "select coalesce(reason, '(no reason recorded)') as why, count(*) as n"
+                "  from app.source_candidate where disposition = 'pending'"
+                " group by why order by count(*) desc limit 3"
+            )
+            if parked:
+                lines.append("files parked, waiting on you:")
+                for row in parked:
+                    lines.append(f"  x{row['n']} — {str(row['why'])[:70]}")
+                if any("Hindi audio" in str(row["why"]) for row in parked):
+                    lines.append(
+                        "  if this channel is a shelf of bare files: /source <@handle> audio hindi"
+                    )
             # These four decide what gets published at all, so they belong on the
             # one screen the operator reads.
             settings = await self.db.fetch(
@@ -516,6 +542,199 @@ class ControlBot:
                 "your number."
             )
         ]
+
+    async def _source(self, update: Update, args: list[str]) -> list[Reply]:
+        """``/source <@handle|channel id> [series <name>] [audio <kind>] [season <n>]``.
+
+        For the channels that are a shelf of files rather than a captioned source: each
+        message says ``episode 7`` and nothing else, so the series, the language and the
+        season cannot be read out of anything. The pipeline will not guess them — a guessed
+        series names a 30k-member channel, and a guessed language publishes a subbed file as
+        a Hindi one — so this command is where those three facts come from: stated once per
+        channel instead of once per file.
+
+        The reply also says what this command does *not* do. It re-decides nothing by itself:
+        parked files are re-read on the next scan, decided files are never rewritten.
+        """
+        handle = (args[0].strip() if args else "")
+        if not handle or handle.lower() in {"help", "?"}:
+            # Usage first, and with no database required: someone asking how the command
+            # works must not be answered with an infrastructure error.
+            return [Reply(self._SOURCE_USAGE)]
+        if self.db is None or not getattr(self.db, "connected", False):
+            return [Reply("the database is not reachable, so I cannot record a channel declaration.")]
+
+        keys = self._SOURCE_KEYS
+        tokens = args[1:]
+        wanted: dict[str, object] = {}
+        index = 0
+        while index < len(tokens):
+            key = tokens[index].strip().casefold()
+            if key == "clear":
+                wanted = {name: None for name in keys}
+                index = len(tokens)
+                break
+            if key not in keys:
+                return [
+                    Reply(
+                        f"I only take {', '.join(keys)} (or clear) after the channel — not "
+                        f"`{tokens[index]}`.\n{self._SOURCE_USAGE}"
+                    )
+                ]
+            pieces: list[str] = []
+            index += 1
+            while index < len(tokens) and tokens[index].strip().casefold() not in keys:
+                pieces.append(tokens[index])
+                index += 1
+            if not pieces:
+                return [Reply(f"`{key}` needs a value.\n{self._SOURCE_USAGE}")]
+            if key in wanted:
+                return [Reply(f"you gave me `{key}` twice — which one did you mean?")]
+            wanted[key] = " ".join(pieces).strip()
+
+        rows = await self._find_source_channel(handle)
+        if isinstance(rows, str):  # a message to send instead of a lookup result
+            return [Reply(rows)]
+        if len(rows) > 1:
+            listed = "\n".join(
+                f"  {row['id']}: @{row['username'] or '?'} — {row['title'] or 'no title'}" for row in rows
+            )
+            return [Reply(f"`{handle}` matches {len(rows)} channels, so I will not pick one:\n{listed}")]
+        channel = rows[0]
+
+        problems = await self._check_declarations(wanted)
+        if problems:
+            return [Reply(problems)]
+
+        if wanted:
+            columns = [name for name in keys if name in wanted]
+            sets = ", ".join(f"declared_{name} = ${position + 2}" for position, name in enumerate(columns))
+            await self.db.execute(
+                f"update app.source_channel set {sets}, declared_by = 'operator', declared_at = now(),"
+                " updated_at = now() where id = $1",
+                channel["id"],
+                *[wanted[name] for name in columns],
+            )
+        return [Reply(self._source_summary(channel, wanted))]
+
+    _SOURCE_KEYS = ("series", "audio", "season")
+    _SOURCE_USAGE = (
+        "usage: /source <@handle or channel id> [series <name>] [audio <kind>] [season <n>]\n"
+        "  /source @anime_uploads4u series Bleach audio hindi\n"
+        "  /source @anime_uploads4u season 2      (a numbering default, never a season claim)\n"
+        "  /source @anime_uploads4u               (show what is declared)\n"
+        "  /source @anime_uploads4u clear         (stop assuming anything)\n\n"
+        "audio is one of: hindi, dual, multi, subbed, subbed_only, unknown."
+    )
+
+    async def _find_source_channel(self, handle: str) -> list | str:
+        """Look a source channel up by @handle or numeric Telegram id.
+
+        Both, because the operator reads handles in Telegram and the database keys on the
+        numeric id, and the one case where a numeric-looking handle is actually a username
+        (`@1000hours`) is handled by matching the text form too.
+        """
+        stripped = handle.lstrip("@")
+        # Negative on purpose: every Telegram channel id the operator will copy out of a
+        # t.me link or a dashboard row is -100xxxxxxxxxx, and `str.isdigit()` calls that a
+        # string. The lookup matches the text form too, so `@1000hours` is still found.
+        numeric = int(stripped) if stripped.lstrip("-").isdigit() and stripped != "-" else None
+        rows = await self.db.fetch(
+            """
+            select id, username, title, telegram_channel_id,
+                   coalesce(declared_series, '') as declared_series,
+                   coalesce(declared_audio, '') as declared_audio,
+                   coalesce(declared_season, -1) as declared_season
+              from app.source_channel
+             where ($1::text is not null and (lower(coalesce(username, '')) = lower($1)
+                                              or lower(coalesce(title, '')) = lower($1)))
+                or ($2::bigint is not null and telegram_channel_id = $2)
+             order by id
+            """,
+            stripped,
+            numeric,
+        )
+        if not rows:
+            return (
+                f"`{handle}` is not a configured source channel, so there is nothing to declare "
+                "about it.\nThe row itself is created in the dashboard table app.source_channel — "
+                "I can read and update it, not create it."
+            )
+        return list(rows)
+
+    async def _check_declarations(self, wanted: dict[str, object]) -> str | None:
+        """Validate before writing. A half-recorded declaration is worse than none."""
+        from .normalize import DECLARED_AUDIO, declared_audio_kind
+        from .seasons import MAX_PLAUSIBLE_SEASON
+
+        if "series" in wanted and wanted["series"] is not None:
+            text = str(wanted["series"]).strip()
+            if not text:
+                return "an empty series name would put us back to guessing from the channel title."
+            wanted["series"] = text
+        if "audio" in wanted and wanted["audio"] is not None:
+            try:
+                declared_audio_kind(str(wanted["audio"]))
+            except ValueError as error:
+                return f"I cannot record that audio value. {error}"
+            wanted["audio"] = str(wanted["audio"]).strip().casefold().replace("-", "_")
+        if "season" in wanted and wanted["season"] is not None:
+            value = _int_or_none(str(wanted["season"]))
+            if value is None or value < 0 or value > MAX_PLAUSIBLE_SEASON:
+                return (
+                    f"the season default has to be a number between 0 and {MAX_PLAUSIBLE_SEASON}. "
+                    "It is a numbering default only — it can never open a season; /declare is the "
+                    "command that states things about seasons."
+                )
+            wanted["season"] = value
+        if "audio" in wanted and wanted["audio"] is not None and str(wanted["audio"]) not in DECLARED_AUDIO:
+            return f"audio must be one of: {', '.join(sorted(DECLARED_AUDIO))}"
+        return None
+
+    def _source_summary(self, channel, wanted: dict[str, object]) -> str:
+        """What is declared now, and — the part that matters — what it does and does not unlock."""
+        current = {
+            "series": channel["declared_series"] or None,
+            "audio": channel["declared_audio"] or None,
+            # -1 is the sentinel for NULL, because a row of a fake db has no type info
+            "season": None if int(channel["declared_season"]) < 0 else int(channel["declared_season"]),
+        }
+        for name in self._SOURCE_KEYS:
+            if name in wanted:
+                current[name] = wanted[name]
+        label = channel["title"] or f"@{channel['username'] or channel['telegram_channel_id']}"
+        lines = [f"{label}: {'declarations updated' if wanted else 'as they stand'}"]
+        for name in self._SOURCE_KEYS:
+            value = current[name]
+            lines.append(f"  {name}: {value if value not in (None, '') else 'not declared'}")
+        lines.append("")
+        if current["audio"]:
+            lines.append(
+                "bare files here count as carrying that audio, and the caption's Audio line prints it "
+                "as *your* statement — recorded as audio_source = channel_declaration, so a month from "
+                "now you can tell 'the file said Hindi' from 'you told me to assume it'. A file whose "
+                "own text says otherwise keeps its own wording, and a subbed one is still rejected."
+            )
+        else:
+            lines.append(
+                'with no audio declared, a file whose text says nothing about language parks as "cannot '
+                "determine whether the file carries Hindi audio\u201d. That is deliberate: it waits for you "
+                "rather than choosing a scope for you."
+            )
+        lines.append("")
+        if current["series"]:
+            lines.append("the series name is yours, so a destination channel may be named from it.")
+        else:
+            lines.append(
+                "with no series declared, this channel's own title is one signal where the spec wants two: "
+                "files will archive, but I will ask before naming a destination after a channel name."
+            )
+        if wanted:
+            lines.append(
+                "\nThis command re-decides nothing by itself: files still parked are re-read on the next "
+                "scan of this channel, and files already decided are left alone."
+            )
+        return "\n".join(lines)
 
     async def _declaration_bounds(
         self, series_id: int, season_number: int, count: int | None

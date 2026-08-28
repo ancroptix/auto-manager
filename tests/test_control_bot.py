@@ -93,6 +93,21 @@ class FakeDb:
         self.series = [
             {"id": 7, "title": "Dekin no mogura", "normalized_title": "dekin no mogura"},
         ]
+        # A files-only source channel: no title that reads as a series, nothing declared yet.
+        self.source_channels = [
+            {
+                "id": 3,
+                "username": "anime_uploads4u",
+                "title": None,
+                "telegram_channel_id": -1001112223334,
+                "declared_series": "",
+                "declared_audio": "",
+                "declared_season": -1,
+            }
+        ]
+        self.declared_history: list[dict] = []
+        # What `select reason, count(*) ... where disposition = 'pending'` would answer.
+        self.parked: list[dict] = []
         self.writes: list[tuple[str, tuple]] = []
 
     @property
@@ -116,6 +131,18 @@ class FakeDb:
             needle = str(args[0] or "")
             hits = [row for row in self.series if needle and needle in row["normalized_title"]]
             return hits or ([] if needle else [dict(row) for row in self.series])
+        if "from app.source_candidate" in sql:
+            return list(self.parked)
+        if "from app.source_channel" in sql:
+            handle, numeric = args[0], args[1]
+            hits = [
+                dict(row)
+                for row in self.source_channels
+                if (handle and str(row["username"] or "").casefold() == str(handle).casefold())
+                or (handle and str(row["title"] or "").casefold() == str(handle).casefold())
+                or (numeric is not None and row["telegram_channel_id"] == numeric)
+            ]
+            return hits
         if "app.job" in sql:
             return list(self.blocked)
         return []
@@ -142,6 +169,24 @@ class FakeDb:
         return None
 
     async def execute(self, sql: str, *args: Any) -> int:
+        if "update app.source_channel set" in sql:
+            import re as _re
+
+            columns = _re.findall(r"declared_(\w+) = \$", sql)
+            row = next((r for r in self.source_channels if r["id"] == args[0]), None)
+            if row is None:
+                return 0
+            for position, name in enumerate(columns):
+                value = args[position + 1]
+                if value is None:
+                    # Mirror the fake's own encoding: this row has no NULLs, and -1 is what
+                    # the SELECT's coalesce() turns a NULL season into.
+                    row[f"declared_{name}"] = -1 if name == "season" else ""
+                else:
+                    row[f"declared_{name}"] = str(value)
+            self.declared_history.append(dict(row))
+            self.writes.append((sql, args))
+            return 1
         if "insert into app.season" in sql:
             # /declare's write, asserted as (series id, season, count) by those tests.
             self.writes.append((sql, args))
@@ -936,24 +981,159 @@ async def test_declare_shows_usage_before_touching_the_database() -> None:
 def test_the_help_text_advertises_exactly_the_routed_commands() -> None:
     """Guard against the router and the help text drifting apart in either
     direction: an undocumented command is undiscoverable, a documented non-command
-    is a lie."""
-    from app.controlbot import HELP
+    is a lie.
+
+    Both sides are read from the code rather than typed into this test, because a hand-kept
+    list of commands is exactly how a new command ends up undocumented for a whole session.
+    """
+    from app.controlbot import HELP, _ROUTES
 
     advertised = {f"/{name}" for name in re.findall(r"(?<![\w`])/(\w+)\b", HELP)}
-    assert advertised == {
-        "/start",
-        "/help",
-        "/status",
-        "/pause",
-        "/resume",
-        "/reconcile",
-        "/probe",
-        "/declare",
-        "/sessions",
-        "/use",
-        "/forget",
-        "/login",
-        "/code",
-        "/password",
-        "/cancel",
-    }, advertised ^ {"/start", "/help", "/status", "/pause", "/resume", "/reconcile", "/probe", "/sessions", "/use", "/forget", "/login", "/code", "/password", "/cancel"}
+    expected = {f"/{name}" for name in _ROUTES}
+    assert advertised == expected, (
+        f"advertised but not routed: {sorted(advertised - expected)}; "
+        f"routed but undiscoverable: {sorted(expected - advertised)}"
+    )
+    # The four the operator actually uses day to day, so a deleted HELP block fails here too.
+    assert {"/declare", "/source", "/status", "/pause"} <= advertised
+
+
+# --------------------------------------------------------------------------- /source
+# A source channel that is a shelf of bare files ("episode 7" + an mp4) has no series, no
+# language and no season in any text to read. These tests are the one command that supplies
+# those three facts, and the refusals that stop it from becoming a licence to guess.
+
+
+async def test_source_shows_what_is_declared_before_changing_anything() -> None:
+    db = FakeDb()
+    control, _api, _db = bot(db=db)
+    texts = await say(control, "/source @anime_uploads4u")
+    assert "not declared" in texts[0] and "series" in texts[0]
+    assert not db.writes, "a lookup must not write"
+
+
+async def test_source_records_the_series_and_the_audio_together() -> None:
+    db = FakeDb()
+    control, _api, _db = bot(db=db)
+    (text,) = await say(control, "/source @anime_uploads4u series Bleach audio hindi")
+    assert "Bleach" in text and "hindi" in text
+    row = db.source_channels[0]
+    assert row["declared_series"] == "Bleach" and row["declared_audio"] == "hindi", row
+    assert "channel_declaration" in text, "the reply must say whose statement this is"
+    assert "next scan" in text and "left alone" in text, "and that it re-decides nothing itself"
+
+
+async def test_source_keeps_a_series_name_with_spaces_in_one_value() -> None:
+    db = FakeDb()
+    control, _api, _db = bot(db=db)
+    await say(control, "/source @anime_uploads4u series dekin no mogura audio dual")
+    row = db.source_channels[0]
+    assert row["declared_series"] == "dekin no mogura", row
+    assert row["declared_audio"] == "dual", row
+
+
+async def test_source_refuses_a_language_it_cannot_store() -> None:
+    """A typo here is not cosmetic: 'Eng' stored in the column reads as *no declaration*,
+    and the difference is whether four hundred files are archived or parked."""
+    db = FakeDb()
+    control, _api, _db = bot(db=db)
+    (text,) = await say(control, "/source @anime_uploads4u audio english")
+    assert "cannot record" in text.lower()
+    assert not db.writes
+
+
+async def test_source_refuses_a_season_number_that_could_not_be_a_season() -> None:
+    db = FakeDb()
+    control, _api, _db = bot(db=db)
+    (text,) = await say(control, "/source @anime_uploads4u season 999")
+    assert "between 0 and 99" in text and not db.writes
+
+
+async def test_source_names_the_key_it_did_not_understand_instead_of_guessing() -> None:
+    db = FakeDb()
+    control, _api, _db = bot(db=db)
+    (text,) = await say(control, "/source @anime_uploads4u language hindi")
+    assert "language" in text and "usage" in text.lower()
+    assert not db.writes
+
+
+async def test_source_refuses_to_write_a_value_it_was_not_given() -> None:
+    db = FakeDb()
+    control, _api, _db = bot(db=db)
+    (text,) = await say(control, "/source @anime_uploads4u series")
+    assert "needs a value" in text and not db.writes
+
+
+async def test_source_clears_every_declaration_at_once() -> None:
+    db = FakeDb()
+    control, _api, _db = bot(db=db)
+    await say(control, "/source @anime_uploads4u series Bleach audio hindi season 2")
+    db.writes.clear()
+    (text,) = await say(control, "/source @anime_uploads4u clear")
+    row = db.source_channels[0]
+    assert row["declared_series"] == "" and row["declared_audio"] == "" and row["declared_season"] == -1, row
+    assert "not declared" in text
+    assert len(db.writes) == 1, "one statement, so the columns cannot be cleared one at a time"
+
+
+async def test_source_refuses_to_pick_a_channel_when_the_name_is_ambiguous() -> None:
+    db = FakeDb()
+    db.source_channels.append(
+        {
+            "id": 4,
+            "username": "anime_uploads4u",
+            "title": "second row",
+            "telegram_channel_id": -100999,
+            "declared_series": "",
+            "declared_audio": "",
+            "declared_season": -1,
+        }
+    )
+    control, _api, _db = bot(db=db)
+    (text,) = await say(control, "/source @anime_uploads4u series Bleach")
+    assert "matches 2 channels" in text and not db.writes
+
+
+async def test_source_says_how_to_add_a_channel_it_does_not_know() -> None:
+    """The reply has to be actionable from a phone: 'not found' alone sends the operator
+    looking for a command that does not exist."""
+    db = FakeDb()
+    control, _api, _db = bot(db=db)
+    (text,) = await say(control, "/source @never_configured series Bleach")
+    assert "not a configured source channel" in text and "app.source_channel" in text
+    assert not db.writes
+
+
+async def test_source_finds_a_channel_by_its_numeric_id_too() -> None:
+    db = FakeDb()
+    control, _api, _db = bot(db=db)
+    (text,) = await say(control, "/source -1001112223334 series Bleach")
+    assert "declarations updated" in text, text
+    assert db.source_channels[0]["declared_series"] == "Bleach"
+
+
+async def test_status_groups_parked_files_by_the_reason_that_parked_them() -> None:
+    """Four hundred files parked by one missing statement must not read as four hundred
+    problems — and the fix is one line, so the reply says which line."""
+    db = FakeDb()
+    db.parked = [{"why": "cannot determine whether the file carries Hindi audio", "n": 402}]
+    control, _api, _db = bot(db=db)
+    (text,) = await say(control, "/status")
+    assert "402" in text and "Hindi audio" in text
+    assert "/source" in text, "and the answer, not just the symptom"
+
+
+async def test_status_stays_quiet_about_parking_when_there_is_none() -> None:
+    db = FakeDb()
+    control, _api, _db = bot(db=db)
+    (text,) = await say(control, "/status")
+    assert "parked" not in text
+
+
+async def test_source_without_a_database_says_so_instead_of_pretending() -> None:
+    control = ControlBot(api=FakeApi(), db=None, settings=settings(), owner_ids=frozenset({OWNER}))  # type: ignore[arg-type]
+    (text,) = await say(control, "/source @anime_uploads4u series Bleach")
+    assert "database is not reachable" in text
+    # and the usage text, with no arguments at all, needs no database either
+    control2 = ControlBot(api=FakeApi(), db=None, settings=settings(), owner_ids=frozenset({OWNER}))  # type: ignore[arg-type]
+    assert "usage" in (await say(control2, "/source"))[0].lower()
