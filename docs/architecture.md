@@ -22,18 +22,51 @@ app/
   api.py               /health /ready /status /control/*
   main.py              ASGI entrypoint; boots db, reclaims leases, starts loop
   telegram_client.py   Telethon StringSession wrapper, owner gate, flood-wait policy
+  botapi.py            the whole Bot API surface we need: sendMessage, getUpdates,
+                       deleteMessage — no file sending exists here by omission
+  controlbot.py        the owner's remote: owner gate, login flow, every command
+  sessions.py          one reader of the session string; everything else is metadata
+  mtproto_login.py     sendCode/signIn on the operator's behalf (login only, nothing else)
 supabase/migrations/
   0001_init.sql        enums, 22 tables, constraints, indexes, RLS enabled
   0002_functions.sql   triggers, queue functions, views, grants, default config
+  0003_control_bot.sql app.telegram_session + the bot.* settings the operator tunes
 scripts/
   login.py             operator-side one-time login -> session string
   check_secrets.py     refuses to let a credential be committed
   devdb.py             disposable local Postgres that applies the migrations
-tests/                 287 tests, including the migrations and handlers executed on real Postgres
+tests/                 376 tests, including the migrations and handlers executed on real Postgres
 ops/ci.yml             the CI job; copy into .github/workflows/ to activate it
 docs/                  requirements-draft.md (the spec), setup guides, this file
 render.yaml            the whole deployment, as code
 ```
+
+## The operator's side: the control bot
+
+`app/main.py` starts `ControlBot.run()` when `TELEGRAM_BOT_TOKEN` and owner ids are
+both present, and nothing else about the service depends on it: a revoked token
+costs the remote, never the queue. Long polling (`getUpdates`) instead of a webhook
+because it needs no inbound route, no certificate and no operator configuration,
+and an offset in the client means a redeploy resumes rather than replays.
+
+Three boundaries make it safe enough to hand to a phone:
+
+* **`handle()` is the whole brain** and takes a parsed update. Authorization and the
+  private-chat check happen before any command text is looked at, so there is no
+  path where a handler runs for a stranger. `dispatch()` adds the side effects
+  (send, delete) and `run()` is only the loop — which is why the security rules are
+  testable without a network.
+* **The login path owns the only dangerous capability.** `app/mtproto_login.py` is
+  the sole module that can turn a phone number and code into a session, it disconnects
+  immediately after, and it can do nothing else — no `send_message`, no `GetHistory`.
+  The value goes to `app/sessions.py:store()` and from there to
+  `telegram_client.resolve_session_string()`, which reads the environment first, so a
+  hand-set string is never silently overridden by an older stored one.
+* **Nothing sensitive is printable.** `BotApi` keeps the token out of `repr()` and out
+  of every error message (`httpx` puts the full URL, token included, into its
+  exceptions); `sessions.scrub()` runs over every outgoing reply and removes named
+  secrets *and* session-shaped text, because an exception that carries a session was
+  written by nobody who meant to leak one.
 
 ## One job, start to finish
 
@@ -78,6 +111,7 @@ stage**, and a `reconciliation` job is enqueued. So it resumes at
 | No credential reaches GitHub | `scripts/check_secrets.py` | `test_tracked_files_scan_clean` |
 
 ## Deliberate choices that look like omissions
+
 
 * **Stubs raise instead of returning.** An empty handler would make the queue
   report success while nothing was archived or published. `FeatureNotImplemented`

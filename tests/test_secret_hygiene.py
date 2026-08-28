@@ -100,6 +100,8 @@ REAL_LEAKS = [
     'api_hash = "0f9e8d7c6b5a4321fedcba9876543210"',
     "SUPABASE_SERVICE_ROLE_KEY=eyJhbGciOiJIUzI1NiJ9.eyJyb2xlIjoic2VydmljZSJ9.abcdef",
     'CONTROL_TOKEN = "a-hardcoded-token-value"',
+    "client = TelegramClient('bleach.session', api_id, api_hash)",
+    "path = os.path.expanduser('~/.config/auto-manager/spare.session')",
 ]
 
 BENIGN_EXAMPLES = [
@@ -109,6 +111,9 @@ BENIGN_EXAMPLES = [
     "TELEGRAM_SESSION_STRING=\nTELEGRAM_API_ID=12345",
     "CONTROL_TOKEN=changeme",
     "gpg --recv-keys 0x1234567890abcdef",
+    # reading a session object's string is code, not a file on disk
+    "    session = client.session.as_string()",
+    "    await client.session.connect()",
 ]
 
 

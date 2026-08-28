@@ -47,6 +47,31 @@ def configure_logging(level: str) -> None:
     )
 
 
+def _build_control_bot(settings: Settings, db: Any) -> Any:
+    """Assemble the control bot. Separate so the wiring itself can be tested."""
+    from .botapi import BotApi
+    from .controlbot import ControlBot
+
+    transport = None
+    if settings.bot_allow_login and settings.telegram_api_id and settings.telegram_api_hash:
+        from .mtproto_login import MTProtoLogin
+
+        transport = MTProtoLogin(
+            api_id=int(settings.telegram_api_id),
+            api_hash=settings.telegram_api_hash.get_secret_value(),
+        )
+    api = BotApi(settings.reveal("telegram_bot_token") or "")
+    return ControlBot(
+        api=api,
+        db=db,
+        settings=settings,
+        transport=transport,
+        owner_ids=settings.owner_ids,
+        allow_login=settings.bot_allow_login,
+        background=lambda coro: asyncio.create_task(coro),
+    )
+
+
 def create_app(settings: Settings | None = None, *, start_worker: bool | None = None) -> FastAPI:
     settings = settings or load_settings()
     configure_logging(settings.log_level)
@@ -95,6 +120,17 @@ def create_app(settings: Settings | None = None, *, start_worker: bool | None = 
             )
         if run_worker and app.state.worker:
             app.state.worker.start()
+        if settings.bot_should_run:
+            try:
+                app.state.control_bot = _build_control_bot(settings, db)
+                app.state.control_bot_task = asyncio.create_task(app.state.control_bot.run())
+            except Exception as exc:  # noqa: BLE001 - /health must survive a bad bot token
+                app.state.control_bot = None
+                app.state.bot_error = str(exc)
+                log.error(
+                    "control bot could not start (%s); queue and HTTP surface unaffected", exc
+                )
+
         if settings.probe_on_boot:
             # Deliberately not awaited: a probe talks to two third-party bots and
             # waits for their replies, and health checks must not queue behind it.
@@ -108,6 +144,14 @@ def create_app(settings: Settings | None = None, *, start_worker: bool | None = 
         try:
             yield
         finally:
+            bot = getattr(app.state, "control_bot", None)
+            if bot is not None:
+                bot.stop()
+            task = getattr(app.state, "control_bot_task", None)
+            if task is not None and not task.done():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
             if app.state.worker:
                 await app.state.worker.stop()
             await db.close()

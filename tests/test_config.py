@@ -17,8 +17,36 @@ def test_live_mode_refuses_to_start_without_guards(make_settings) -> None:
     with pytest.raises(ValidationError) as excinfo:
         make_settings(mode=AppMode.LIVE)
     message = str(excinfo.value)
-    for expected in ("DATABASE_URL", "CONTROL_TOKEN", "TELEGRAM_SESSION_STRING", "TELEGRAM_OWNER_USER_IDS"):
+    for expected in ("DATABASE_URL", "CONTROL_TOKEN", "TELEGRAM_OWNER_USER_IDS"):
         assert expected in message, f"{expected} should be named in the error"
+    # The session is the one guard with an alternative route: the control bot can
+    # log the account in and store the session, so a terminal is not mandatory —
+    # and live mode must be able to boot *before* a session exists, or /login could
+    # never happen. The error has to say that out loud instead of looking like a bug.
+    # Not listed as a blocker (the advisory below the list still names it).
+    assert "\n  - TELEGRAM_SESSION_STRING" not in message
+    assert "/login on the control bot" in message
+    with pytest.raises(ValidationError) as strict:
+        make_settings(
+            mode=AppMode.LIVE,
+            telegram_session_source="env",
+            database_url="postgresql://u:p@host:5432/db",
+            control_token="x" * 40,
+            telegram_api_id=1,
+            telegram_api_hash="0123456789abcdef0123456789abcdef",  # allowlist: secret
+            telegram_owner_user_ids=[111],
+        )
+    assert "TELEGRAM_SESSION_STRING" in str(strict.value)
+    # With a session available from the database, live mode is satisfied.
+    settings = make_settings(
+        mode=AppMode.LIVE,
+        database_url="postgresql://u:p@host:5432/db",
+        control_token="x" * 40,
+        telegram_api_id=1,
+        telegram_api_hash="0123456789abcdef0123456789abcdef",  # allowlist: secret
+        telegram_owner_user_ids=[111],
+    )
+    assert settings.outbound_enabled and settings.session_from_database
 
 
 def test_live_mode_starts_when_everything_is_present(make_settings) -> None:
@@ -155,7 +183,47 @@ class TestBootAudit:
         # needs to know before flipping the mode and wondering why nothing sent.
         notes = Settings(app_name="auto-manager").boot_audit()
         listed = next(n for n in notes if n.startswith("Telegram client"))
-        assert "TELEGRAM_API_ID" in listed and "TELEGRAM_SESSION_STRING" in listed
+        assert "TELEGRAM_API_ID" in listed
+
+    def test_a_stored_session_is_reported_as_the_source(self) -> None:
+        """'I logged in and nothing changed' must be diagnosable from one line."""
+        notes = Settings(app_name="auto-manager", telegram_api_id=1, telegram_api_hash="h").boot_audit()
+        listed = next(n for n in notes if n.startswith("Telegram client"))
+        assert "database" in listed and "/login" in listed
+
+    def test_env_only_source_names_the_variable(self) -> None:
+        notes = Settings(
+            app_name="auto-manager", telegram_api_id=1, telegram_api_hash="h",
+            telegram_session_source="env",
+        ).boot_audit()
+        assert "TELEGRAM_SESSION_STRING" in next(n for n in notes if n.startswith("Telegram client"))
+
+    def test_control_bot_lines(self) -> None:
+        without = Settings(app_name="auto-manager", telegram_api_id=1, telegram_api_hash="h").boot_audit()
+        assert any("@BotFather" in n for n in without), "no token should say how to get one"
+        gated = Settings(
+            app_name="auto-manager", telegram_bot_token="123:abc-def", telegram_api_id=1, telegram_api_hash="h"
+        ).boot_audit()
+        assert any("refusing to answer anyone" in n for n in gated), "a token with no owners is a leak risk"
+        ready = Settings(
+            app_name="auto-manager", telegram_bot_token="123:abc-def",
+            telegram_owner_user_ids="7", telegram_api_id=1, telegram_api_hash="h",
+        ).boot_audit()
+        line = next(n for n in ready if n.startswith("control bot"))
+        assert "1 owner id" in line and "login enabled" in line
+
+    def test_bot_token_never_appears_in_the_audit(self) -> None:
+        """The token is a credential: the status surface reports it, never shows it."""
+        import json
+
+        settings = Settings(
+            app_name="auto-manager",
+            telegram_bot_token="123456:SuperSecretTokenValue",
+        )
+        assert "SuperSecretTokenValue" not in "\n".join(settings.boot_audit())
+        dump = settings.safe_dump()
+        assert "SuperSecretTokenValue" not in json.dumps(dump)
+        assert dump["telegram_bot_token"] == "configured"
 
 
 class TestBootAuditTargets:

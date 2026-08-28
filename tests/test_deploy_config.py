@@ -84,6 +84,11 @@ def test_required_secret_slots_exist(service) -> None:
         "TELEGRAM_API_HASH",
         "TELEGRAM_SESSION_STRING",
         "TELEGRAM_OWNER_USER_IDS",
+        # The operator's whole interface is this bot: /status, /pause, /probe and
+        # /login. The last one is why a non-coder can connect an account at all.
+        "TELEGRAM_BOT_TOKEN",
+        "TELEGRAM_SESSION_SOURCE",
+        "BOT_ALLOW_LOGIN",
     }:
         assert required in keys
 
@@ -206,8 +211,17 @@ def test_migration_bundle_ships_both_files_in_order() -> None:
     from app.db import MIGRATION_BUNDLE, REPO_ROOT
 
     text = MIGRATION_BUNDLE.read_text()
-    assert "0001_init.sql" in text and "0002_functions.sql" in text
+    migrations = sorted(path.name for path in (REPO_ROOT / "supabase" / "migrations").glob("*.sql"))
+    assert len(migrations) >= 3, "the scan should see every migration, not just the early ones"
+    positions = []
+    for name in migrations:
+        stem = name[: -len(".sql")]
+        assert stem in text, f"{name} is missing from the bundle — run ops/build_apply_all.py"
+        positions.append(text.index(stem))
+    assert positions == sorted(positions), "the bundle concatenates migrations out of order"
+    # The header names the files it contains, so a reader can tell a stale bundle
+    # from a complete one without diffing.
+    for name in migrations:
+        assert name in text.split("ONE-FILE INSTALLER")[1][:600], f"{name} not advertised in the header"
     assert text.index("create schema if not exists app") < text.index("create or replace function app.claim_next_job")
     pglast.parse_sql(text)
-    # The migrations stay in the repo too, for `supabase db push`.
-    assert len(list((REPO_ROOT / "supabase" / "migrations").glob("*.sql"))) == 2

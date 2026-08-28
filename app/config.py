@@ -29,6 +29,7 @@ SENSITIVE_FIELDS = frozenset(
         "control_token",
         "telegram_api_hash",
         "telegram_session_string",
+        "telegram_bot_token",
     }
 )
 
@@ -116,6 +117,17 @@ class Settings(BaseSettings):
     telegram_owner_user_ids: tuple[int, ...] = ()
     telegram_main_admin_user_id: int | None = Field(default=None, gt=0)
 
+    # --- control bot (the operator's remote; see app/controlbot.py) ----------
+    telegram_bot_token: SecretStr | None = None
+    bot_enabled: bool = True
+    # Where the *user* session comes from. "database" is what the control bot
+    # fills in via /login, so a session string never has to exist in a terminal,
+    # a file or a chat log. "both" prefers the environment value and falls back.
+    telegram_session_source: str = "both"
+    # Off-switch for the login flow itself: once the account is connected, a
+    # deployment that cannot start a login is a deployment with one fewer door.
+    bot_allow_login: bool = True
+
     # --- worker / queue -----------------------------------------------------
     worker_enabled: bool = True
     worker_poll_seconds: float = Field(default=2.0, ge=0.1, le=600)
@@ -192,6 +204,15 @@ class Settings(BaseSettings):
     def _parse_owner_ids(cls, value: Any) -> tuple[int, ...]:
         return _parse_user_ids(value)
 
+    @field_validator("telegram_session_source")
+    @classmethod
+    def _check_session_source(cls, value: str) -> str:
+        allowed = {"env", "database", "both"}
+        cleaned = (value or "both").strip().casefold()
+        if cleaned not in allowed:
+            raise ValueError(f"TELEGRAM_SESSION_SOURCE must be one of {sorted(allowed)}, got {value!r}")
+        return cleaned
+
     @field_validator("db_ssl")
     @classmethod
     def _check_ssl_mode(cls, value: str) -> str:
@@ -213,15 +234,31 @@ class Settings(BaseSettings):
             missing.append("TELEGRAM_API_ID (from my.telegram.org)")
         if self.telegram_api_hash is None:
             missing.append("TELEGRAM_API_HASH")
-        if self.telegram_session_string is None:
-            missing.append("TELEGRAM_SESSION_STRING (from scripts/login.py)")
+        if self.telegram_session_string is None and self.telegram_session_source not in ("database", "both"):
+            missing.append(
+                "TELEGRAM_SESSION_STRING, or set TELEGRAM_SESSION_SOURCE=database and "
+                "log the account in with the control bot's /login"
+            )
         if not self.telegram_owner_user_ids:
             missing.append("TELEGRAM_OWNER_USER_IDS (who may issue owner commands)")
         if missing:
+            # A missing *session* is deliberately not in the list when the database
+            # may hold one: the control bot is what performs the login, so a live
+            # deployment has to be able to boot before any session exists. The
+            # advisory keeps that from looking like an oversight.
+            advisory = ""
+            if self.telegram_session_string is None and self.telegram_session_source in ("database", "both"):
+                advisory = (
+                    "\n\nA Telegram session is not set in the environment, which is fine: "
+                    "live mode will boot and /login on the control bot connects the account. "
+                    "Alternatively set TELEGRAM_SESSION_STRING, or set "
+                    "TELEGRAM_SESSION_SOURCE=env to make the deployment refuse to run without one."
+                )
             raise ValueError(
                 "APP_MODE=live refuses to start until these are set in the "
                 "deployment environment:\n  - "
                 + "\n  - ".join(missing)
+                + advisory
             )
         return self
 
@@ -268,15 +305,38 @@ class Settings(BaseSettings):
             for name, value in (
                 ("TELEGRAM_API_ID", self.telegram_api_id),
                 ("TELEGRAM_API_HASH", self.telegram_api_hash),
-                ("TELEGRAM_SESSION_STRING", self.telegram_session_string),
             )
             if value is None
         ]
-        lines.append(
-            "Telegram client configured"
-            if not missing
-            else "Telegram client not configured yet: " + ", ".join(missing)
-        )
+        # Saying which session is in play prevents the classic confusion of
+        # "I logged in from a laptop and it changed nothing": a stored session is
+        # only used when TELEGRAM_SESSION_STRING is empty.
+        if self.telegram_session_string is not None:
+            session_note = "session from TELEGRAM_SESSION_STRING"
+        elif self.telegram_session_source in ("database", "both"):
+            session_note = "session will be read from the database (log in with /login)"
+        else:
+            session_note = None
+            missing.append("TELEGRAM_SESSION_STRING (TELEGRAM_SESSION_SOURCE=env)")
+        if not missing:
+            lines.append("Telegram client configured" + (f" ({session_note})" if session_note else ""))
+        else:
+            lines.append("Telegram client not configured yet: " + ", ".join(missing))
+
+        if self.telegram_bot_token is not None:
+            ownerless = not self.owner_ids
+            lines.append(
+                "control bot: refusing to answer anyone (TELEGRAM_OWNER_USER_IDS / "
+                "TELEGRAM_MAIN_ADMIN_USER_ID is unset)"
+                if ownerless
+                else f"control bot: enabled for {len(self.owner_ids)} owner id(s); login "
+                + ("enabled" if self.bot_allow_login else "disabled")
+            )
+        elif self.telegram_api_id is not None:
+            lines.append(
+                "control bot: no TELEGRAM_BOT_TOKEN — create one with @BotFather and paste it "
+                "into the environment if you want /commands and /login on Telegram"
+            )
         return lines
 
     @property
@@ -287,14 +347,29 @@ class Settings(BaseSettings):
         return ":6543" in url or "pooler.supabase.com" in url
 
     @property
+    def session_from_database(self) -> bool:
+        """The stored-session path is permitted (and nothing better is set)."""
+        return self.telegram_session_source in ("database", "both") and self.telegram_session_string is None
+
+    @property
+    def has_user_session(self) -> bool:
+        return self.telegram_session_string is not None or self.telegram_session_source in ("database", "both")
+
+    @property
     def outbound_enabled(self) -> bool:
         """Whether Telegram side-effects are permitted at all."""
         return (
             self.mode is AppMode.LIVE
-            and self.telegram_session_string is not None
+            and self.has_user_session
             and self.telegram_api_id is not None
             and self.telegram_api_hash is not None
         )
+
+    @property
+    def bot_should_run(self) -> bool:
+        """A bot token is the whole opt-in. Nothing else about the control bot can
+        start by accident, because it refuses construction without owner ids."""
+        return self.bot_enabled and self.telegram_bot_token is not None
 
     @property
     def owner_ids(self) -> frozenset[int]:

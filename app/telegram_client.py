@@ -35,8 +35,42 @@ class TelegramNotConfigured(RuntimeError):
 @dataclass
 class TelegramUserClient:
     settings: Settings
+    db: Any = None  # Database | None; only needed to read a stored session
     _client: Any = field(default=None, repr=False)
     _connected: bool = False
+
+    async def resolve_session_string(self) -> str:
+        """The session to authenticate with: from the environment, or the database.
+
+        The database path exists so a session string never has to pass through a
+        terminal, a file or a chat log — the control bot logs the account in and
+        stores the result, and this is where it is read back. Precedence is
+        explicit: an environment value wins, so a deliberately set string is never
+        silently overridden by an older stored one.
+        """
+        from_env = self.settings.reveal("telegram_session_string")
+        if from_env:
+            return from_env
+        if self.settings.telegram_session_source not in ("database", "both"):
+            raise TelegramNotConfigured(
+                "TELEGRAM_SESSION_STRING is unset and TELEGRAM_SESSION_SOURCE="
+                + self.settings.telegram_session_source
+                + " forbids reading a stored session"
+            )
+        if self.db is None or not getattr(self.db, "connected", False):
+            raise TelegramNotConfigured(
+                "TELEGRAM_SESSION_STRING is unset and there is no database to read "
+                "a stored session from"
+            )
+        from .sessions import active_session_string
+
+        stored = await active_session_string(self.db)
+        if not stored:
+            raise TelegramNotConfigured(
+                "no active session is stored yet: message the control bot "
+                "'/login spare +<phone>' and complete the code"
+            )
+        return stored
 
     @property
     def connected(self) -> bool:
@@ -44,6 +78,11 @@ class TelegramUserClient:
 
     @property
     def configured(self) -> bool:
+        """Live mode plus credentials.
+
+        A *stored* session counts as configured here and is checked for existence
+        at connect time, because existence needs a query and this property is read
+        from request paths and the worker loop."""
         return self.settings.outbound_enabled
 
     async def start(self) -> Any:
@@ -55,9 +94,10 @@ class TelegramUserClient:
         from telethon import TelegramClient
         from telethon.sessions import StringSession
 
+        session_string = await self.resolve_session_string()
         if self._client is None:
             self._client = TelegramClient(
-                StringSession(self.settings.reveal("telegram_session_string")),
+                StringSession(session_string),
                 self.settings.telegram_api_id,
                 self.settings.telegram_api_hash.get_secret_value(),
                 flood_sleep_threshold=min(MAX_FLOOD_WAIT_SECONDS, 60),
@@ -155,7 +195,7 @@ async def probe_once(settings: Settings, db: Any = None, *, send: bool = True) -
     mean a probe failure could take the queue loop down with it, and the probe is
     by design the riskiest thing this service does with a user session.
     """
-    client = TelegramUserClient(settings=settings)
+    client = TelegramUserClient(settings=settings, db=db)
     await client.start()
     try:
         return await client.probe(db=db, send=send)

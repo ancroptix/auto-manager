@@ -28,7 +28,10 @@ SAFE_NAMES = {".env.example", "check_secrets.py", "login.py"}
 RULES: list[tuple[str, re.Pattern[str]]] = [
     ("Telegram session string", re.compile(r"1AAA[A-Za-z0-9+/=_-]{24,}")),
     ("Telethon StringSession literal", re.compile(r"StringSession\(\s*[\"'][A-Za-z0-9+/=_-]{25,}[\"']")),
-    ("MTProto session file path", re.compile(r"\b[\w.-]+\.session\b")),
+    # A session *file* is what must never be committed. An attribute access is not
+    # one: `client.session.as_string()` is the supported way to read a StringSession,
+    # so the lookahead keeps that legal line out of the findings.
+    ("MTProto session file path", re.compile(r"\b[\w.-]+\.session\b(?!\s*\.)")),
     ("api_hash literal", re.compile(r"api[_-]?hash[\"']?\s*[:=]\s*[\"'][0-9a-f]{32}[\"']", re.I)),
     ("GitHub token", re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b")),
     ("Render API key", re.compile(r"\brnd_[A-Za-z0-9]{20,}\b")),

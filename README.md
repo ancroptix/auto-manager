@@ -4,7 +4,7 @@ A modular Telegram media-management system for content the operator owns or is
 authorized to distribute.
 
 **Status:** the runtime skeleton and the whole decision layer are built and
-tested (287 tests): parsing, the Hindi-scope rule, thumbnail screening, manifest
+tested (376 tests): parsing, the Hindi-scope rule, thumbnail screening, manifest
 order, the create-vs-edit choice, and destination-channel setup. Source scanning,
 archive copies, storage-bot menus and Channel Help publishing are **not**
 implemented — they need a logged-in session and fail loudly into a `blocked`
@@ -38,14 +38,15 @@ Owner private Telegram chat  (control commands, review queues, approvals)
 
 | Component | State |
 | --- | --- |
-| Postgres schema: 22 tables, constraints, RLS | built, executed against real Postgres in tests |
+| Postgres schema: 23 tables + 4 views, constraints, RLS | built, executed against real Postgres in tests |
 | Queue: lease-based claim, stage checkpoints, exponential retry, blocked state | built, tested |
 | Restart recovery (`release_expired_locks` + boot reconciliation) | built, tested, verified live |
 | HTTP surface: `/health` `/ready` `/status` `/control/pause\|resume\|reconcile\|shutdown` | built, tested, verified live |
 | Config: fail-closed live mode, masked secrets, pooler detection | built, tested |
 | Deployment: `render.yaml` Blueprint, UptimeRobot `/health`, Dockerfile deliberately absent | built, tested |
 | Credential guard (`scripts/check_secrets.py`) + CI (`ops/ci.yml`) | built, tested |
-| Local login helper (`scripts/login.py`) | built; not yet exercised against Telegram |
+| Control bot: `/status` `/pause` `/probe` `/login` `/sessions` (owner-only, [docs](docs/control-bot.md)) | built, 49 tests; Telegram-side behaviour unverified from this network |
+| Local login helper (`scripts/login.py`) | kept as the offline fallback; the bot is the default path |
 | Source scanning / metadata parsing | **not built** — needs filename patterns |
 | Thumbnail screening (allowlist: `@ycanime`, `@india_crunchyroll`) | **not built** — the rule is agreed, the detector is not |
 | Archive copy, `@anime_hindifilesbot` adapter, Channel Help adapter | **not built** — needs one authenticated test run |

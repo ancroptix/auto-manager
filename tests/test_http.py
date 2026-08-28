@@ -43,6 +43,28 @@ def test_status_exposes_the_ladder_and_masks_secrets(client) -> None:
     assert body["outbound_telegram_actions"] is False
 
 
+def test_status_reports_the_control_bot_as_not_configured(client) -> None:
+    """The bot is optional; its absence has to be visible as a name to set."""
+    body = client.get("/status").json()["control_bot"]
+    assert body["running"] is False
+    assert "TELEGRAM_BOT_TOKEN" in body["how"] and "BotFather" in body["how"]
+
+
+def test_a_token_without_owner_ids_is_reported_as_refusing_to_start(make_settings) -> None:
+    """Fail-closed is only honest if it is *visible*: a silent refusal to answer is
+    indistinguishable from a broken deploy."""
+    with TestClient(
+        create_app(
+            make_settings(telegram_bot_token="123456:" + "a" * 25, telegram_owner_user_ids=None),
+            start_worker=False,
+        )
+    ) as client:
+        body = client.get("/status").json()
+    assert body["control_bot"]["state"] == "refused to start"
+    assert "TELEGRAM_OWNER_USER_IDS" in body["control_bot"]["why"]
+    assert body["config"]["telegram_bot_token"] == "configured"
+
+
 def test_stage_endpoint_matches_ladder(client) -> None:
     from app.stages import LADDER
 

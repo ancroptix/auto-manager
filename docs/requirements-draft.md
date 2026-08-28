@@ -243,21 +243,48 @@ generated from the manifest every time, in `quality_rank` order.
 - Log successful / failed / skipped / already-contacted outcomes.
 - Message template: **TBD by operator.**
 
-## 16. Owner control interface
+## 16. Owner control interface (revised: a control bot is in scope)
 
-```text
-/status            /health            /sources
-/addsource         /removesource      /destinations
-/createchannel     /archive           /pending
-/dmrequests        /campaigns         /queue
-/retry             /pause             /resume
-/watermark_review  /approve_candidate /reject_candidate
-/logs              /shutdown
-```
+*Superseded decision.* An earlier draft said "no bot of our own — the third-party
+bots are services we message, and the operator uses HTTP". That was reversed on the
+grounds that the operator does not run Python: a command list reachable only by
+`curl` with a bearer token is not an interface they can use. The third-party bots
+(`@anime_hindifilesbot`, `@chelpbot`) are still services we message; what is new is
+**our own bot as the front-end** — including for logging the user account in.
 
-- Restricted to the configured owner Telegram user ID allowlist.
-- Destructive actions, mass messaging, and privilege changes require explicit confirmation.
-- `/shutdown` acts as an emergency kill switch alongside Render's own stop.
+Two surfaces, one set of switches. Neither has authority the other lacks:
+
+| In Telegram (private chat with our bot) | Over HTTP (`/control/*`, bearer `CONTROL_TOKEN`) |
+| --- | --- |
+| `/status` `/pause` `/resume` `/reconcile` `/probe` | `GET /health` `GET /status` |
+| `/sessions` `/use <name>` `/forget <name>` | `POST /control/pause` `.../resume` |
+| `/login <name> +<phone>` → `/code` → `/password` | `POST /control/reconcile`, `POST /control/probe` |
+| `/cancel` | `POST /control/shutdown` (no bot equivalent by design) |
+
+Rules agreed for the bot:
+
+- **Owner-only, fail-closed.** `TELEGRAM_OWNER_USER_IDS` (plus
+  `TELEGRAM_MAIN_ADMIN_USER_ID`) is required; with none set the bot refuses to
+  start rather than answering whoever finds it. A message from any other id is
+  dropped before its text is parsed — no reply, no echo, no "unauthorised".
+- **Private chats only.** In a group or channel it refuses, because a chat id that
+  contains the owner is not a chat the owner controls.
+- **It cannot touch content.** The Bot API gives it no read access to foreign
+  channels, no media download, no channel creation and no permission changes — and
+  this build gives it no file-sending method at all. It cannot be tricked into
+  leaking a file from the machine it runs on.
+- **Login secrets are transient.** Phone number, code and 2FA password exist in
+  memory for one attempt, their chat messages are deleted after use, the password is
+  cleared in a `finally`, and every outgoing line passes a scrubber that removes
+  session-shaped text — so an exception cannot print a session into the DMs.
+- **Bounded against Telegram's own limits.** 3 code requests per 10 minutes, 3 wrong
+  codes per flow; the third failure closes the flow instead of trying the account's
+  patience.
+- **Switchable off.** `BOT_ALLOW_LOGIN=0` once the session is stored: a deployment
+  that cannot start a login has one fewer door.
+- Destructive actions, mass messaging and privilege changes still require explicit
+  confirmation, and `/shutdown` remains HTTP-only: a kill switch that can be pressed
+  from a chat window is one lost phone away from being pressed by someone else.
 
 ## 17. Persistence, deployment, and continuity
 
@@ -273,8 +300,15 @@ generated from the manifest every time, in `quality_rank` order.
 
 - Jobs are idempotent and resume from the last completed stage; a database lock prevents two workers uploading the
   same file. No correctness depends on the ephemeral local filesystem.
-- The MTProto session is an encrypted Render environment secret — never in GitHub, never in Supabase as plaintext.
-  The operator enters phone number, login code, and 2FA password themselves; these are never shared with the agent.
+- The MTProto session never passes through a terminal, a file, or a chat with the agent: the control bot asks for
+  the phone number and code inside the deployment and stores the result in `app.telegram_session` (RLS on, zero
+  policies, `service_role` only, never selected into a reply or a log line). This replaces "an encrypted Render
+  environment secret" — there is no second secret in this architecture to encrypt it with, and a value that cannot
+  be read back by the operator is worse than one held in a table only the app can reach. `TELEGRAM_SESSION_STRING`
+  still wins when set, so an operator who prefers the environment route loses nothing.
+  Revocation is Telegram's own: Settings → Privacy and Security → Devices. `/forget` deletes our copy and says out
+  loud that it has not signed anything out.
+  The operator enters phone number, code and 2FA password themselves; these are never shared with the agent.
   The client cannot access Saved Messages, change 2FA, delete the account, or export unrelated private chats.
 - Honest limitation: Render free web services spin down after ~15 minutes of inactivity, may restart at any time, and
   are capped at ~750 instance hours per month. UptimeRobot reduces idle spin-down but cannot guarantee continuous
@@ -287,14 +321,17 @@ generated from the manifest every time, in `quality_rank` order.
 1. Season → sticker mapping (auto-detect on first run, else owner picks once) — pending live account connection.
 2. Join-request message template — operator deferred this.
 3. Storage bot command protocol — requires authenticated integration testing.
-4. Template refinements beyond the §12 defaults, if desired.
+4. Template refinements beyond the §12 defaults, if desired. The three §12 captions are still marked
+   `Temporary default` in `app.config`: they are correct enough to run and wrong enough to need a read.
+   Editing them is a `update app.config set value = ...` away, so no migration is required to accept them —
+   but a reviewable migration is the safer record if the operator wants the wording in git.
 
 ## 19. Repository status
 
 Requirements are agreed. The **runtime skeleton is now built and tested**:
 Supabase schema and queue functions, the checkpoint/resume worker loop, the
 health/status/kill-switch HTTP surface, config with fail-closed live-mode
-validation, and Render deployment as code. 166 tests pass, including the
+validation, and Render deployment as code. 376 tests pass, including the
 migrations executed against a real PostgreSQL cluster.
 
 What is **not** built: all Telegram I/O — source scanning, thumbnail screening,

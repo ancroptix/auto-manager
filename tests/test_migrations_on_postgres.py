@@ -814,7 +814,9 @@ def test_first_boot_installs_the_schema_into_an_empty_database(conn):
                    (select count(*) from app.config) as cfg
             """
         )
-        assert (counts["rel"], counts["fn"], counts["cfg"]) == (26, 14, 28)
+        # 0003 adds one table (app.telegram_session, which is what makes the
+        # control bot's /login possible) and four operator-tunable settings.
+        assert (counts["rel"], counts["fn"], counts["cfg"]) == (27, 14, 32)
         # A second boot must be a no-op, never a re-run that fights live data.
         assert await db.schema_missing() is False
         # And the installer is itself replayable.
@@ -1186,3 +1188,269 @@ def test_ingest_writes_the_rows_the_ladder_reads(conn):
             cur.execute("delete from app.source_channel where telegram_channel_id in (-100700001, -100700002)")
             cur.execute("delete from app.series where normalized_title like 'ingest %'")
     assert info["episode_key"].count("|") >= 3
+
+
+# ---------------------------------------------------------------------------
+# 0003_control_bot.sql — the session store the control bot writes into
+# ---------------------------------------------------------------------------
+
+
+def _clear_sessions(conn) -> None:
+    conn.execute("truncate table app.telegram_session")
+
+
+def test_the_session_table_enforces_what_the_bot_cannot_assume(conn) -> None:
+    """The database is the last line of defence for a value that *is* an account.
+
+    Each constraint here mirrors a mistake the bot could make: an unauthorised
+    caller writing a second live session, or a truncated string that would fail at
+    connect time with an error nobody can read.
+    """
+    _clear_sessions(conn)
+    filler = "1" + "A" * 300
+    with conn.cursor() as cur:
+        cur.execute(
+            "insert into app.telegram_session (name, kind, session_string, active) "
+            "values ('spare', 'user', %s, true)",
+            (filler,),
+        )
+        # a second *active* user session would mean two workers posting the same
+        # episode twice, so it is not merely untidy: it is refused
+        with pytest.raises(psycopg.errors.UniqueViolation):
+            cur.execute(
+                "insert into app.telegram_session (name, kind, session_string, active) "
+                "values ('other', 'user', %s, true)",
+                (filler,),
+            )
+        # ...while an inactive spare may exist beside it, which is what /use swaps
+        cur.execute(
+            "insert into app.telegram_session (name, kind, session_string) values ('other', 'user', %s)",
+            (filler,),
+        )
+        cur.execute("select count(*) from app.telegram_session")
+        assert cur.fetchone()[0] == 2
+    conn.rollback()
+    with conn.cursor() as cur:
+        cur.execute(
+            "insert into app.telegram_session (name, kind, session_string, active) values ('bot1', 'bot', %s, true)",
+            (filler,),
+        )
+        cur.execute("select count(*) from app.telegram_session where kind = 'bot' and active")
+        assert cur.fetchone()[0] == 1, "one live bot session must coexist with one live user session"
+        # a truncated session string is worse than none: it connects, then fails
+        with pytest.raises(psycopg.errors.CheckViolation):
+            cur.execute(
+                "insert into app.telegram_session (name, kind, session_string) values ('tiny', 'user', '1AAA')"
+            )
+        with pytest.raises(psycopg.errors.CheckViolation):
+            cur.execute(
+                "insert into app.telegram_session (name, kind, session_string) values ('ghost', 'wizard', %s)",
+                (filler,),
+            )
+        with pytest.raises(psycopg.errors.CheckViolation):
+            cur.execute(
+                "insert into app.telegram_session (name, kind, session_string) values ('Bad Name', 'user', %s)",
+                (filler,),
+            )
+    _clear_sessions(conn)
+
+
+def test_session_names_are_reused_not_multiplied(conn) -> None:
+    """`/login spare` twice must update one row: two rows under one name would mean
+    an ambiguous /use and an old credential the operator believes they replaced."""
+    _clear_sessions(conn)
+    filler = "1" + "B" * 300
+    with conn.cursor() as cur:
+        cur.execute(
+            "insert into app.telegram_session (name, kind, session_string, note) "
+            "values ('spare', 'user', %s, 'first')",
+            (filler,),
+        )
+        cur.execute(
+            "insert into app.telegram_session (name, kind, session_string, note) "
+            "values ('spare', 'user', %s, 'second') "
+            "on conflict (name) do update set session_string = excluded.session_string, "
+            "note = coalesce(excluded.note, app.telegram_session.note), last_used_at = now()",
+            (filler,),
+        )
+        cur.execute(
+            "select count(*), max(note), bool_or(last_used_at >= created_at) from app.telegram_session"
+        )
+        count, note, fresh = cur.fetchone()
+    assert (count, note) == (1, "second") and fresh is True
+    _clear_sessions(conn)
+
+
+def test_anon_and_authenticated_cannot_read_the_session_table(conn) -> None:
+    """RLS with zero policies plus explicit grants: the roles the API surface uses
+    must be refused, while service_role (the worker) is allowed."""
+    _clear_sessions(conn)
+    with conn.cursor() as cur:
+        cur.execute(
+            "insert into app.telegram_session (name, kind, session_string) values ('spare', 'user', %s)",
+            ("1" + "C" * 300,),
+        )
+        for role in ("anon", "authenticated"):
+            cur.execute(f"set role {role}")
+            with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                cur.execute("select session_string from app.telegram_session")
+            cur.execute("reset role")
+        cur.execute("set role service_role")
+        cur.execute("select name from app.telegram_session")
+        assert cur.fetchone()[0] == "spare"
+        cur.execute("reset role")
+    _clear_sessions(conn)
+
+
+def test_the_operator_tunables_from_0003_are_seeded(conn) -> None:
+    with conn.cursor() as cur:
+        cur.execute("select key, value::text from app.config where key like 'bot.%%' order by key")
+        rows = dict(cur.fetchall())
+    assert rows["bot.allow_login"] == "true"
+    assert rows["bot.login_ttl_seconds"] == "600"
+    assert rows["bot.delete_sensitive"] == "true"
+    # A command list, not a boolean: which commands exist is code, which ones the
+    # operator wants answered is configuration.
+    assert '"login"' in rows["bot.enabled_commands"] and '"cancel"' in rows["bot.enabled_commands"]
+def test_sessions_helpers_round_trip_against_real_postgres(conn) -> None:
+    """store/list/activate/forget against the real table, through the real asyncpg
+    wrapper — the SQL in app/sessions.py is otherwise only ever exercised by mocks.
+    """
+    import asyncio
+
+    from app.config import Settings
+    from app.db import Database
+    from app import sessions
+
+    _clear_sessions(conn)
+    settings = Settings(_env_file=None, database_url=pg_uri, db_ssl="disable", worker_enabled=False)
+    db = Database(settings)
+    secret = "1" + "D" * 299
+
+    async def scenario():
+        assert await db.connect()
+        try:
+            described = await sessions.store(
+                db, name="Spare", session_string=secret, account_id=4242, username="spare_account"
+            )
+            assert described["name"] == "spare", "names are normalised, not duplicated case-variants"
+            assert "session_string" not in described, "the metadata view must not carry the secret"
+            rows = await sessions.list_sessions(db)
+            assert [row["name"] for row in rows] == ["spare"]
+            assert rows[0]["length_chars"] == len(secret)
+            assert await sessions.active_session_string(db) == secret
+            assert sessions.masked(secret).endswith(f"chars>") and secret not in sessions.masked(secret)
+
+            # An explicit activate=False keeps the live account live: a second
+            # /login stores a credential without moving the pipeline onto it.
+            await sessions.store(
+                db, name="backup", session_string="1" + "E" * 250, note="second account", activate=False
+            )
+            assert await sessions.active_session_string(db) == secret
+            by_name = {row["name"]: row["active"] for row in await sessions.list_sessions(db)}
+            assert by_name == {"spare": True, "backup": False}
+            # switching is a deliberate act, and it demotes the previous one
+            assert await sessions.activate(db, "backup") is True
+            assert await sessions.active_session_string(db) == "1" + "E" * 250
+            assert await sessions.activate(db, "nobody") is False
+            by_name = {row["name"]: row["active"] for row in await sessions.list_sessions(db)}
+            assert by_name == {"spare": False, "backup": True}
+
+            with pytest.raises(ValueError):
+                await sessions.store(db, name="bad name", session_string=secret)
+            with pytest.raises(ValueError):
+                await sessions.store(db, name="spare", session_string="1AAA")
+
+            assert await sessions.forget(db, "BACKUP") is True
+            assert await sessions.forget(db, "backup") is False
+            names = [row["name"] for row in await sessions.list_sessions(db)]
+            assert names == ["spare"]
+        finally:
+            await db.close()
+
+    asyncio.run(scenario())
+    _clear_sessions(conn)
+
+
+def test_control_bot_login_writes_one_usable_row(conn) -> None:
+    """The whole login path against a real schema: reply text, stored row, and no
+    secret anywhere in the chat log.
+    """
+    import asyncio
+
+    from app.config import Settings
+    from app.controlbot import ControlBot, LoginResult
+    from app.db import Database
+    from app.sessions import active_session_string
+
+    _clear_sessions(conn)
+    secret = "1" + "F" * 280
+    settings = Settings(
+        _env_file=None,
+        app_name="auto-manager",
+        database_url=pg_uri,
+        db_ssl="disable",
+        worker_enabled=False,
+        telegram_owner_user_ids="7",
+    )
+    db = Database(settings)
+
+    class Transport:
+        async def send_code(self, phone):
+            return "hash"
+
+        async def sign_in(self, phone, code, code_hash, *, password=None):
+            return LoginResult(session_string=secret, account_id=99, username="spare_account")
+
+        async def discard(self, phone):
+            return None
+
+    class Api:
+        def __init__(self):
+            self.sent = []
+            self.deleted = []
+
+        async def get_updates(self, *, timeout=None):
+            return []
+
+        async def get_me(self):
+            return {"id": 1, "username": "ctrl"}
+
+        async def send(self, chat_id, text, *, reply_to=None, parse_mode=None):
+            self.sent.append(text)
+            return 5
+
+        async def delete(self, chat_id, *message_ids):
+            self.deleted.extend(mid for mid in message_ids if mid)
+            return len(self.deleted)
+
+        async def answer_callback(self, callback_id, text=""):
+            return None
+
+    from app.botapi import Update
+
+    async def scenario():
+        assert await db.connect()
+        api = Api()
+        try:
+            bot = ControlBot(
+                api=api, db=db, settings=settings, transport=Transport(), owner_ids=frozenset({7})
+            )
+            await bot.handle(Update(update_id=1, chat_id=7, from_id=7, from_username=None, text="/login spare +919876543210", message_id=11))
+            replies = await bot.dispatch(
+                Update(update_id=2, chat_id=7, from_id=7, from_username=None, text="482913", message_id=12)
+            )
+            assert replies and "stored as 'spare'" in replies[0].text
+            assert all(secret not in text for text in api.sent)
+            assert 12 in api.deleted, "the message that carried the code must be gone"
+            assert await active_session_string(db) == secret
+            with conn.cursor() as cur:
+                cur.execute("select name, account_id, username, note, active from app.telegram_session")
+                row = cur.fetchone()
+            assert row[0] == "spare" and row[1] == 99 and row[2] == "spare_account"
+            assert "control bot" in row[3] and row[4] is True
+        finally:
+            await db.close()
+
+    asyncio.run(scenario())
+    _clear_sessions(conn)

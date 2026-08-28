@@ -1,35 +1,80 @@
 # Render setup (and the honest limits of the free tier)
 
-The repository contains a `render.yaml` Blueprint, so Render creates and updates
-the service itself — you do not fill in a settings form field by field.
+There are two ways to create this service and both are supported. **Manual Web
+Service** is what this project actually runs on today; the Blueprint in
+`render.yaml` is the same configuration in a file, and becomes the better option
+once the branch is merged to `main` because it keeps env-var *names* (never values)
+and the start command in sync automatically.
 
-## 1. Deploy
+## 1a. Deploy — manual Web Service (current)
 
-1. Push this branch to your repo (or merge it to `main`).
-2. <https://dashboard.render.com> → **New + → Blueprint** → pick the
-   `auto-manager` repository → **Next**.
-3. Render reads `render.yaml` and lists the env vars marked `sync: false`.
-   Fill in:
+1. Push this branch to your repo.
+2. <https://dashboard.render.com> → **New +** → **Web Service** → pick the
+   `auto-manager` repository → **Connect**.
+3. Fill the form exactly like this:
+
+   | Field | Value |
+   | --- | --- |
+   | Name | `auto-manager` |
+   | Region | **Oregon (us-oregon)** — reliably has free instances; Singapore is ~80 ms closer to the Tokyo database if your account offers free there |
+   | Branch | `main` once merged, otherwise the branch you are testing |
+   | Root directory | *(blank — the repo root)* |
+   | Runtime | **Python 3** |
+   | Build command | `pip install -r requirements.txt` |
+   | Start command | `uvicorn app.main:app --host 0.0.0.0 --port ${PORT} --workers 1 --proxy-headers` |
+   | Instance type | **Free** |
+   | Health check path | `/health` |
+
+   `--workers 1` is not a preference: two processes means two queue loops. The
+   database lease still keeps them correct, but one process is what the design
+   assumes. `${PORT}` must stay as written — Render assigns the port and the app
+   refuses to bind a hardcoded one.
+4. Scroll to **Environment** and add these (Advanced → Add Environment Variable):
 
    | Key | Value |
    | --- | --- |
+   | `APP_MODE` | `shadow` for the first deploy |
    | `DATABASE_URL` | the Supabase **pooler** string from [setup-supabase.md](setup-supabase.md) |
+   | `DB_SSL` | `require` |
+   | `CONTROL_TOKEN` | any long random string (see step 5) |
    | `TELEGRAM_API_ID` | number from <https://my.telegram.org> → API development tools |
    | `TELEGRAM_API_HASH` | the hash on the same page |
-   | `TELEGRAM_SESSION_STRING` | output of `python scripts/login.py` **on your own computer** |
-   | `TELEGRAM_OWNER_USER_IDS` | your numeric Telegram user ID |
+   | `TELEGRAM_BOT_TOKEN` | the token from **@BotFather** — see [control-bot.md](control-bot.md) |
+   | `TELEGRAM_OWNER_USER_IDS` | your numeric Telegram user ID (from @userinfobot) |
    | `TELEGRAM_MAIN_ADMIN_USER_ID` | your main account's numeric ID |
-   | `CONTROL_TOKEN` | any long random string (see step 5) |
+   | `TELEGRAM_SESSION_SOURCE` | `both` |
+   | `BOT_ALLOW_LOGIN` | `true` while setting up |
+   | `PROBE_ON_BOOT` | `0` (flip to `1` once, later — see the last section) |
 
-   Leave `APP_MODE` as `shadow` for the first deploy.
-4. **Apply**. Build takes ~2 minutes.
+   `TELEGRAM_SESSION_STRING` is **not** in that list on purpose. You do not need it:
+   `/login` on the control bot puts the session in the database instead. Leave the
+   variable absent — an env value always wins over a stored one, so a stale copy
+   pasted here would silently override the live session.
+5. **Create Web Service**. Build takes ~2 minutes.
 
-Do not paste the session string, the code Telegram sent you, or your 2FA
-password into a chat, an issue, or a commit. `scripts/login.py` exists so those
-never leave your keyboard, and `scripts/check_secrets.py` (plus CI) fails the
-build if one is committed anyway.
+Do not paste the session string, the code Telegram sent you, or your 2FA password
+into a chat with a person, an issue, or a commit. The control bot is the one place
+a code may be typed — it deletes those messages, and `scripts/check_secrets.py`
+(plus CI) fails the build if a credential is committed anyway. `scripts/login.py`
+remains as the offline fallback for when Telegram's side of the login needs a
+different network path.
 
-## 2. Check it
+## 1b. Deploy — Blueprint (after merging)
+
+<https://dashboard.render.com> → **New +** → **Blueprint** → pick the repository →
+**Next** → Render reads `render.yaml` and prompts only for the vars marked
+`sync: false` (the secrets). Values in the file are applied as-is, which is why
+`APP_MODE=shadow` is committed: the first deploy must not be able to message
+anyone. Press **Apply**.
+
+## 2. Check it, then connect Telegram
+
+Before the table below, one log line decides everything else: the service prints
+`DATABASE_URL is NOT set…` when the variable never got **Saved**, and
+`control bot: enabled for N owner id(s)` when the bot came up. If a step below
+misbehaves, read those lines first — every failure mode in this project has been a
+variable that was typed into the wrong place.
+
 
 | URL | Expect |
 | --- | --- |
@@ -99,10 +144,18 @@ bot".
 
 ## 6. Updating
 
-`autoDeployTrigger: commit` means every push redeploys. On a push mid-upload the
+Only the Blueprint path auto-deploys: `autoDeployTrigger: commit` means every push redeploys. On a push mid-upload the
 instance is replaced; the job keeps its stage and boot reconciliation reclaims
 its lease. That is the designed path, not an edge case — but it is why long
 uploads are checkpointed per stage rather than at the end.
+
+## 7a. Driving it from Telegram instead of curl
+
+[control-bot.md](control-bot.md) is the operator's guide: creating the bot with
+@BotFather, `/login` (which is how the user session gets connected), `/status`,
+`/pause`, `/probe`, and how to close the login door afterwards. Everything it can
+do is also in the `/control/*` routes above — the bot is a phone-sized interface to
+the same switches, not a second set of permissions.
 
 ## 7. Logs
 

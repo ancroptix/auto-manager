@@ -142,7 +142,57 @@ async def status(request: Request) -> dict[str, Any]:
             )
         except Exception as exc:  # noqa: BLE001
             body["status_error"] = str(exc)[:300]
+        # Metadata only, and never the session string: this response is the one
+        # thing an operator pastes into a screenshot. A deployment whose migrations
+        # predate 0003 is reported as "not installed" rather than as an error, so
+        # the answer is "apply the bundle", not a stack trace.
+        try:
+            row = await db.fetchrow(
+                "select count(*) as total, count(*) filter (where active) as active, "
+                "max(last_used_at) as last_used_at from app.telegram_session"
+            )
+            body["telegram_sessions"] = dict(row) if row is not None else {"total": 0}
+        except Exception as exc:  # noqa: BLE001 - see above
+            detail = str(exc)
+            body["telegram_sessions"] = {
+                "state": "not installed",
+                "how": "run ops/apply-all.sql in the Supabase SQL Editor",
+                "detail": detail[:120],
+            }
+    body["control_bot"] = _control_bot_state(request)
     return body
+
+
+def _control_bot_state(request: Request) -> dict[str, Any]:
+    """Whether the owner's remote is actually listening.
+
+    Deliberately reported here and *not* as a `/ready` problem: a bot that cannot
+    poll costs the operator their phone interface, but the queue is still healthy,
+    and an alert for "Telegram is briefly unreachable" would train them to ignore
+    the alerts that matter.
+    """
+    settings = request.app.state.settings
+    if settings.telegram_bot_token is None:
+        return {"running": False, "state": "not configured", "how": "set TELEGRAM_BOT_TOKEN (from @BotFather)"}
+    if not settings.owner_ids:
+        return {
+            "running": False,
+            "state": "refused to start",
+            "why": "no TELEGRAM_OWNER_USER_IDS / TELEGRAM_MAIN_ADMIN_USER_ID: "
+            "a control bot with no owner list would obey whoever found the token",
+        }
+    bot = getattr(request.app.state, "control_bot", None)
+    error = getattr(request.app.state, "bot_error", None)
+    if error:
+        return {"running": False, "state": "failed to start", "why": str(error)[:200]}
+    stop_event = getattr(bot, "_stop", None) if bot is not None else None
+    running = bool(bot is not None and (stop_event is None or not stop_event.is_set()))
+    return {
+        "running": running,
+        "state": "polling" if running else "not running",
+        "login_enabled": bool(settings.bot_allow_login),
+        "owner_ids": sorted(settings.owner_ids),
+    }
 
 
 @router.post("/control/pause", dependencies=[Depends(control_dependency())])

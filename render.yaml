@@ -15,6 +15,11 @@
 #   * --workers 1       — one process, so exactly one queue loop runs. The DB
 #                         lease protects correctness if this ever changes.
 #   * sync: false       — secrets are entered in the dashboard, never committed.
+#   * region: oregon    — free instances are reliably available here. Singapore is
+#                         ~80 ms closer to the Tokyo Supabase pooler; switching costs
+#                         nothing but availability of the free plan differs by
+#                         region, so the safe default stays Oregon. The app is
+#                         indifferent either way.
 services:
   - type: web
     name: auto-manager
@@ -45,6 +50,22 @@ services:
       - key: TELEGRAM_OWNER_USER_IDS
         sync: false
       - key: TELEGRAM_MAIN_ADMIN_USER_ID
+        sync: false
+      # The owner's remote control (app/controlbot.py): create it with @BotFather's
+      # /newbot and paste the token here. The bot answers only its owner ids and
+      # is the operator's only interface: /status, /pause, /resume, /probe and
+      # /login, which is how a Telegram session gets connected without a terminal.
+      # Delete the value to fall back to HTTP-only control.
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      # "both" = prefer TELEGRAM_SESSION_STRING, else use the session /login stored.
+      - key: TELEGRAM_SESSION_SOURCE
+        value: both
+        sync: false
+      # Set to "false" once the account is connected: a deployment that cannot
+      # start a new login has one fewer door than one that can.
+      - key: BOT_ALLOW_LOGIN
+        value: "true"
         sync: false
       # One-shot protocol discovery (app/probe.py): set to "true" in the
       # dashboard, let it boot once, read the DM it sends the owner, then set it

@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 """One-time, local-only Telegram login that produces a StringSession.
 
+**This is the fallback, not the normal path.** The service can log the account in
+itself: message the control bot `/login spare +919876543210`, then the code it
+sends. That is the design, because the operator does not run Python (see
+docs/control-bot.md). Use this file instead when MTProto cannot be reached from the
+deployment's network, when you would rather the session never touch the database, or
+when you prefer typing a code into your own terminal than into any chat.
+
 Run this on YOUR OWN computer, not in chat, not in a shared terminal.
 
     pip install telethon
