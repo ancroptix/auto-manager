@@ -1,0 +1,244 @@
+"""The updates channel and the bot that makes its posts possible: @Link_providerobot.
+
+Three screenshots from the operator on 2026-08-28 showed a fourth flow, one this project had not
+named yet. Every series channel gets an announcement in a *separate, big* channel — the one with
+the audience — saying which episode was just added, with a link that opens the card holding that
+channel's invite. The steps, in the order the operator does them:
+
+1. The destination channel holds a **card post**: a picture (the series art with ``@YCANIME`` over
+   it) whose caption says ``Channel link`` and then carries the channel's own invite link.
+2. That message is **forwarded to @Link_providerobot**, which replies with one shareable link.
+3. The link goes into the **announcement** in the updates channel: series, season, which episode
+   was added, and the link.
+4. Nobody in the updates channel has to join anything to read it; the link opens the bot, and the
+   bot shows the card.
+
+Why the detour: the announcement channel has 33k strangers in it and the destination channel is
+private. The invite link therefore travels *inside a picture*, and the picture travels behind a
+bot link. Whether that is necessity or habit is one of the open questions below — this module
+records what was seen, not a theory about it.
+
+What is certain here is copied out of the screenshots verbatim, typo included (``Send A Message
+For To Get Your Shareable Link``). What is not certain is listed in :func:`still_unknown`, and the
+announcement shape is deliberately **absent** from ``captions.APPROVED_TEMPLATES``: no post is
+made from this module until the operator approves the box, exactly like every other caption.
+"""
+
+from __future__ import annotations
+
+import re
+from typing import Any
+
+__all__ = [
+    "BOT_USERNAME",
+    "BOT_DISPLAY_NAME",
+    "COMMAND",
+    "REQUEST_TEXT",
+    "REPLY_MARKER",
+    "SHARE_BUTTON",
+    "NOT_FOR_PROBE",
+    "deep_link",
+    "token_of",
+    "is_deep_link",
+    "parse_reply",
+    "card_caption",
+    "announcement_caption",
+    "announcement_matches_shape",
+    "still_unknown",
+    "summary",
+]
+
+#: The username as it appears in the link the bot itself sent (``t.me/Link_providerobot?start=…``),
+#: which is the only spelling that is evidence rather than a reading of a chat header.
+BOT_USERNAME = "Link_providerobot"
+BOT_DISPLAY_NAME = "Link provider"
+
+#: The verb the operator typed. It is the same word the storage bot lists for "store a single
+#: message or file" — see ``app/storagebot.py`` — which is a hint about that bot, not proof.
+COMMAND = "/genlink"
+
+#: Verbatim, including the article that should not be there. A bot's own wording is data.
+REQUEST_TEXT = "Send A Message For To Get Your Shareable Link"
+REPLY_MARKER = "Here is your link:"
+SHARE_BUTTON = "SHARE URL"
+
+#: Never sent by the probe. ``/genlink`` is not dangerous the way a moderation verb is, but it is
+#: not free either: it makes the bot mint a permanent link to something on the operator's account,
+#: and it only answers once a message has been forwarded to it — a probe does neither.
+NOT_FOR_PROBE = frozenset({"genlink", "share", "link"})
+
+# A bot username is only a bot username when it ends in ``bot``, so the suffix is part of the group
+# rather than a literal outside it: the recorded spelling has to survive a round trip. Telegram treats
+# the username case-insensitively, so the *match* ignores case and the *capture* keeps it — a link
+# written `t.me/LINK_ProviderBOT` is the same bot, and the post should print it as it was given.
+_LINK_RE = re.compile(
+    r"https?://t\.me/(?P<bot>[A-Za-z0-9_]*bot)\?start=(?P<token>[A-Za-z0-9_\-]+)", re.IGNORECASE
+)
+_INVITE_RE = re.compile(r"https?://t\.me/\+(?P<code>[A-Za-z0-9_\-]+)")
+
+#: The heading and note markers as they appear in both sampled announcements. The trailing ``”`` is
+#: in both of them, so it is a habit and not a slip of one message; it is kept for that reason and
+#: it is also the kind of thing to delete with one config row the day the operator says so.
+HEADING_MARK = "\U0001f353"  # strawberry, opens every heading line in that channel
+NOTE_MARK = "\U0001f617"
+NOTE_TAIL = "✨”"
+LINK_LABEL = "Click here to start and get episode"
+#: The observed post carries the link twice, on two lines, in the caption. Both samples do it.
+LINK_LINES = 2
+
+
+def deep_link(token: str, *, bot: str = BOT_USERNAME) -> str:
+    """The shareable URL for one ``start`` token."""
+    clean = str(token or "").strip()
+    if not clean:
+        raise ValueError("an empty start token would make a link that goes nowhere")
+    # The username is kept as recorded rather than folded to lowercase: this string is pasted
+    # into a public post, and it should read exactly like the one the bot sent.
+    return f"https://t.me/{bot.lstrip('@')}?start={clean}"
+
+
+def token_of(link: str | None) -> str | None:
+    """The ``start`` payload of a bot deep link, or None if this is not one.
+
+    The token is what has to be stored: the link is then always rebuilt from the bot's current
+    username, so a bot that renames itself does not invalidate every link already published.
+    """
+    match = _LINK_RE.search(str(link or ""))
+    return match.group("token") if match else None
+
+
+def is_deep_link(link: str | None) -> bool:
+    return token_of(link) is not None
+
+
+def parse_reply(text: str | None, *, bot: str = BOT_USERNAME) -> dict[str, Any]:
+    """Read one reply from the link bot into a link, or say it is not that yet.
+
+    Deliberately narrow. A reply is only a link when it carries the marker *and* a
+    ``t.me/<bot>`` deep link; a bot that answers "Send A Message…" is recorded as the request, and
+    anything else is ``unknown`` — never a link guessed from a stray URL, because a wrong link in
+    an announcement is a link 33k people are handed.
+    """
+    body = " ".join(str(text or "").split())
+    out: dict[str, Any] = {"kind": "unknown", "link": None, "token": None, "bot": None, "chars": len(body)}
+    if not body:
+        return out
+    if REQUEST_TEXT.casefold() in body.casefold():
+        out["kind"] = "asks_for_a_message"
+        return out
+    match = _LINK_RE.search(body)
+    if REPLY_MARKER.casefold() in body.casefold() and match:
+        out["kind"] = "link"
+        out["token"] = match.group("token")
+        out["bot"] = match.group("bot")
+        # The bot's own spelling of its username wins over the default, so a renamed bot does not
+        # turn every reply we already read into a link to somewhere else.
+        out["link"] = deep_link(match.group("token"), bot=match.group("bot"))
+    return out
+
+
+def card_caption(invite_link: str, *, repeats: int = LINK_LINES, words: str = "Channel link") -> str:
+    """The caption of the card post inside a destination channel (image 2's shape).
+
+    ``words`` is the only part of that line this module claims to know; the pointing-hand emoji that
+    follow it are visible in the screenshot but their exact count is listed as unread, so they are
+    left to the operator's own post rather than invented here.
+    """
+    link = str(invite_link or "").strip()
+    if not _INVITE_RE.fullmatch(link):
+        raise ValueError("a card caption carries a t.me/+ invite link, nothing else")
+    return "\n".join([words, ""] + [link] * max(1, int(repeats)))
+
+
+def announcement_caption(
+    series: str,
+    season: int | str | None,
+    episode: int | str | None,
+    link: str,
+    *,
+    style: str = "markdown",
+    repeats: int = LINK_LINES,
+) -> str:
+    """The updates-channel post, in the shape both samples had.
+
+    Two things this refuses to do. It does not accept an empty ``season``: every sampled heading
+    carried ``(S1)``/``(S4)``, and a bare series line in an announcement reads like the whole show
+    was added. And it does not emit a link it has not recognised: the announcement is the one place
+    where a hallucinated URL reaches strangers, so ``link`` must be a real ``?start=`` deep link.
+    """
+    name = str(series or "").strip()
+    if not name:
+        raise ValueError("an announcement names the series it is about")
+    if season is None or str(season).strip() == "":
+        raise ValueError("an announcement names the season; without it the line claims the series")
+    token = token_of(link)
+    if token is None:
+        raise ValueError("an announcement's link must be a t.me/<bot>?start= deep link, not any URL")
+    number = str(episode).strip().zfill(2) if str(episode or "").strip().isdigit() else str(episode or "").strip()
+    if not number:
+        raise ValueError("an announcement says which episode was added")
+    url = deep_link(token)
+    if style == "markdown":
+        lines = [f"[{LINK_LABEL}]({url})"] * max(1, int(repeats))
+    elif style == "text":
+        lines = [LINK_LABEL, url] * max(1, int(repeats))
+    else:
+        raise ValueError(f"unknown link style {style!r}: 'markdown' or 'text'")
+    return (
+        f"{HEADING_MARK} {name} (S{str(season).strip().lstrip('Ss')})\n\n"
+        f"{NOTE_MARK} Episode {number} Added...{NOTE_TAIL}\n\n"
+        + "\n".join(lines)
+    )
+
+
+def announcement_matches_shape(text: str) -> dict[str, Any]:
+    """What a caption already in the updates channel looks like to us.
+
+    ``reconciliation`` needs this in one direction only: when a post in that channel is *not* this
+    shape it is somebody's announcement (a special, a collab, a poll) and the app must not treat it
+    as ours or offer to edit it. It is not a matcher that decides a post is stale.
+    """
+    body = str(text or "")
+    heading = next((line for line in body.splitlines() if line.strip().startswith(HEADING_MARK)), None)
+    note = next((line for line in body.splitlines() if NOTE_MARK in line), None)
+    return {
+        "is_ours": bool(heading and note and LINK_LABEL in body),
+        "series_line": (heading or "")[len(HEADING_MARK) :].strip() or None,
+        "episode": (re.search(r"Episode\s+(\d+)", note or "").group(1) if note and re.search(r"Episode\s+(\d+)", note) else None),
+        "links": len(_LINK_RE.findall(body)),
+    }
+
+
+def still_unknown() -> tuple[str, ...]:
+    """What the three screenshots do not answer, and what ``storage_upload`` still waits on.
+
+    Kept as data because the doc prints this list and ``tests/test_linkprovider.py`` fails if the
+    two drift apart: an honest "we do not know yet" is the difference between a blocked job and a
+    guessed one.
+    """
+    return (
+        "who posts the announcement: your own account, @chelpbot, or the app's session — the sampled "
+        "posts carry text links and no button row, which is not how Channel Help composes one",
+        "whether the shareable link lives forever, or dies with the card message it was made from "
+        "(this decides whether the app may ever delete a card, and the answer is presumably no)",
+        "whether the link expires, is rate-limited, or stops working when the private invite it shows is "
+        "revoked and regenerated",
+        "what @Link_providerobot's /start menu holds besides /genlink, and whether it has the same "
+        "moderation verbs as the storage bot's menu (broadcast, ban, unban)",
+        "the exact emoji run in the card caption after the words 'Channel link' — visible, not counted",
+        "whether one updates channel serves every series (as it appears to now) or one per show, and "
+        "which channel it is by handle: the screenshots show it open by id, not by username",
+        "whether the announcement is owed per episode, per batch, or only when you say so",
+    )
+
+
+def summary() -> str:
+    """One line, read by ``app.probe.format_report``.
+
+    It belongs in the probe report because the operator is the one who has to answer the open
+    questions, and a report that asks without saying what is already known wastes their answers.
+    """
+    return (
+        f"{COMMAND} on @{BOT_USERNAME} takes a forwarded message and answers with a "
+        f"t.me/<bot>?start= link; {len(still_unknown())} questions still open"
+    )

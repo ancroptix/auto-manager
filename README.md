@@ -62,7 +62,8 @@ Owner private Telegram chat  (control commands, review queues, approvals)
 | Thumbnail screening (allowlist: `@YCAnime`, `@india_crunchyroll`) | built as a **gate** (`thumbnails.py`): with no image evidence it parks for review. Your correction — screening should rank and flag rather than block — is **not built yet** |
 | In-place publishing: caption the file post that is already there, pipeline unchanged (`/inplace`, [docs](docs/seasons-and-channels.md)) | policy, plan, mode and command built and tested; the `EditMessage` call itself is the unwired write layer |
 | Storage bot verbs (`/genlink`, `/batch`, `/custom_batch`, `/special_link`, `/universal_link`) | observed and recorded, with a drift check and an unsendable list ([docs](docs/storage-bot.md)) |
-| Archive copy, the storage bot's *reply protocol*, Channel Help adapter | **not built** — the menu is known; what each command asks for next is not, and one authenticated run (`/probe`) settles it |
+| Updates channel: card post → forward to `@Link_providerobot` → one shareable link → announcement ([docs](docs/updates-channel.md)) | flow and both post shapes recorded and tested; the probe may read that bot but never mint a link, and the announcement box is deliberately **not** approved yet |
+| Archive copy, the storage bot's *reply protocol*, Channel Help adapter | **not built** — the menu is known; what each command asks for next is not, and one authenticated run (`/probe`) settles it. `@Link_providerobot` answering `/genlink` with a forwarded-message-then-link is a hint about that verb, recorded as a hint |
 | Season sticker *posting*, join-request campaigns | **not built** — the pack's document ids and the request template are still open; the boundary logic above is not |
 
 ## Run it locally

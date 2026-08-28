@@ -177,7 +177,7 @@ have to be observed once, from inside your deployment, with your logged-in spare
 account.
 
 1. In Render → Environment, set `PROBE_ON_BOOT=1` and save (restarts the service).
-2. DM the bot `/probe`. It messages both bots the safe questions only — `/start`, `/help`,
+2. DM the bot `/probe`. It messages the three bots the safe questions only — `/start`, `/help`,
    `/id` — never anything that uploads, deletes or spends quota, and it refuses to send
    a second time in one run.
 3. A report comes back in the chat (it is capped at ~3,800 characters; if the menu is

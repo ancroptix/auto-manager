@@ -430,6 +430,7 @@ real edit goes out.
 | whose words were the series / the language / the quality? | `app.source_channel.declared_*`, mirrored into the candidate's `parsed` as `*_source` |
 | which publishing mode a destination uses, and which source it was compared with | `app.destination.publish_mode` / `paired_source_channel_id`, plus `app.source_channel.publish_role` |
 | who may write in a joined channel, and so whether a destination has to be built | `app.source_channel.we_are_admin`, read by `app.inplace.route_for` into `create_destination` |
+| the channel's own shareable identity, for the updates channel | a card post in the destination (picture + invite link) forwarded to `@Link_providerobot`; the `?start=` token it returns is what gets stored — `app.linkprovider` |
 | what the text under a file post said before we captioned it | `app.destination_post.caption_previous` (and `edits`, how often it was rewritten) |
 
 A decision that is only in a log line is a decision nobody can audit next month, which is

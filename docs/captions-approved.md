@@ -1,5 +1,11 @@
 # Approved captions and buttons
 
+*One shape is deliberately missing from this page: the updates-channel announcement. Its text is
+recorded in [docs/updates-channel.md](docs/updates-channel.md) and rendered by
+`app.linkprovider.announcement_caption`, but it is not in `APPROVED_TEMPLATES`, so nothing can send it
+until the operator says the box is right. That is the gate working, not a gap — say "approve the
+announcement box" and it becomes one row here.*
+
 The operator's own samples, as implemented. What is on this page is what a post
 will say — no code reading required to check it. If a line below is wrong, say
 which line: the fix is one row in `app.config`, not a deploy.

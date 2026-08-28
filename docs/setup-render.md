@@ -199,7 +199,7 @@ that filters MTProto. So the service probes itself, once, from inside Render:
    `PROBE_ON_BOOT` back to `0`.
 
 The same run is available on demand with `POST /control/probe` (bearer token), and
-it is safe by construction: only `/start`-class text to the two bots and the
+it is safe by construction: only `/start`-class text to the bots and the
 owner, no uploads, no forwards, no channel posts, no permission changes, and a
 hard message budget. A guard in `app/probe.py` rejects anything else — including
 anything a future edit of this file might try — and a test asserts that exactly

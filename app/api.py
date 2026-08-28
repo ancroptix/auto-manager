@@ -215,7 +215,7 @@ async def probe(request: Request) -> dict[str, Any]:
     """Run read-only protocol discovery against the storage bot and Channel Help.
 
     Started in the background and never awaited: the probe deliberately waits on
-    two bots' replies, which can take a minute, and a request that times out would
+    bots' replies, which can take a minute, and a request that times out would
     read as a failure while the probe was still running. The report is delivered to
     the owner as a DM, so nothing sensitive has to travel through an HTTP response.
     """

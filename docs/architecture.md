@@ -106,6 +106,8 @@ stage**, and a `reconciliation` job is enqueued. So it resumes at
 | Display order is 480p, 720p, 1080p regardless of arrival order | `v_episode_manifest` ordered by `quality_rank` | `test_manifest_orders_by_quality_not_arrival` |
 | A half-imported season never gets a "Complete Season" post | `v_season_coverage.season_complete` requires a file per episode **and** a declared span | `test_season_coverage_needs_files_not_just_row_counts` |
 | In-place captioning never overwrites a message's real note | `app.inplace.looks_like_label` (whole-string label patterns) + `ASK` | `test_anything_with_information_in_it_is_not` |
+| The updates channel's link is only ever a link the bot actually sent | `app.linkprovider.parse_reply` (marker **and** `?start=` link) | `test_the_request_and_the_reply_are_not_confused_with_each_other` |
+| A verb that mints a permanent link is not a probe's business | `app.linkprovider.NOT_FOR_PROBE`, checked before the allowlist | `test_widening_the_allowlist_does_not_enable_the_link_verb` |
 | The text a caption replaced still exists somewhere | `app.destination_post.caption_previous` | `test_a_replacement_carries_the_text_it_burned` |
 | Twelve files here and twelve there is twelve edits, not twelve copies | `SeasonShape.counts` -> `plan` | `test_twelve_files_against_twelve_files_is_twelve_edits_and_no_copies` |
 | A suspected renumbering copies nothing at all | `SeasonShape.numbering_shifted` short-circuits the copy branch | `test_the_renumbering_trap_copies_nothing_and_asks_instead` |

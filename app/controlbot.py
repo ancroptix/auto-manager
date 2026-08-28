@@ -390,7 +390,7 @@ class ControlBot:
         self.background(self._probe_task(update.chat_id))
         return [
             Reply(
-                "probe started. It asks both bots their menu questions and sends the report here "
+                "probe started. It asks the bots their menu questions and sends the report here "
                 "when it finishes (usually under two minutes)."
             )
         ]

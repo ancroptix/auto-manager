@@ -79,3 +79,9 @@ above, reporting three lists rather than one boolean:
 
 The bot's replies, links and buttons stay in `app.audit_log` and reach the operator as one
 paste-able message; nothing in this document is inferred from a reply we have not read.
+
+One exception to that last sentence, stated so it stays a hint and not a fact: `@Link_providerobot`
+answers the *same verb* (`/genlink`) by asking for a forwarded message and replying with a
+`t.me/<bot>?start=` link. That is recorded in [docs/updates-channel.md](docs/updates-channel.md) about
+*that* bot. It makes the storage bot's likely behaviour easier to predict and it settles nothing —
+the questions above stay open until `/probe` reads this bot's own replies.

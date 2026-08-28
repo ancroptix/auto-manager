@@ -70,6 +70,23 @@ episodes as files, each message saying nothing but `episode 7`. In that shape th
   the operator's own; leech channels re-watermark it). Re-rendering a thumbnail by downloading and
   re-uploading still requires asking first.
 
+### 2d. The updates channel (a fourth thing the app must know about, not a fifth pipeline)
+
+- The operator runs a separate **announcements channel** for the whole brand. When episodes land in a
+  series channel, that channel gets a post saying which series, which season, and which episode was added —
+  and a link. Nothing else happens there: no files, no requests.
+- The link is not the invite. It is a bot deep link — `@Link_providerobot` answers `/genlink` with "send me a
+  message", and the message it wants is a **forward of the series channel's card post** (the picture carrying
+  that channel's private invite in its caption). The bot replies with one `t.me/<bot>?start=` link, plus a
+  `SHARE URL` button.
+- So the object stored per series channel is that link, and the announcement is rendered from it. The token is
+  stored, not the URL, so a bot rename cannot rot a published post.
+- Recorded in `app/linkprovider.py` with its open questions, in [docs/updates-channel.md](docs/updates-channel.md).
+  The announcement shape is **not** in the approved caption templates, deliberately: describing a post and being
+  allowed to send it are two different permissions in this project.
+- Whether this mode changes anything about storage, publishing or deletion: it does not. The pipeline is the one
+  in §2c — caption the file, store it, take the link, post it — and an announcement is what follows a post.
+
 ## 3. Destination channels
 
 - A destination holds **captioned posts with links**, never the files themselves. A channel whose messages are bare

@@ -1,4 +1,4 @@
-"""Read-only discovery against the two bots, run from the deployed service.
+"""Read-only discovery against the three bots, run from the deployed service.
 
 Why this exists instead of me testing from the development sandbox: that sandbox
 can reach two hosts on the whole internet (GitHub and PyPI). TCP to Telegram's
@@ -15,7 +15,7 @@ be invented, and it is not stable enough to trust from documentation.
 
 Safety is the design here, not a disclaimer, and it is *enforced* rather than
 described: every outbound call goes through :func:`_send`, which raises
-:class:`ProbeViolation` unless the peer is one of the two bots or the owner **and**
+:class:`ProbeViolation` unless the peer is one of the three bots or the owner **and**
 the text is one of a dozen harmless commands. There is no code path in this module
 that can upload a file, forward a message, post in a channel, create a channel,
 change a permission, or answer a join request.
@@ -29,6 +29,9 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Sequence
 
+from .linkprovider import NOT_FOR_PROBE as LINK_MINTING_COMMANDS
+from .linkprovider import parse_reply as _parse_link_reply
+from .linkprovider import summary as _link_provider_summary
 from .storagebot import FORBIDDEN as FORBIDDEN_COMMANDS
 
 log = logging.getLogger("auto_manager.probe")
@@ -41,7 +44,14 @@ MAX_REPORT_CHARS = 3800
 
 #: Commands the storage bot offers that this program may never send, whatever else changes: its
 #: moderation tools act on people, which is not this pipeline's job. See ``app/storagebot.py``.
+#: ``LINK_MINTING_COMMANDS`` is the second half of the same idea, for @Link_providerobot: a verb
+#: that answers a forwarded message with a permanent link is not "dangerous", it is *not free*, and
+#: a read-only probe has no business spending one. See ``app/linkprovider.py``.
 FORBIDDEN_COMMANDS  # noqa: B018  (re-exported through the guard above; see may_send)
+_NEVER_SEND = frozenset(
+    {str(name).lstrip("/").casefold() for name in FORBIDDEN_COMMANDS}
+    | {str(name).lstrip("/").casefold() for name in LINK_MINTING_COMMANDS}
+)
 
 #: The only text this probe may ever send. Everything here is a menu-navigation
 #: command; nothing starts an upload, accepts a request, or talks to a person.
@@ -73,6 +83,9 @@ class ProbePolicy:
 
     storage_bot: str = "anime_hindifilesbot"
     channel_help: str = "chelpbot"
+    #: Third bot, learned from the operator's own screenshots rather than from a probe run: it is
+    #: what makes the updates channel possible, and its menu is still unmapped.
+    link_provider: str = "Link_providerobot"
     owner_user_id: int | None = None
     per_step_timeout: float = 25.0
     settle_seconds: float = 1.5
@@ -81,7 +94,11 @@ class ProbePolicy:
 
     @property
     def peers(self) -> set[str]:
-        allowed = {self.storage_bot.casefold().lstrip("@"), self.channel_help.casefold().lstrip("@")}
+        allowed = {
+            self.storage_bot.casefold().lstrip("@"),
+            self.channel_help.casefold().lstrip("@"),
+            self.link_provider.casefold().lstrip("@"),
+        }
         if self.owner_user_id is not None:
             allowed.add(str(self.owner_user_id))
         return allowed
@@ -89,7 +106,7 @@ class ProbePolicy:
     def may_send(self, peer: Any, text: str) -> bool:
         peer_key = str(peer).lstrip("@").casefold()
         wanted = str(text).strip().casefold().lstrip("/")
-        if wanted in {name.lstrip("/").casefold() for name in FORBIDDEN_COMMANDS}:
+        if wanted in _NEVER_SEND:
             # Checked before the allowlist, not after it. `SAFE_COMMANDS` is a list someone will
             # one day widen while testing by hand, and ``/broadcast`` is a command that has to
             # stay unsendable by a program however reasonable that widening looks at the time:
@@ -229,12 +246,17 @@ async def probe_bot(client: Any, username: str, *, policy: ProbePolicy, run: _Ru
             run.record(label, error=result["error"])
             return result
         text = _message_text(message)
+        recognised = _parse_link_reply(text)
         result["first"] = {
             "reply_chars": len(text),
             "reply": " ".join(text.split())[:900],
             "buttons": _describe_buttons(message),
             "has_media": bool(getattr(message, "media", None)),
             "from_bot": not bool(getattr(message, "out", False)),
+            # Recorded only when the reply is a shape we already know how to read. A bot that hands
+            # back a `t.me/<bot>?start=` link during a probe is a fact about the protocol, and it
+            # belongs in the report rather than in a screenshot someone has to compare by eye.
+            "reply_shape": recognised["kind"] if recognised["kind"] != "unknown" else None,
         }
     except ProbeBudget:
         result["error"] = "message budget reached before this bot was asked"
@@ -378,7 +400,7 @@ async def run_probe(
     db: Any = None,
     send: bool = True,
 ) -> dict[str, Any]:
-    """Probe the account and both bots, then report.
+    """Probe the account and the three bots, then report.
 
     ``send=False`` returns the report instead of delivering it — what the tests
     use, and what a dry run should do.
@@ -393,12 +415,22 @@ async def run_probe(
         except Exception as exc:  # noqa: BLE001
             log.warning("probe could not read configured channels: %s", exc)
 
-    report: dict[str, Any] = {"account": {}, "storage_bot": {}, "channel_help": {}, "steps": run.steps}
+    report: dict[str, Any] = {
+        "account": {},
+        "storage_bot": {},
+        "channel_help": {},
+        "link_provider": {},
+        "steps": run.steps,
+    }
     try:
         report["account"] = await probe_account(client, policy=policy, run=run, expected=expected)
         report["storage_bot"] = await probe_bot(client, policy.storage_bot, policy=policy, run=run, label="storage_bot")
         if not run.out_of_time:
             report["channel_help"] = await probe_bot(client, policy.channel_help, policy=policy, run=run, label="channel_help")
+        if not run.out_of_time:
+            report["link_provider"] = await probe_bot(
+                client, policy.link_provider, policy=policy, run=run, label="link_provider"
+            )
     except ProbeBudget as exc:
         report["stopped"] = str(exc)
         log.info("probe stopped at its own budget: %s", exc)
@@ -474,10 +506,15 @@ def format_report(report: dict[str, Any]) -> str:
     if missing:
         lines.append("  configured but NOT visible: " + ", ".join(str(m.get("want")) for m in missing[:8]))
 
-    for label, key in (("storage bot", "storage_bot"), ("channel help", "channel_help")):
+    for label, key in (("storage bot", "storage_bot"), ("channel help", "channel_help"), ("link provider", "link_provider")):
         section = report.get(key) or {}
         lines.append("")
         lines.append(f"{label}: @{section.get('username') or '?'}")
+        if key == "link_provider":
+            lines.append(f"  already known: {_link_provider_summary()}")
+        shape = (section.get("first") or {}).get("reply_shape")
+        if shape:
+            lines.append(f"  reply shape observed: {shape}")
         if section.get("error"):
             lines.append(f"  error: {section['error']}")
             continue

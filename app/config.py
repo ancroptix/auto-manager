@@ -143,7 +143,7 @@ class Settings(BaseSettings):
     # Run the read-only protocol probe (app/probe.py) once after boot and DM the
     # report to the owner. Exists because protocol discovery cannot happen from a
     # development machine whose network filters Telegram, only from the deployed
-    # service. Off by default: it talks to two bots on the operator's account.
+    # service. Off by default: it talks to three bots on the operator's account.
     probe_on_boot: bool = False
     campaign_rate_per_hour: int = Field(default=20, ge=1, le=500)
 

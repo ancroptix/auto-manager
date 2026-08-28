@@ -223,10 +223,12 @@ class TestProbeBehaviour:
     def test_only_start_is_sent_and_the_report_comes_back(self) -> None:
         client = FakeClient()
         report = run(run_probe(client, policy=policy(), send=False))
-        assert client.texts == ["/start", "/start"]  # two bots, one command each
-        assert client.peers == ["anime_hindifilesbot", "chelpbot"]
+        # Three bots now, one command each: the link provider joined the list because its menu is
+        # the last unread half of a flow the operator already runs by hand.
+        assert client.texts == ["/start"] * 3
+        assert client.peers == ["anime_hindifilesbot", "chelpbot", "Link_providerobot"]
         assert report["storage_bot"]["first"]["buttons"][0]["text"] == "Cancel"
-        assert report["messages_sent"] == 2
+        assert report["messages_sent"] == 3
         assert "delivery" not in report
 
     def test_scary_buttons_are_never_pressed(self) -> None:
@@ -242,11 +244,11 @@ class TestProbeBehaviour:
         assert [p["button"] for p in pressed if not p.get("skipped")] == ["Cancel"]
         # The click coordinates are the real assertion: the probe must have asked
         # to press row 2 (Cancel), and only that.
-        # One click per probed bot, both on the Cancel row. The same fake message
-        # object answers both bots, so the count is the check that nothing else
+        # One click per probed bot, all three on the Cancel row. The same fake message
+        # object answers every bot, so the count is the check that nothing else
         # was pressed while the set is the check that only that button was.
         assert set(client.message.clicks) == {(2, 0)}
-        assert len(client.message.clicks) == 2
+        assert len(client.message.clicks) == 3
 
     def test_url_buttons_are_reported_not_visited(self) -> None:
         client = FakeClient(buttons=[[FakeButton("Open store", url="https://example.com/premium")]])
@@ -299,7 +301,7 @@ class TestProbeBehaviour:
         report = run(run_probe(client, policy=policy(), send=True))
         assert report["delivery"].startswith("sent to owner id=999")
         peers = {str(peer) for peer in client.peers}
-        assert peers == {"anime_hindifilesbot", "chelpbot", "999"}
+        assert peers == {"anime_hindifilesbot", "chelpbot", "Link_providerobot", "999"}
 
     def test_no_owner_means_no_delivery(self) -> None:
         client = FakeClient()

@@ -55,10 +55,20 @@ DEPENDENCIES: dict[str, str] = {
     JobKind.STORAGE_UPLOAD.value: (
         "the @anime_hindifilesbot menu is known (app/storagebot.py: /genlink, /batch, "
         "/custom_batch, /special_link, /universal_link); what each command asks for next, and "
-        "the link shape it replies with, are what one authenticated run still has to read back"
+        "the link shape it replies with, are what one authenticated run still has to read back. "
+        "@Link_providerobot answers /genlink with 'Send A Message For To Get Your Shareable Link' "
+        "and then a t.me/<bot>?start= link (app/linkprovider.py) — a sibling of the same verb, "
+        "which narrows the guess without replacing the observation"
     ),
     JobKind.LINK_VERIFY.value: "link liveness probe",
-    JobKind.PUBLISH_POST.value: "ChannelHelpPublisher adapter",
+    # The publisher has two audiences, and only one of them is a series channel: the episode post
+    # goes to the destination, and the updates channel is owed a short announcement carrying the
+    # link-provider deep link. Its shape is recorded in ``app/linkprovider.py`` and deliberately not
+    # yet in ``captions.APPROVED_TEMPLATES``, so it cannot be sent before the operator approves it.
+    JobKind.PUBLISH_POST.value: (
+        "ChannelHelpPublisher adapter, plus the updates-channel announcement that follows each "
+        "episode post (app/linkprovider.py: shape known, box not approved)"
+    ),
     JobKind.EDIT_POST.value: "ChannelHelpPublisher adapter (in-place quality edits)",
     JobKind.SEASON_STICKER.value: "sticker-pack label mapping (S1, Season 2, ...)",
     JobKind.JOIN_REQUEST_CAMPAIGN.value: "owner-approved campaign sender with per-hour pacing",
