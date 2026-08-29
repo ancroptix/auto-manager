@@ -247,7 +247,9 @@ async def probe_bot(client: Any, username: str, *, policy: ProbePolicy, run: _Ru
             run.record(label, error=result["error"])
             return result
         text = _message_text(message)
-        recognised = _parse_link_reply(text)
+        # The peer we are standing in front of is the *expected* bot here, so a link belonging to
+        # one of its siblings is reported as what it is instead of flattering the report.
+        recognised = _parse_link_reply(text, bot=username)
         result["first"] = {
             "reply_chars": len(text),
             "reply": " ".join(text.split())[:900],

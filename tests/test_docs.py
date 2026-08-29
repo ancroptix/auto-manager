@@ -186,6 +186,28 @@ def test_the_kill_switch_stays_http_only_in_every_doc() -> None:
     assert "/control/shutdown" in read("docs/setup-render.md")
 
 
+def test_the_spec_records_this_weeks_storage_decisions() -> None:
+    """Decisions that arrived after the spec was written have to be *in* the spec.
+
+    Three of them change what the storage job must do, so a reader of §10 alone should get them:
+    the batch granularity, what a link's permanence does to our publishing rules, and the fact
+    that the bots are our own clones (which is why the clone's @username is now load-bearing).
+    """
+    spec = " ".join(read("docs/requirements-draft.md").split())
+    for decision in (
+        "one batch per episode holding every quality",
+        "a link works forever",
+        "nothing published may reference a message id inside the bot chat",
+        "our own clones",
+        "Never rename a clone that has published links",
+    ):
+        assert decision in spec, f"§10 lost the decision: {decision!r}"
+    assert "deleted after 5 minutes" in spec, (
+        "the deletion notice needs its scope stated next to the permanence claim"
+    )
+    assert "Public or Private Mode" in spec, "the mode question has to be visible in the spec too"
+
+
 def test_readme_points_at_the_control_bot() -> None:
     readme = read("README.md")
     assert "control-bot.md" in readme and "TELEGRAM_BOT_TOKEN" not in readme.split("```")[1::2][-1], (

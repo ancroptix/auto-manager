@@ -249,11 +249,27 @@ Both handles are primary and always appear together.
   plus `/broadcast`, `/ban`, `/unban`.
 - **Never sent by this program:** `/broadcast`, `/ban`, `/unban`. They act on people, and the refusal is checked
   before the probe's own allowlist so widening that list during testing cannot grant the capability.
-- What the menu does **not** answer — and therefore what still keeps `storage_upload` blocked instead of implemented:
-  what each command asks for next, whether the reply is a message or a button, the shape and lifetime of a link,
-  whether a batch can be appended to, what "moderators only" is moderation *of*, and whether a link can be revoked.
-  The operator will not screen-record the flow, so one authenticated run reads those back; `/probe` re-reads the menu
-  and reports any drift against the recorded copy.
+- What the `/batch` flow **does** answer (operator's screenshots, 2026-08-29, recorded in `docs/storage-bot.md` and
+  `app.storagebot.BATCH_FLOW`): `/batch` asks for the first message of a range and then the last, as a tagged forward
+  or a link, and answers `Here is your link:` with one `t.me/<bot>?start=` link plus a `SHARE URL` button. Opening it
+  re-sends the whole range verbatim, source labels and `❌ END OF SEASON ❌` included.
+- **Batch granularity, decided by the operator on 2026-08-29:** one batch per episode holding every quality of that
+  episode, plus one final batch covering the whole season. A batch is a range, so neighbouring files are one batch and
+  no re-indexing is needed; `/custom_batch` is the fallback for a season whose qualities are scattered.
+- **Link lifetime:** the operator's word (2026-08-29) is that a link works forever, and that "all messages will be
+  deleted after 5 minutes" is the clone's autodelete acting on the *delivered copy* — a switch the owner can change,
+  present so that a copyright claim does not land on the bot, which is why the bot tells users to save the files. Two
+  rules follow: nothing published may reference a message id inside the bot chat, and this program never deletes
+  anything whatever the clone is set to do.
+- **These bots are our own clones** of `@Md_Files_Store_Bot`, made with `@Md_CloneManagerBot` (vendor channel
+  `t.me/venombotupdates`). So "moderators only" is our own moderator list, "your clones" is our own set (up to three
+  per Telegram account), and the clone's `@username` is load-bearing: a published link embeds it, and the vendor's
+  parent bots get renamed or deleted every year or so while clones keep serving. Never rename a clone that has
+  published links, and keep the clone as a member with access in every private source channel.
+- What still keeps `storage_upload` blocked instead of implemented is the write layer (forward, read the reply back,
+  store the token) plus `app.storagebot.still_unknown()`: whether a link is a reference to the source post or a copy
+  the clone made, whether a batch can be appended to, whether the clone is in Public or Private Mode, whether "No
+  Forward" is on, and the rate limit. `/probe` re-reads the menu and reports any drift against the recorded copy.
 - Files go to the archive/storage workflow; destination channels receive text/link posts only.
 - Missing-quality flow: upload only the new variant → add to the ordered manifest → rebuild or extend the batch /
   universal link → edit the existing destination post in place. Never resend the season sticker or create a second

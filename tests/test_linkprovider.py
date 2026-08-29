@@ -45,11 +45,33 @@ def test_the_link_is_read_only_when_the_reply_actually_is_one() -> None:
 
     # A link written in another case comes back in *that* case. Usernames are case-insensitive to
     # Telegram, but a public post should read like the bot's own message, not like a normalised key.
+    # The spelling has to be the same *name*, only folded differently: a different bot is a
+    # different subject (see the test below), not a casing question.
     shuffled = linkprovider.parse_reply(
-        f"{linkprovider.REPLY_MARKER}\n\nhttps://t.me/LINK_ProviderBOT?start={SAMPLE_TOKEN}"
+        f"{linkprovider.REPLY_MARKER}\n\nhttps://t.me/link_providerobot?start={SAMPLE_TOKEN}"
     )
-    assert shuffled["link"].startswith("https://t.me/LINK_ProviderBOT?start=")
+    assert shuffled["kind"] == "link"
+    assert shuffled["link"].startswith("https://t.me/link_providerobot?start=")
     assert shuffled["token"] == SAMPLE_TOKEN
+
+
+def test_a_sibling_clone_with_the_same_words_is_not_the_answer() -> None:
+    """The bug this check exists for: both bots in this family say "Here is your link:".
+
+    @anime_hindifilesbot is the storage clone and @Link_providerobot mints the announcement link, and
+    they are clones of one manager, so the sentence and the ``BQADAQAD`` token family are shared. A
+    reply that carries a link to *some other* bot is therefore not the reply we asked for, and storing
+    it as ours would publish a stranger's deep link to 33k people. The host is the identity.
+    """
+    sibling = f"{linkprovider.REPLY_MARKER}\n\nhttps://t.me/anime_hindifilesbot?start={SAMPLE_TOKEN}"
+    parsed = linkprovider.parse_reply(sibling)
+    assert parsed["kind"] == "link_from_another_bot"
+    assert parsed["link"] is None and parsed["token"] is None
+    assert parsed["bot"] == "anime_hindifilesbot", "the name of who really answered is kept"
+
+    # Asked the other way round, the same text is a perfectly good link.
+    storage = linkprovider.parse_reply(sibling, bot="anime_hindifilesbot")
+    assert storage["kind"] == "link" and storage["token"] == SAMPLE_TOKEN
 
 
 def test_the_request_and_the_reply_are_not_confused_with_each_other() -> None:

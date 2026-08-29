@@ -237,14 +237,15 @@ machinery, none of which applies to a notice board).
 
 ## What it does not settle
 
-1. whether the link expires, is rate-limited, or stops working when the private invite it shows is revoked and regenerated — the question that decides whether an old announcement is a dead end
+1. whether the link is rate-limited, or stops working when the private invite it shows is revoked and regenerated. Whether it *expires* was answered on 2026-08-29 by the operator, whose bots are clones of one manager: the link works forever, and the deletion notice a user sees is about the copy delivered to them, not the stored message (see [docs/storage-bot.md](storage-bot.md))
 2. what @Link_providerobot's /start menu holds besides /genlink, and whether it has the same moderation verbs as the storage bot's menu (broadcast, ban, unban)
 3. the exact emoji run in the card caption after the words 'Channel link' — visible, not counted
 4. whether this session's account can post in the updates channel at all: /probe reads our own rights from the dialog list (app/rights.py) and writes them, and until that has run, the first announcement is a guess about a channel this account may only be able to read
 
-Each of those has a next step that is a run on a channel we control rather than a guess. The one about
-expiry decides whether an old announcement rots; the one about rights answers itself the first time
-`/probe` runs, because `app/rights.py` reads our own admin status out of the dialog list and records
+Each of those has a next step that is a run on a channel we control rather than a guess. Expiry is no
+longer one of them — the operator answered it on 2026-08-29, and the risk that remains is not the link
+rotting but the invite *inside* the card being regenerated while every old announcement keeps pointing
+at the old one. The question about rights answers itself the first time `/probe` runs, because `app/rights.py` reads our own admin status out of the dialog list and records
 it. Listing them here is deliberate: a closed list of unknowns is a to-do list, and an empty one would
 be a lie.
 

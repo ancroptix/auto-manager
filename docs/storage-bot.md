@@ -6,9 +6,13 @@ outside: it answers a menu, takes a forwarded message, and hands back a link. So
 arrived cheaper than expected: the operator sent screenshots of the bot's own command list on
 2026-08-28.
 
-That is *menu text*, which is worth recording exactly and worth re-checking, and it is not the
-protocol. This document is the difference between the two, kept in the repo because a screenshot
-in a chat is how a protocol ends up half-remembered.
+That is *menu text*: worth recording exactly, worth re-checking, and not the protocol. The
+protocol arrived the next day — five screenshots of the operator running `/batch` in their own clone
+of this bot — and the answer to the question behind it ("whose bot is this, anyway?") turned out to be
+the more useful half.
+
+This document is the difference between a menu, a conversation, and a vendor's claim, kept in the repo
+because a screenshot in a chat is how a protocol ends up half-remembered.
 
 ## The menu, verbatim
 
@@ -32,6 +36,54 @@ last column is ours, and is a plan, not a fact about the bot.
 The same list lives in code as `app.storagebot.MENU`, and a test fails if this table stops
 matching it, because the useful half of a recorded menu is knowing the day it changes.
 
+## The `/batch` flow, as it was run
+
+From the operator's five screenshots of 2026-08-29, in their own clone of the bot (chat title *Anime
+files*, username `Anime_hindifilesbot`, web.telegram.org). The two prompts are quoted the way the bot
+wrote them — capitalisation and doubled dots included — because they are the strings a future handler
+has to recognise, and `app.storagebot.BATCH_FLOW` holds the same two lines.
+
+1. `/batch`.
+2. The bot asks: "Forward The Batch First Message From your Batch Channel (With Forward Tag).. or Give Me Batch First Message link from your batch channel"
+3. The operator forwards a tagged post from the source channel — the screenshot shows
+   `➡️ Forwarded from 🍉 The beginning after the end in hindi Episode 10`.
+4. The bot asks: "Forward The Batch Last Message From Your Batch Channel (With Forward Tag).. or Give Me Batch last message link from your batch channel"
+5. The operator forwards the last post of the range, which in their run was `❌ END OF SEASON ❌`.
+6. The bot answers `Here is your link:` with `https://t.me/Anime_hindifilesbot?start=BQADAQAD…` and a
+   green `⤴️ SHARE URL` button.
+
+A single file took the same shape, with the answer labelled `Episode10Hindi.mp4`.
+
+**What a range is.** Opening the link sends that token back to the bot, and the bot re-sends *every
+message in the range, verbatim*: the video messages (each captioned with the source filename, e.g.
+`[@Anime_Hindi_Files] season 01 episode 10 480p.mkv`, one of them missing its season number), the
+source channel's own plain-text `Episode 10` label messages, and the closing `❌ END OF SEASON ❌`
+post. A batch is a replay of a stretch of a channel, not a set of files re-indexed by the bot. Two
+things follow:
+
+- Four qualities of one episode sitting next to each other *are* one range, which is why the
+  granularity the operator chose on 2026-08-29 — one batch per episode holding every quality, plus
+  one final batch for the whole season — needs no new machinery, and why `/custom_batch` (an explicit
+  message list) is the fallback for a season whose qualities do not sit together rather than the
+  default.
+- Whatever the source channel wrote rides along to the user. Our captions live in the destination
+  post; nothing inside the bot's chat is ours to tidy, and nothing there is fixed by editing our post.
+
+**What is ephemeral, and what is not.** One screenshot's side panel warns: `⚠️ Important: All
+Messages will be deleted after 5 minutes. Please save or forward these messages to avoid losing them!`
+That is the clone's autodelete setting acting on the *delivered copy* in a user's chat — a switch on
+the owner's `/settings` screen, not a property of the link. The link's own future is the opposite: the
+operator's word on 2026-08-29 is that it works forever. The rule for us comes straight out of that
+split: **a post we publish may carry the `?start=` link and never a reference to a message id inside
+the bot chat**, because the chat's contents are the part on a timer.
+
+**Which bot answered comes from the link, not the sentence.** `Here is your link:` and the
+`BQADAQAD…` token family belong to `@Link_providerobot` too (see
+[docs/updates-channel.md](updates-channel.md)), and the storage bot's menu offers the same verb
+(`/genlink`) as that bot. Wording is evidence about a protocol; only `t.me/<bot>` is evidence about an
+identity. `app.linkprovider.parse_reply` therefore checks the link's host against the bot that was
+asked and reports `link_from_another_bot` instead of pretending.
+
 ## What this settles
 
 * **the verbs.** One file is `/genlink`; a whole channel is `/batch`; an explicit list of messages
@@ -42,27 +94,91 @@ matching it, because the useful half of a recorded menu is knowing the day it ch
   They are in `app.storagebot.FORBIDDEN`, and :func:`app.probe.ProbePolicy.may_send` refuses them
   before it consults its own allowlist — so widening that allowlist by hand during testing does not
   make the probe able to broadcast.
-* **that two of the useful ones are moderator-gated.** `/special_link` and `/universal_link` both
-  say so in their own help text. What "moderator" means there — of the bot's service, or of the
-  channel the messages come from — is the first thing the authenticated run has to find out,
-  because a season-batch design that assumes an editable link cannot fall back to one that does
-  not exist.
+* **that two of the useful ones are moderator-gated, and the gate is ours.** `/special_link` and
+  `/universal_link` both say so in their own help text. The vendor's channel answers what that means:
+  *"Moderators have access to all your clone features, include broadcasting"* — a moderator is somebody
+  the **owner of the clone** appoints, not a moderator of the channel the files came from. So the gate
+  is not a stranger's permission to wait for. What is still unread is whether this account is actually
+  on that list (item 3 below).
+* **whose service this is.** Every storing and linking bot on this deployment is the operator's *own
+  clone*, made and managed by `@Md_CloneManagerBot`. That sentence is worth its weight: the deletion
+  timer, force-subscribe, "No Forward", the moderator list, and Public vs Private Mode are settings we
+  own, not limits somebody else imposes. The details and the dates are in the next section.
+* **one link per range, and its lifetime.** A batch is one range between two messages and produces one
+  link; the link does not expire (the operator, 2026-08-29). Both halves of "publish a link and never
+  touch it again" are therefore allowed to be lazy — the *durable* object is the token, and the
+  destination post is the archive.
+* **whether the bot needs to be an admin.** A public channel does not: the vendor says it in one line,
+  *"able to generate shareable link for messages from any public channel without bot admin in there.
+  (For private channel bot must be admin in there)"*, and the operator said the same thing
+  independently. Our private sources are the case that binds us — the clone stays a member with the
+  rights it has, because that is what the links read through.
 
 ## What it does not settle
 
 The questions below are why `storage_upload` stays a blocked job instead of a confident guess.
-They are the exact list one authenticated run can answer, and `tests/test_storagebot.py` checks
-that this list and `app.storagebot.still_unknown()` stay the same length — a doc that says "eight"
-while the code lists nine is the kind of lie that only ever helps nobody:
+Most of them are what one authenticated run can answer; three are a switch on the owner's
+`/settings` screen rather than a mystery, which is why they are cheap to settle and still worth
+naming. `tests/test_storagebot.py` checks that this list and `app.storagebot.still_unknown()` stay the
+same length — a doc that says nine while the code lists eight is the kind of lie that only ever
+helps nobody:
 
-1. what each command asks for after it is sent (a forwarded message id? a file? a channel handle? a number of messages?)
-2. whether the answer is a text message with a URL, or a button, or both
-3. the shape and lifetime of a link: does it expire, and is it a t.me link to a stored copy or a redirect the bot serves itself?
-4. whether a batch can be appended to later, or whether adding one quality means a new link and therefore an edited destination post
-5. what 'moderators only' means for /special_link and /universal_link: moderator of the bot's service, or of the channel the messages come from
-6. what 'your clones' are for /universal_link, and whether we get one, several, or none
+1. whether a batch link can be appended to later, or whether /special_link's "edit" means re-issuing the range and then editing the destination post that carries the new link
+2. whether a link is a *reference* to the post in the source channel or a copy the bot made for itself: the vendor advertises "no db channel required", which points at a reference, and a reference is only as durable as the message it points at — this is the question that decides how much our zero-deletion rule is protecting other people's links
+3. which rights our account actually has on our own clone: the moderator list that /special_link and /universal_link are gated by is ours to fill, and nobody has read it yet
+4. whether the clone is in Public Mode ("any telegram user can generate shareable & shorten links using clone") or Private Mode, since a clone that can read a private channel and is open to strangers is a private channel anyone can hand out links from
+5. whether "No Forward" or content protection is on, which would contradict the bot's own advice to save files and would have to be checked against our first step, which is a forward out of the source channel
+6. what the deletion timer really covers — the operator can set it, and what it takes away is the delivered copy, not the stored message — which is why no post of ours may ever reference a message id inside the bot chat
 7. whether a link can be revoked, and what a revoked link does to a post that already carries it
-8. rate limits per account, since the free tier cannot afford a retry storm
+8. rate limits per account, since the free tier cannot afford a retry storm. One half of the link's future is answered already: the operator's word (2026-08-29) is that a link does not expire, and that the deletion notice covers only the copy delivered to a user and not the stored message — so what a published post still risks is a rate limit, and a regenerated invite behind the card while every old post goes on pointing at the old one
+
+## Where this bot comes from, in its vendor's own words
+
+The operator's answer to "whose bot is this?" was a name: their storing and linking bots are clones of
+`@Md_Files_Store_Bot`, created and managed by **`@Md_CloneManagerBot`**, whose announcements channel is
+<https://t.me/venombotupdates>. Read on 2026-08-29, posts spanning Dec 2022 → Apr 2025. **This is the
+vendor's word, not an observation of ours** — nothing below is treated as a fact about *our* clone, and
+the four open questions that depend on it are in the list above rather than in code.
+
+* **The manager is not the file bot.** "@Md_CloneManagerBot can only be used to create and manage your
+  file store bot clones", and *"up to 3 clones per Telegram account"*. So there is no third-party
+  service to petition: the bot our links point at is one we made.
+* **The parent handles keep dying; the clones do not.** The channel's own history names bot after bot
+  as deleted (`@md_filestore_bot` in Dec 2023, `@MdFileStoreBot` and `@MdFileStore_Bot` in Oct 2024,
+  `@Md_FilesStore_Bot`, `@MdFileStorev2_Bot`) and each time repeats *"Clones are still functioning as
+  before"* — including twice for the manager itself, whose current handle is the one the operator
+  quoted. Our design consequence: depend only on our clone's username and token, never on the manager
+  or a parent bot.
+* **A link is a username plus a token.** `t.me/<bot>?start=…`. Nothing in Telegram re-points a link
+  already published when a bot is renamed or its handle is freed and taken by somebody else, so the
+  clone's @username is *permanent from the first published post*: rename it, and every old post points
+  at a stranger. `app.linkprovider.token_of` keeps the token so we can rebuild links for **future**
+  posts; it cannot rescue a past one.
+* **Public Mode vs Private Mode.** The vendor: *"Public Mode: Any telegram user can generate shareable
+  & shorten links using clone. Private Mode: Only the owner and moderators can."* A clone that can read
+  a private channel and sits in Public Mode is a private channel anyone can mint links from. Private
+  Mode is the setting that matches what this pipeline needs.
+* **"No Forward"** (Oct 2025) restricts clone users from forwarding messages shared via links, and
+  **24h token verification** (Sep 2024) makes a user pass a shortened link for "special access" to
+  messages. Both sit between our button and the file. "No Forward" is also the setting that would
+  contradict the bot's own advice to *"save or forward these messages"* — and our pipeline's first step
+  is itself a forward out of the source channel, so whatever is on in the clone has to be read, not
+  assumed.
+* **Autodelete** is described as deleting *"media messages sent to clone users after 30 minutes"* — the
+  same knob as the 5-minute warning in the screenshot, on the owner's `/settings`, about the delivered
+  copy. Nothing about it changes what we store or publish.
+* **Force subscribe** (up to six channels), a custom start message, per-clone user stats,
+  ban/unban of the clone's own users, and ownership transfer to a moderator are the other clone
+  features. `app.storagebot.FORBIDDEN` refuses the three that talk to an audience whatever the
+  vendor says about them, because the point of that refusal was never someone else's terms of
+  service — it is that a queued job should not be able to reach people.
+* **"no db channel required"** — the vendor's own feature list, and the opposite of the upstream
+  fork family (CodeXBotz/File-Sharing-Bot) this software descends from, whose README tells you to make
+  the bot admin in your "DB channel". Which of the two our clone actually runs is unanswered and it is
+  item 2 above, because it decides whether a link is a pointer at the source post or a copy of it.
+* Support channel `@MdBotzSupport`, setup tutorial `youtu.be/l1PuwqKqsbA`, and *"Google Backup"* (Oct
+  2024) for recovering a lost account's clones. Recorded because "the operator's Telegram account is
+  the only place these clones exist" is a single point of failure for every link we publish.
 
 ## How a live run checks this page
 
@@ -76,6 +192,15 @@ above, reporting three lists rather than one boolean:
   nothing until a human says so; a bot's menu growing is not an instruction.
 * **changed_help** — the wording moved. Usually cosmetic; occasionally the sentence that said
   "(moderators only)" is the one that changed.
+
+A probe also reads *the peer's* replies with the link bot's parser: `app.probe.probe_bot` calls
+`parse_reply(text, bot=username)`, so a link belonging to a sibling clone is reported as
+`link_from_another_bot` in the report instead of flattering it into `"link"`.
+
+Three things on the operator's `/settings` screen are worth reading while the session is open, because
+they are the cheap version of items 4, 5 and 6: which mode the clone is in, whether "No Forward" is
+on, and what the deletion timer is set to. None of them is a code change; all three change what a
+published post promises.
 
 The bot's replies, links and buttons stay in `app.audit_log` and reach the operator as one
 paste-able message; nothing in this document is inferred from a reply we have not read.

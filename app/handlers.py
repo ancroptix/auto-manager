@@ -21,7 +21,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Mapping
 
-from . import ingest, thumbnails
+from . import ingest, storagebot, thumbnails
 from .db import Database
 from .keys import archive_key
 from .stages import JobKind, JobStage
@@ -54,11 +54,13 @@ DEPENDENCIES: dict[str, str] = {
     JobKind.ARCHIVE_MEDIA.value: "server-side copy into the private master archive channel",
     JobKind.STORAGE_UPLOAD.value: (
         "the @anime_hindifilesbot menu is known (app/storagebot.py: /genlink, /batch, "
-        "/custom_batch, /special_link, /universal_link); what each command asks for next, and "
-        "the link shape it replies with, are what one authenticated run still has to read back. "
-        "@Link_providerobot answers /genlink with 'Send A Message For To Get Your Shareable Link' "
-        "and then a t.me/<bot>?start= link (app/linkprovider.py) — a sibling of the same verb, "
-        "which narrows the guess without replacing the observation"
+        "/custom_batch, /special_link, /universal_link) and so is the first conversation: "
+        + storagebot.flow_note()
+        + ". What is missing now is the write layer — the code that forwards, reads the reply back "
+        "and stores the token — and the behaviour only an authenticated run can settle, listed in "
+        "app.storagebot.still_unknown(). Which bot answered is read from the link's host, not from "
+        "its wording: @Link_providerobot is a sibling clone that says the same sentence "
+        "(app/linkprovider.py)"
     ),
     JobKind.LINK_VERIFY.value: "link liveness probe",
     # The publisher has two audiences, and only one of them is a series channel: the episode post

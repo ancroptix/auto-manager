@@ -89,9 +89,13 @@ reason (82 files scanned clean as of this writing — the count is what the scri
   answer from you today.
 - **The join-request message text.** You deferred it deliberately: the app may not contact a
   join-requester at all until you write the sentence it should receive. Nothing blocks anything else.
-- **The storage assistant's protocol.** One authenticated run at @anime_hindifilesbot, with one file you
-  upload by hand, is the only way to learn what each of its five verbs asks for next. Until then
-  `storage_upload` is blocked, and that block is the design, not a defect.
+- **The storage assistant's write layer, and three switches on your clone.** `/batch` and its two
+  prompts are recorded, so what is left is the code that performs the flow and four readings: whether
+  a link is a reference to the source post or a copy, and — on the clone's own `/settings` — whether
+  it is in **Public Mode** (any Telegram user can mint links through it) or **Private Mode**, whether
+  **No Forward** is on (it would fight your own "save these messages" advice), and what the
+  **deletion timer** is set to. Public Mode on a clone that can read a private channel is the one
+  answer here that is urgent; and whatever you do, do not rename the clone once a link is published.
 - **`bots.channel_help_rights`** — whether `@chelpbot` gets `can_invite_users`. The guide asks for it,
   the default withholds it (a publisher that can invite is a publisher that can be used to spam your
   channel). Grant it by editing that one row; `can_add_admins` and `can_ban_users` are refused whatever

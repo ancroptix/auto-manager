@@ -18,6 +18,11 @@ private. The invite link therefore travels *inside a picture*, and the picture t
 bot link. Whether that is necessity or habit is one of the open questions below — this module
 records what was seen, not a theory about it.
 
+One hazard deserves naming, because it is the reason :func:`parse_reply` checks the link's *host*
+and not just its sentence: this bot and @anime_hindifilesbot are clones of the same family, so both
+answer with the words ``Here is your link:`` and both hand back a ``BQADAQAD…`` token. Wording
+proves a protocol, never an identity — only ``t.me/<bot>`` says which bot minted a link.
+
 What is certain here is copied out of the screenshots verbatim, typo included (``Send A Message
 For To Get Your Shareable Link``). What is not certain is listed in :func:`still_unknown`, and the
 announcement shape is deliberately **absent** from ``captions.APPROVED_TEMPLATES``: no post is
@@ -101,8 +106,11 @@ def deep_link(token: str, *, bot: str = BOT_USERNAME) -> str:
 def token_of(link: str | None) -> str | None:
     """The ``start`` payload of a bot deep link, or None if this is not one.
 
-    The token is what has to be stored: the link is then always rebuilt from the bot's current
-    username, so a bot that renames itself does not invalidate every link already published.
+    The token is what has to be stored, because it is the part that survives us rebuilding a link
+    for the *next* post. It cannot rescue a link already published: an announcement in a channel
+    carries the username as typed that day, and on this vendor's account bot handles are deleted and
+    re-taken regularly — a freed @username can belong to somebody else. Hence the rule in
+    ``docs/storage-bot.md`` that the clone's username is permanent once anything points at it.
     """
     match = _LINK_RE.search(str(link or ""))
     return match.group("token") if match else None
@@ -116,12 +124,21 @@ def parse_reply(text: str | None, *, bot: str = BOT_USERNAME) -> dict[str, Any]:
     """Read one reply from the link bot into a link, or say it is not that yet.
 
     Deliberately narrow. A reply is only a link when it carries the marker *and* a
-    ``t.me/<bot>`` deep link; a bot that answers "Send A Message…" is recorded as the request, and
+    ``t.me/<bot>`` deep link **for the bot that was asked**, because the marker and the token family
+    are shared between this bot and the storage bot's clones: a link belonging to some other bot is
+    evidence about that bot, and storing it as ours would send people somewhere else. A bot that
+    answers "Send A Message…" is recorded as the request, and
     anything else is ``unknown`` — never a link guessed from a stray URL, because a wrong link in
     an announcement is a link 33k people are handed.
     """
     body = " ".join(str(text or "").split())
-    out: dict[str, Any] = {"kind": "unknown", "link": None, "token": None, "bot": None, "chars": len(body)}
+    out: dict[str, Any] = {
+        "kind": "unknown",
+        "link": None,
+        "token": None,
+        "bot": None,
+        "chars": len(body),
+    }
     if not body:
         return out
     if REQUEST_TEXT.casefold() in body.casefold():
@@ -129,9 +146,16 @@ def parse_reply(text: str | None, *, bot: str = BOT_USERNAME) -> dict[str, Any]:
         return out
     match = _LINK_RE.search(body)
     if REPLY_MARKER.casefold() in body.casefold() and match:
+        host = match.group("bot")
+        if host.casefold() != str(bot).casefold():
+            # Recorded, never stored as ours. The name of the bot that really answered is the fact
+            # worth keeping when two siblings answer with the same sentence.
+            out["kind"] = "link_from_another_bot"
+            out["bot"] = host
+            return out
         out["kind"] = "link"
         out["token"] = match.group("token")
-        out["bot"] = match.group("bot")
+        out["bot"] = host
         # The bot's own spelling of its username wins over the default, so a renamed bot does not
         # turn every reply we already read into a link to somewhere else.
         out["link"] = deep_link(match.group("token"), bot=match.group("bot"))
@@ -287,11 +311,17 @@ def still_unknown() -> tuple[str, ...]:
     guessed one. Four questions from the earlier list were answered on 2026-08-28 (who posts, whether
     the link survives editing the card, one channel for every series, one announcement per episode);
     they live as ``app.config`` rows now, because a thing we know does not belong in a list of
-    unknowns and a thing we merely believe does not belong in code that posts to 33k people.
+    unknowns and a thing we merely believe does not belong in code that posts to 33k people. A fifth
+    was answered on 2026-08-29, by the operator's own word about their clone, and is written into the
+    first item below rather than removed, because "the link is permanent" is only useful if the thing
+    *behind* the link is permanent too.
     """
     return (
-        "whether the link expires, is rate-limited, or stops working when the private invite it shows is "
-        "revoked and regenerated — the question that decides whether an old announcement is a dead end",
+        "whether a link is rate-limited, or stops working when the private invite it shows is revoked "
+        "and regenerated. Whether it expires was answered by the operator on 2026-08-29 — it does not, "
+        "\"the link works forever\" — which is the only reason a token is worth publishing at all; "
+        "what still bites is that the invite inside the card can be regenerated while every old "
+        "announcement keeps pointing at the old one",
         "what @Link_providerobot's /start menu holds besides /genlink, and whether it has the same "
         "moderation verbs as the storage bot's menu (broadcast, ban, unban)",
         "the exact emoji run in the card caption after the words 'Channel link' — visible, not counted",

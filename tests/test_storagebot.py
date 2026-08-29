@@ -176,11 +176,14 @@ def test_the_doc_lists_exactly_the_open_questions() -> None:
 
 
 def test_the_handler_still_refuses_and_says_which_half_is_missing() -> None:
-    """`storage_upload` must stay a loud failure while the replies are unobserved.
+    """`storage_upload` must stay a loud failure while the link's durability is unobserved.
 
-    This test exists because the temptation, once a menu is known, is to write the handler and let
-    the queue go green. The menu is not the protocol: nothing here says what `/genlink` asks for
-    next or what it answers with, so the job has to keep blocking until a live run says so.
+    This test exists because the temptation, once a protocol is half-known, is to write the handler
+    and let the queue go green. The flow *is* known now — the operator walked through `/batch` on
+    2026-08-29 — and the job still blocks, because "forward two messages, get a link" is not the
+    thing that decides whether a published post survives: whether the link is a reference to a
+    source post or a copy is (still_unknown's second item), and a handler written before that
+    reading is a handler that can orphan every link in a season.
     """
     from app.handlers import DEPENDENCIES, FeatureNotImplemented, JobKind  # noqa: PLC0415
 
@@ -188,8 +191,112 @@ def test_the_handler_still_refuses_and_says_which_half_is_missing() -> None:
     for fragment in ("/genlink", "/custom_batch", "/special_link"):
         assert fragment in reason, "the blocked reason should name what the operator has to approve"
     assert "authenticated" in reason.lower()
+    # The observed flow reaches the operator through this same string, not through a summary someone
+    # wrote by hand next to it: `/status` prints what the data says.
+    assert storagebot.flow_note() in reason
     with pytest.raises(FeatureNotImplemented):
         # The stub itself: importing and calling the builder must not silently succeed.
         from app.handlers import _stub
 
         raise FeatureNotImplemented(reason)
+
+
+# --- the observed /batch flow, and the vendor's claims ----------------------------------------
+
+
+def test_the_flow_is_recorded_as_data_and_not_as_prose() -> None:
+    """`BATCH_FLOW` is the two prompts, in the bot's own words, plus what it answered with.
+
+    Quoted verbatim on purpose: a tidied copy of somebody's UI text is a string that will never
+    match their UI text again, and this is the pair a future handler has to recognise.
+    """
+    steps = storagebot.BATCH_FLOW
+    assert len(steps) == 3
+    assert steps[0].verbatim.startswith("Forward The Batch First Message From your Batch Channel")
+    assert "or Give Me Batch First Message link" in steps[0].verbatim
+    # The bot's own inconsistent capitalisation of "Your"/"last" is part of the quote.
+    assert "From Your Batch Channel" in steps[1].verbatim
+    assert "Batch last message link" in steps[1].verbatim
+    assert steps[1].verbatim != steps[0].verbatim.replace("First", "Last"), "quoted, not generated"
+    assert "Here is your link:" in steps[2].verbatim
+    assert "?start=" in steps[2].verbatim and "SHARE URL" in steps[2].verbatim
+    for step in steps:
+        assert step.ours, "every prompt needs our side of it, or it is a quote with no use"
+    assert storagebot.FLOW_OBSERVED_ON == "2026-08-29"
+
+
+def test_the_doc_carries_the_flow_and_the_ephemeral_warning() -> None:
+    """The screenshots exist once; the doc is what keeps them readable in a year.
+
+    Both prompts are pinned from the code rather than re-typed, so a doc that quietly "improves"
+    the wording fails here instead of teaching the next reader the wrong strings.
+    """
+    # Collapsed, because a doc that wraps a sentence over two lines is still the same sentence.
+    doc = " ".join(DOC.read_text(encoding="utf-8").split())
+    for step in storagebot.BATCH_FLOW[:2]:
+        assert " ".join(step.verbatim.split()) in doc, f"{step.verbatim[:32]}… drifted out of the doc"
+    for fact in (
+        "END OF SEASON",  # what a range re-sends, labels included
+        "deleted after 5 minutes",  # the warning, and what it does *not* apply to
+        "never a reference to a message id inside the bot chat",
+        "link_from_another_bot",
+        "one batch per episode holding every quality",
+    ):
+        assert fact in doc, f"the doc lost: {fact}"
+
+
+def test_the_vendor_claims_are_labelled_as_claims() -> None:
+    """Everything known about the clone ecosystem comes from the vendor's channel, not from us.
+
+    The label is the point: these sentences make four design decisions defensible (Private Mode,
+    the permanent username, the admin rule, the moderator list) and not one of them is evidence
+    about *our* clone. A test is the only thing that keeps a confident doc from turning into code.
+    """
+    doc = " ".join(DOC.read_text(encoding="utf-8").split())
+    section = doc.split("## Where this bot comes from", 1)[1].split("## ", 1)[0]
+    assert "vendor's word" in section and "not an observation of ours" in section
+    assert storagebot.PARENT_CHANNEL in section, "the source URL is the one thing to re-check"
+    for claim in (
+        "@Md_CloneManagerBot",
+        "up to 3 clones per Telegram account",
+        "Private Mode",
+        "No Forward",
+        "no db channel required",
+        "Clones are still functioning as before",
+    ):
+        assert claim in section, f"the provenance section lost {claim!r}"
+
+
+def test_ownership_of_the_clone_does_not_unlock_the_people_verbs() -> None:
+    """These three are *our* verbs now, aimed at *our* users, and still unsendable.
+
+    The operator's answer changed why the rule exists and not the rule: a job that can broadcast to
+    an audience or ban a person is a capability this program has no reason to hold, whatever the
+    menu calls it. The count is pinned because a fourth name appearing here means someone reclassified
+    a verb, which deserves a conversation.
+    """
+    assert sorted(storagebot.FORBIDDEN) == ["/ban", "/broadcast", "/unban"]
+    for name in storagebot.FORBIDDEN:
+        command = next(c for c in storagebot.MENU if c.name == name)
+        assert "never sent" in command.ours
+    assert "/broadcast" in storagebot.MODERATOR_ONLY, "the vendor's own moderator list gates it"
+
+
+def test_still_unknown_is_answered_in_the_right_direction() -> None:
+    """Four questions were answered this week; the list has to show it.
+
+    The phrases below are what the screenshots and the vendor's channel settled. If one of them
+    reappears in `still_unknown()` then either the answer was lost or a doc was rewritten to be
+    more modest than the evidence, and both are worth failing over.
+    """
+    joined = " ".join(storagebot.still_unknown()).casefold()
+    for settled in (
+        "a forwarded message id?",
+        "a text message with a URL, or a button",
+        "moderator of the bot's service, or of the channel",
+        "whether we get one, several, or none",
+    ):
+        assert settled not in joined, f"already answered, still listed as unknown: {settled!r}"
+    # And the questions that *are* open must not be quietly dropped from the doc or the code.
+    for open_item in ("reference", "public mode", "no forward", "revoke", "rate limit"):
+        assert open_item in joined, f"the unknown list lost {open_item!r}"
