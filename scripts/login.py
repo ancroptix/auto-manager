@@ -71,7 +71,11 @@ def main() -> int:
     me = client.loop.run_until_complete(client.get_me())
     print(f"\nAuthorized as @{getattr(me, 'username', 'unknown')} (id={me.id})")
     print("This is the account the automation will act as. Confirm it is the spare, not your main.")
-    session = client.session.as_string()
+    # The same two names the service tries, from the same function: if Telethon renames this again, one
+    # fix covers both the container and this fallback.
+    from app.mtproto_login import read_session_string
+
+    session = read_session_string(client)
 
     if args.out:
         with open(args.out, "w", encoding="utf-8") as handle:

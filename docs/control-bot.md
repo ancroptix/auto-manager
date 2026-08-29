@@ -225,6 +225,15 @@ rely on it as a revocation step.
 * Three `/login` starts in ten minutes → refused locally, before asking Telegram for
   a code. That limit exists to keep us on the right side of Telegram's own flood
   control, not to be user-hostile.
+* Telegram accepted the code (and the password) but the service could not read a
+  session string out of the client → the reply says exactly that: the credentials
+  worked, nothing was stored, and the flow is closed rather than offering another try
+  at a code that is already spent. It names the one place to check for a login nobody
+  stored — **Settings → Privacy and Security → Devices** — because that session is
+  live on the account until you end it. This happened once for real, when the code
+  asked Telethon for `as_string()`, which version 1.44 does not have (`save()` is the
+  name); `tests/test_mtproto_login.py` now binds every session attribute this project
+  calls to the installed class, so the next rename fails a test instead of a login.
 * `DATABASE_URL` missing or migrations not applied → the login completes at
   Telegram and then says plainly that it could not store the session. It never
   pretends to have succeeded.

@@ -44,7 +44,7 @@ from .sessions import list_sessions, mask_phone, scrub, store as store_session, 
 
 log = logging.getLogger("auto_manager.controlbot")
 
-__all__ = ["ControlBot", "LoginCancelled", "LoginResult", "NeedsPassword", "Reply"]
+__all__ = ["ControlBot", "LoginCancelled", "LoginResult", "LoginUnstored", "NeedsPassword", "Reply"]
 
 #: Telegram's own limit for repeated code requests is roughly "a few per minute,
 #: then wait a while". Stopping at three per ten minutes keeps us well clear of it,
@@ -151,6 +151,17 @@ class NeedsPassword(Exception):
 
 class LoginCancelled(Exception):
     """The operator cancelled, or the attempt expired."""
+
+
+class LoginUnstored(Exception):
+    """Telegram accepted the credentials and the service could not hand over a session.
+
+    Its own exception because the two login failures need opposite answers. A wrong code means *try the
+    code again*; this means the account is signed in right now, there is no code left to retry, and the
+    only useful thing to say is that a live session exists which nobody stored — so it should be
+    terminated on the account before anyone tries again. Answering it with "2 attempt(s) left, reply with
+    the code" sends the operator to do something that cannot work, over a login that already worked.
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -1861,6 +1872,18 @@ class ControlBot:
                     "this account has 2FA. Reply with /password <your password>. Your code message is "
                     "deleted now, and your password message as soon as it is used — I never store the "
                     "password and never repeat it.",
+                    delete_prompt_too=True,
+                )
+            ]
+        except LoginUnstored as exc:
+            # The account is in. No code try is spent and nothing is retried: the next step is on the
+            # account (terminate the stray session), not in this chat, and asking for the code again over
+            # a code Telegram has already burned is how an account gets rate-limited for no reason.
+            self.pending.pop(update.chat_id, None)
+            return [
+                Reply(
+                    f"{scrub(str(exc), phone, pending.password or '')[:400]}\n\nNothing was stored, so "
+                    "this service cannot use the account yet.",
                     delete_prompt_too=True,
                 )
             ]

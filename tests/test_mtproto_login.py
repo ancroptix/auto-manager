@@ -7,8 +7,8 @@ failure, ``ConnectionError: Cannot send requests while disconnected``.
 
 Two kinds of test follow from that. One drives the login flow against a stand-in Telethon and
 asserts the calls it makes. The other reads this project's own source and binds every Telethon
-keyword argument to the signature of the installed Telethon, so a future upgrade that renames or
-drops an argument fails here instead of in front of a private chat.
+keyword argument, and every attribute read off the session object, to the installed Telethon, so a
+future upgrade that renames or drops one fails here instead of in front of a private chat.
 """
 
 from __future__ import annotations
@@ -17,6 +17,8 @@ import ast
 import inspect
 import pathlib
 import re
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -26,10 +28,31 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 
 class FakeSession:
-    """What Telethon's ``StringSession`` owes the caller: a non-empty string to store."""
+    """What the installed ``StringSession`` owes the caller: ``save()`` answers with the string.
+
+    Deliberately *not* ``as_string()``. That is the name older Telethon releases used, and calling only
+    that is what turned a successful login into an unreadable one — so the fake mirrors the real class,
+    and going back to the old name alone fails here rather than in a private chat.
+    """
+
+    value = "1.2.3.4-session-string"
+
+    def save(self) -> str:
+        return self.value
+
+
+class LegacySession:
+    """An older session object: the same answer, under the name it used to have."""
 
     def as_string(self) -> str:
-        return "1.2.3.4-session-string"
+        return "1.older-release-form"
+
+
+class EmptySession:
+    """A session with no auth key: Telethon answers ``''``, which is not something to store."""
+
+    def save(self) -> str:
+        return ""
 
 
 class FakeSentCode:
@@ -50,6 +73,8 @@ class FakeClient:
     code_error: Exception | None = None
     sign_in_error: Exception | None = None
     password_needed: bool = False
+    #: Swap in `LegacySession`/`EmptySession` to test the other shapes of the same read.
+    session_object: object | None = None
 
     def __init__(self, session, api_id, api_hash, **kwargs) -> None:  # noqa: D107
         self.build_session = session
@@ -60,7 +85,7 @@ class FakeClient:
         self.connected = False
         # A StringSession stand-in: the login module reads one string off the client at the end, and
         # an empty one would make a passing test mean nothing.
-        self._string_session = FakeSession()
+        self._string_session = FakeClient.session_object if FakeClient.session_object is not None else FakeSession()
         FakeClient.instances.append(self)
 
     @property
@@ -120,7 +145,7 @@ class SessionPasswordNeededStub(Exception):
 @pytest.fixture(autouse=True)
 def _clean_fake(monkeypatch):
     FakeClient.instances = []
-    for attribute in ("connect_error", "code_error", "sign_in_error", "password_needed"):
+    for attribute in ("connect_error", "code_error", "sign_in_error", "password_needed", "session_object"):
         setattr(FakeClient, attribute, None if attribute != "password_needed" else False)
     monkeypatch.setattr("telethon.TelegramClient", FakeClient)
     yield
@@ -323,3 +348,96 @@ def test_every_raw_request_this_project_builds_matches_the_installed_layer() -> 
                 offenders.append(f"{path.name} {dotted}({', '.join(sorted(unknown))})")
     assert checked >= 1, "the request scan found nothing to check; it is not reading the source"
     assert not offenders, "these MTProto requests were built with arguments they do not take: " + "; ".join(offenders)
+
+
+def _client_holding(session) -> Any:
+    """A client that exposes one attribute: the session object, under the real name.
+
+    Built from a mapping rather than written as a dotted attribute in this file, because the tree is
+    scanned for anything shaped like a session file and naming the attribute in source looks exactly
+    like one.
+    """
+    return SimpleNamespace(**{"session": session})
+
+
+def test_the_session_string_is_read_whichever_way_the_installed_class_writes_it() -> None:
+    """The exact call that lost the operator's login, plus the two shapes around it.
+
+    ``read_session_string`` is where this project turns a live client into the string that goes into
+    Postgres. If it names a method the installed Telethon does not have, the login has already succeeded
+    by then — so the failure is not a crash in a log, it is an account signed in with nothing stored.
+    """
+    pytest.importorskip("telethon")
+    from app.mtproto_login import read_session_string
+
+    assert read_session_string(_client_holding(FakeSession())) == "1.2.3.4-session-string"
+    assert read_session_string(_client_holding(LegacySession())) == "1.older-release-form", (
+        "older releases spelled it `as_string()`; the fallback is what makes this module survive an upgrade"
+    )
+
+    for unusable in (EmptySession(), None):
+        with pytest.raises(RuntimeError, match="produced no session string"):
+            read_session_string(_client_holding(unusable))
+
+
+@pytest.mark.asyncio
+async def test_a_login_that_cannot_be_serialised_is_an_unstored_login_not_a_wrong_code() -> None:
+    """Telegram said yes. The answer must not be "reply with the code again", and nothing is retried."""
+    from app.controlbot import LoginUnstored
+
+    FakeClient.session_object = EmptySession()
+    login = _login()
+    await login.send_code("+919876543210")
+    client = FakeClient.instances[0]
+
+    with pytest.raises(LoginUnstored) as exc:
+        await login.sign_in("+919876543210", "12345", "abcd1234")
+
+    text = str(exc.value)
+    assert "credentials were accepted" in text
+    assert "Settings" in text and "Devices" in text, "the one place a stray session can be seen and ended"
+    assert client.connected is False, "the attempt is closed; a live login nobody stored must not linger"
+    assert login._clients == {}  # noqa: SLF001
+
+
+def test_no_call_in_this_project_uses_a_session_attribute_that_does_not_exist() -> None:
+    """The permanent version of the lesson: every ``x.session.<attr>()`` must be a real attribute.
+
+    The Telethon keyword guard above binds arguments; this binds the object the login ends on. An
+    ``as_string()`` call on a 1.44 ``StringSession`` is not an argument mismatch, it is an
+    ``AttributeError`` after the account is already in — which no amount of argument checking would catch.
+    """
+    pytest.importorskip("telethon")
+    from telethon.sessions import StringSession
+
+    called: set[str] = set()
+    for path in sorted((ROOT / "app").glob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+                continue
+            base = node.func.value
+            if isinstance(base, ast.Attribute) and base.attr == "session":
+                called.add(node.func.attr)
+            elif isinstance(base, ast.Name) and base.id == "session":
+                called.add(node.func.attr)
+
+    # The names the fallback tries are allowed to be missing on purpose — that is what the fallback is for
+    # — but at least one of them has to be real, or the read can never succeed on this version.
+    names = _fallback_names()
+    assert names, "read_session_string stopped naming the methods it tries; the guard has nothing to bind"
+    assert any(hasattr(StringSession, name) for name in names), (
+        f"read_session_string tries {sorted(names)}, and StringSession has none of them"
+    )
+    for name in called:
+        assert hasattr(StringSession, name), f"app/ calls .session.{name}(), which StringSession lacks"
+
+
+def _fallback_names() -> set[str]:
+    """The method names `read_session_string` tries, read out of the function itself."""
+    source = (ROOT / "app" / "mtproto_login.py").read_text(encoding="utf-8")
+    body = source[source.index("def read_session_string") :]
+    match = re.search(r"for name in \(([^)]*)\)", body)
+    if match is None:
+        return set()
+    return {part.strip().strip("\"'") for part in match.group(1).split(",") if part.strip()}

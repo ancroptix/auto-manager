@@ -24,7 +24,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
-from .controlbot import LoginResult, NeedsPassword
+from .controlbot import LoginResult, LoginUnstored, NeedsPassword
 # Single implementation of mask_phone lives in app.sessions, next to the scrubbing
 # the bot applies to every reply: two definitions of "masked" always drift, and the
 # drift is a leak.
@@ -32,7 +32,39 @@ from .sessions import mask_phone
 
 log = logging.getLogger("auto_manager.login")
 
-__all__ = ["MTProtoLogin", "mask_phone"]
+__all__ = ["MTProtoLogin", "LoginUnstored", "read_session_string", "mask_phone"]
+
+
+def read_session_string(client: Any) -> str:
+    """The serialised session of one client, under whichever name the installed Telethon writes it out.
+
+    It is handed the *client* rather than the session object, on purpose: the attribute read that can produce a
+    session string then lives in exactly one place in this module, which is one line to audit for "could
+    this leak a session?" — and it keeps `scripts/check_secrets.py`, whose job is to catch committed
+    session *files*, from reading a legitimate attribute access as a path.
+
+    Telethon 1.44's ``StringSession`` has no ``as_string()``: its method is ``save()``, and
+    ``as_string()`` is the name older releases used. This project called the older name, and the cost was
+    not an exception in a log — it was the operator's own login: Telegram accepted the code and the
+    password, ``sign_in`` then died on the way out, the authorized connection was discarded, and nothing
+    could be stored. So both names are tried, in that order, and an empty answer counts as no answer.
+
+    ``StringSession.save()`` returns ``''`` when there is no auth key. That is a session which was never
+    authorised, and writing it into the table would fail later in a way no log line explains.
+    """
+    session = getattr(client, "session", None)
+    for name in ("save", "as_string"):
+        method = getattr(session, name, None)
+        if not callable(method):
+            continue
+        value = method()
+        if isinstance(value, str) and value:
+            return value
+        if isinstance(value, str):
+            # The method exists and answered honestly. Asking the same session the same question under
+            # another name would only produce the same empty string twice.
+            break
+    raise RuntimeError(f"{type(session).__name__} produced no session string to store")
 
 
 
@@ -90,8 +122,21 @@ class MTProtoLogin:
             await self.discard(phone)
             raise RuntimeError(self._explain(exc)) from None
 
-        me = await client.get_me()
-        session = client.session.as_string()
+        # Everything from here is *after* Telegram said yes, so a failure is no longer about the code.
+        # Reporting it as "sign-in failed, 2 attempts left" was the second half of the operator's bug: the
+        # code is spent, the account is signed in, and the one useful thing to say is that a session
+        # exists which nobody stored.
+        try:
+            me = await client.get_me()
+            session = read_session_string(client)
+        except Exception as exc:  # noqa: BLE001 - the login worked; losing the session still must be said
+            await self.discard(phone)
+            raise LoginUnstored(
+                "the account answered and the credentials were accepted, but this service could not read "
+                f"a session string out of it ({type(exc).__name__}: {str(exc)[:120]}). The login may be "
+                "live on the account without being stored here — open Telegram → Settings → Privacy and "
+                "Security → Devices, terminate the auto-manager session, then run /login again"
+            ) from None
         # Disconnect immediately: holding an authorized connection open after the
         # string is produced would mean two live connections for one account, and
         # Telegram treats that as suspicious behaviour.

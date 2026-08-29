@@ -24,7 +24,7 @@ import pytest
 
 from app.botapi import BotApi, BotTokenError, parse_update, redact
 from app.config import Settings
-from app.controlbot import MAX_CODE_TRIES, ControlBot, LoginResult, NeedsPassword, Reply
+from app.controlbot import MAX_CODE_TRIES, ControlBot, LoginResult, LoginUnstored, NeedsPassword, Reply
 from app.sessions import mask_phone, scrub, valid_name
 from app.telegram_client import TelegramNotConfigured
 
@@ -379,6 +379,16 @@ class FakeTransport:
             raise RuntimeError(f"connection reset while using {SESSION} for {phone}")
         if self.error == "expired":
             raise RuntimeError("PHONE_CODE_INVALID: the code has expired")
+        if self.error == "unstored":
+            # The account is signed in; only the session string failed to materialise. The transport's
+            # own tests cover *why*; this covers what the operator is told about it.
+            raise LoginUnstored(
+                "the account answered and the credentials were accepted, but this service could not read "
+                "a session string out of it (RuntimeError: StringSession produced no session string to "
+                "store). The login may be live on the account without being stored here — open Telegram "
+                "→ Settings → Privacy and Security → Devices, terminate the auto-manager session, then "
+                "run /login again"
+            )
         if self.require_password and password is None:
             raise NeedsPassword("two-factor protection is on")
         return self.result
@@ -1800,3 +1810,27 @@ async def test_a_failed_hand_off_does_not_undo_the_login() -> None:
     text = api.sent[-1][1]
     assert "stored as 'spare'" in text and "could not start using it yet" in text, text
     assert PHONE not in text
+
+
+@pytest.mark.asyncio
+async def test_a_login_that_cannot_be_stored_is_not_reported_as_a_bad_code() -> None:
+    """The worst possible mix-up: Telegram said yes, and the chat says "try the code again".
+
+    That is what happened on the operator's account when the session string was read under a name this
+    Telethon does not have. The flow must close (the code is spent), the account must be told where to
+    look for the stray session, and nothing may be recorded as stored.
+    """
+    transport = FakeTransport(error="unstored")
+    control, api, db = bot(transport=transport)
+    await say(control, f"/login spare {PHONE}")
+
+    replies = await control.dispatch(update("482913", message_id=44))
+    text = "\n".join(reply.text for reply in replies)
+
+    assert "credentials were accepted" in text, text
+    assert "Devices" in text, "the sentence has to name where a stray session can be ended"
+    assert "Nothing was stored" in text
+    assert "attempt" not in text and "sign-in failed" not in text, "this is not a code problem"
+    assert control.pending == {}, "the flow closes: there is nothing left to retry here"
+    assert db.stored == []
+    assert 44 in [mid for _, ids in api.deleted for mid in ids], "the spent code still goes"
