@@ -280,6 +280,10 @@ Both handles are primary and always appear together.
 
 - Channel Help is used **only** to create and edit destination text posts with inline URL buttons. It does not handle
   source monitoring, files, archive backup, storage links, deduplication, or join requests.
+- Restated and narrowed by the operator on 2026-08-29: the announcements channel's post is created **by this
+  program's own session**, so Channel Help is not needed there and is not used there; Channel Help posts only in the
+  series destination channels, doing only what it was configured to do in them. `docs/updates-channel.md` carries the
+  announcement's text and `app/linkprovider.py` renders it; the sender that would place it is unwired.
 - Official button syntax: `Button text - https://url`, `&&` joins multiple buttons on one row, new lines create new
   button rows.
 - Buttons by the plan: one per quality (`480p - LINK_480 && 720p - LINK_720`) or a single `Get Episode NN` link.
@@ -412,8 +416,13 @@ generated from the manifest every time, in `quality_rank` order.
   reconstructed; from deployment onward everything is logged in Supabase for a permanent history.
 - Sending a message **never** approves or declines a request. Requests stay pending until a separate, disabled-by-
   default command changes them.
-- Default to owner-triggered campaigns (`/dmrequests <channel> <campaign>`) rather than auto-messaging every new
-  requester, until the operator finalizes the policy.
+- Default to owner-triggered campaigns rather than auto-messaging every new requester, until the operator
+  finalizes the policy. The command the spec predicted (`/dmrequests`) is **not** what got built: on
+  2026-08-29 the operator asked for the wording to be settable at any time from the assistant, so the half
+  that exists is `/joinmsg` (three drafts to pick from, or your own words; `app/joinmsg.py`) writing the
+  `joinrequest.message` config row. A campaign row stays `draft` — starting one is a later decision, and
+  the row's own `campaign_never_approves` check is what makes "we approved them by other means" impossible
+  to spell.
 - Deduplicate with a unique `(campaign_id, user_id)` record so one campaign cannot message the same user twice. A
   user may be contacted by different campaigns.
 - Replies from contacted users are forwarded to the configured main account.
@@ -422,7 +431,11 @@ generated from the manifest every time, in `quality_rank` order.
   tuned to evade Telegram anti-spam enforcement — there is no safe promise that tens of thousands of private
   messages complete quickly.
 - Log successful / failed / skipped / already-contacted outcomes.
-- Message template: **TBD by operator.**
+- Message template: **the operator's, whenever they choose to write it.** Empty by default, which means nobody is
+  contacted; `/joinmsg show` prints what is saved and says in the same breath that nothing has been sent.
+  `{name}` and `{series}` are the only placeholders, and `app.joinmsg.refusals` is the one place that says
+  why an invite link may not appear in this message (a DM carrying an invite admits the person past an
+  approval that was never given).
 
 ## 16. Owner control interface (revised: a control bot is in scope)
 
@@ -500,7 +513,10 @@ Rules agreed for the bot:
 ## 18. Open decisions
 
 1. Season → sticker mapping (auto-detect on first run, else owner picks once) — pending live account connection.
-2. Join-request message template — operator deferred this.
+2. ~~Join-request message template — operator deferred this.~~ **answered 2026-08-29:** the operator asked to be
+   able to set it at any time instead of once in a chat, so it is a setting (`/joinmsg`,
+   `app.config` key `joinrequest.message`, rules in `app/joinmsg.py`) and it ships empty, which still means
+   "contact nobody". Picking the sentence is open; being able to write it is not.
 3. Storage bot command protocol — requires authenticated integration testing.
 4. ~~Template refinements beyond the §12 defaults~~ — the operator dictated the three caption formats and
    the button label on 2026-08-28; §12 and `0004_approved_captions.sql` carry them.

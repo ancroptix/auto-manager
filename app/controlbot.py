@@ -64,6 +64,7 @@ HELP = """auto-manager control
 /declare     say how long a season is (Total Episodes, and the batch post)
 /source      say what a source channel carries (series, audio, season) — for bare-file channels
 /inplace     caption the files already posted in your own channel (no delete; link + post still run)
+/joinmsg     what a join requester is told: options, your own words, or switch it off
 /sessions    stored Telegram sessions (never their contents)
 /use <name>  make one session the active account
 /forget <n>  delete a stored session from the database
@@ -96,6 +97,7 @@ _ROUTES: dict[str, str] = {
     "declare": "_declare",
     "source": "_source",
     "inplace": "_inplace",
+    "joinmsg": "_joinmsg",
     "sessions": "_sessions",
     "use": "_use",
     "forget": "_forget",
@@ -349,13 +351,13 @@ class ControlBot:
                     lines.append(
                         "  if this channel is a shelf of bare files: /source <@handle> audio hindi"
                     )
-            # These four decide what gets published at all, so they belong on the
-            # one screen the operator reads.
+            # These decide what gets published at all, and the last one decides whether anybody
+            # is contacted at all, so they belong on the one screen the operator reads.
             settings = await self.db.fetch(
                 "select key, value::text as value from app.config "
                 "where key in ('thumbnail.strict_mode','thumbnail.on_no_clean_candidate',"
                 "'ingest.require_hindi_audio','ingest.include_subbed_only','caption.button_rows',"
-                "'caption.total_episodes_unknown') "
+                "'caption.total_episodes_unknown','joinrequest.message') "
                 "order by key"
             )
             if settings:
@@ -415,6 +417,104 @@ class ControlBot:
             await self.api.send(chat_id, scrub(format_report_text(report), *self._live_secrets()))
         except Exception as exc:  # noqa: BLE001 - the operator must hear about it, not find silence
             await self.api.send(chat_id, scrub(f"probe failed: {type(exc).__name__}: {str(exc)[:200]}"))
+
+
+    _JOINMSG_USAGE = (
+        "usage: /joinmsg [show|options|use <n>|set <text>|clear]\n"
+        "  /joinmsg              what is saved now, and what that does and does not allow\n"
+        "  /joinmsg options      three drafts to pick from, each with what it promises\n"
+        "  /joinmsg use 2        save one of them as the message\n"
+        "  /joinmsg set <text>   save your own words ({name} and {series} are filled in)\n"
+        "  /joinmsg clear        empty it — the app may contact nobody\n\n"
+        "Saving a message does not send one. A campaign is owner-triggered, per channel, and the\n"
+        "sender that would carry it is not built yet (job kind join_request_campaign), so this\n"
+        "command only ever changes what would be said. It never approves or declines a request."
+    )
+
+    async def _joinmsg(self, update: Update, args: list[str]) -> list[Reply]:
+        """``/joinmsg [show|options|use <n>|set <text>|clear]`` — the join-request wording.
+
+        The operator asked for options in the bot rather than a row to edit by hand, on 2026-08-29:
+        *"jisse mujhe kabhi bhi kuch bhi bolna ho to mai bol paau sabhi se"*. So the setting lives
+        here and the rules live in :mod:`app.joinmsg`, which refuses an invite link in a DM, refuses
+        wording that reads like an approval, and refuses a placeholder it cannot fill.
+
+        What this command pointedly does not do is send. The message is a *setting*; the act of
+        contacting people is the blocked job kind, and the refusal is printed in the same reply as
+        the confirmation, so "saved" can never be misread as "on its way".
+        """
+        from . import joinmsg  # noqa: PLC0415  (one-way import, like .inplace above)
+
+        action = (args[0].strip().casefold() if args else "show")
+        if action in {"help", "?"}:
+            return [Reply(self._JOINMSG_USAGE)]
+
+        if action in {"show", "options"}:
+            current = await self.db.config(joinmsg.CONFIG_KEY, "") if self.db is not None else ""
+            if action == "options":
+                return [Reply(joinmsg.options_text(current))]
+            note = joinmsg.status_note(current)
+            body = " ".join(str(current or "").split())
+            if not body:
+                return [Reply(f"{note}\n\n{self._JOINMSG_USAGE}")]
+            return [
+                Reply(
+                    f"{note}\n\nSaved text ({len(body)} chars):\n{body}\n\n"
+                    "Placeholders filled at send time: " + ", ".join(joinmsg.PLACEHOLDERS)
+                )
+            ]
+
+        if self.db is None or not getattr(self.db, "connected", False):
+            return [Reply("the database is not reachable, so I cannot save a message.")]
+
+        if action == "use":
+            if len(args) < 2 or not args[1].strip().isdigit():
+                return [Reply(f"`use` needs a number from the options list.\n{self._JOINMSG_USAGE}")]
+            index = int(args[1].strip())
+            if not 1 <= index <= len(joinmsg.PRESETS):
+                return [
+                    Reply(
+                        f"there are {len(joinmsg.PRESETS)} options, not {index}. "
+                        "Run /joinmsg options to see them."
+                    )
+                ]
+            preset = joinmsg.PRESETS[index - 1]
+            text, note = preset.text, f"\nWhat it promises: {preset.note}"
+        elif action == "set":
+            text = " ".join(args[1:]).strip()
+            note = ""
+            if not text:
+                return [Reply(f"`set` needs the words themselves.\n{self._JOINMSG_USAGE}")]
+        elif action == "clear":
+            if len(args) > 1:
+                return [Reply("`clear` takes no arguments — it is the one that stops everything.")]
+            text, note = "", ""
+        else:
+            return [Reply(f"I do not know `/joinmsg {args[0]}`.\n{self._JOINMSG_USAGE}")]
+
+        if text:
+            problems = joinmsg.refusals(text)
+            if problems:
+                return [Reply("I will not save that:\n" + "\n\n".join(f"• {p}" for p in problems))]
+        import json  # noqa: PLC0415  (only the writer needs the encoder)
+
+        await self.db.execute(
+            "insert into app.config (key, value, description) values ($1, $2::jsonb, $3)"
+            " on conflict (key) do update set value = excluded.value, updated_at = now()",
+            joinmsg.CONFIG_KEY,
+            json.dumps(text),
+            "Set from the control bot with /joinmsg on 2026-08-29; the wording and its rules are "
+            "app/joinmsg.py, and an empty value means the app may contact no requester.",
+        )
+        if not text:
+            return [Reply("cleared. nobody is contacted, and a campaign would have nothing to say.")]
+        return [
+            Reply(
+                f"saved ({len(' '.join(text.split()))} chars). It goes to nobody yet: sending a "
+                f"join-request campaign is still the blocked job kind join_request_campaign, "
+                f"because there is no sender wired.{note}"
+            )
+        ]
 
     async def _sessions(self, update: Update, args: list[str]) -> list[Reply]:
         rows = await list_sessions(self.db)

@@ -229,6 +229,15 @@ class FakeDb:
             # /declare's write, asserted as (series id, season, count) by those tests.
             self.writes.append((sql, args))
             return 1
+        if "insert into app.config" in sql and "on conflict (key) do update" in sql:
+            # /joinmsg writes wording, and the write has to come back out on the next read: the
+            # round trip is the only way a test can prove the command saves what it says it saved.
+            import json as _json
+
+            key, value = args[0], _json.loads(args[1])
+            self.writes.append((sql, args))
+            self.config_rows[key] = value
+            return 1
         if "insert into app.audit_log" in sql:
             self.audit.append((sql, args))
             return 1

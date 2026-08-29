@@ -80,7 +80,14 @@ DEPENDENCIES: dict[str, str] = {
         "description of the tool, not a test of ours"
     ),
     JobKind.SEASON_STICKER.value: "sticker-pack label mapping (S1, Season 2, ...)",
-    JobKind.JOIN_REQUEST_CAMPAIGN.value: "owner-approved campaign sender with per-hour pacing",
+    JobKind.JOIN_REQUEST_CAMPAIGN.value: (
+        "the owner-triggered sender itself. The wording is a setting now (/joinmsg writes "
+        "app.config key joinrequest.message; app/joinmsg.py holds the presets and the refusals), "
+        "and app.join_campaign already carries the pacing columns and the check that a send never "
+        "approves. What does not exist is the code that reads still-pending requests, honours every "
+        "FloodWait and stops on a restriction — the same missing MTProto write path that blocks "
+        "publish_post and edit_post"
+    ),
     JobKind.LINK_HEALTH_CHECK.value: "periodic re-check of published storage links",
 }
 

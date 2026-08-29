@@ -31,18 +31,26 @@ deployment's environment is the one move that turns a stolen dashboard login int
 account. `TELEGRAM_SESSION_SOURCE=both` means the app prefers the environment value and falls back to
 the stored one, so the empty case is the normal case.
 
-## 2. One database row only you can fill
+## 2. The row that used to be only yours — now shipped, still worth a look
 
-`updates.channel` is seeded empty (`supabase/migrations/0008_updates_channel.sql`), and empty means
-"the app does not know where" — `/status` prints exactly that instead of picking a channel. Your
-updates channel is **private**, so it has no `@handle`: the answer is its numeric id, a `-100` followed
-by the channel's digits.
+`updates.channel` was seeded empty (`0008_updates_channel.sql`) because empty means "the app does not
+know where", and `/status` prints exactly that rather than picking a channel by name. On 2026-08-29
+you gave the id: `-1002072936982`, a private channel's numeric form, which is the normal spelling for a
+private channel and not a fallback.
+
+That value is now carried by `supabase/migrations/0010_join_message_and_updates_id.sql`, so applying
+`ops/apply-all.sql` (§4) fills it — there is nothing to paste. The statement is guarded on the row
+still being empty, so if you had already set it yourself, yours stays. After §4 step 2, this should
+print the id and nothing else:
 
 ```sql
-update app.config
-   set value = '"-1002072936982"'::jsonb, updated_at = now()
- where key = 'updates.channel';
+select value from app.config where key = 'updates.channel';   -- expect "-1002072936982"
 ```
+
+What 0010 does *not* do is decide who posts there. The announcement is made by **this program's own
+session**, as plain text with a link; `@chelpbot` posts only in the series destination channels, with
+only what it is configured to do there. That is your ruling of 2026-08-29, and no row in the database
+grants Channel Help a right in the announcements channel.
 
 Change the number to the one you confirm, then run `/status` — the line must change from "not set" to
 `updates channel: private channel -100…, one announcement per episode, …`. Two ways to read your own
@@ -63,14 +71,14 @@ window has to be treated as public.
    new one (the pooler string embeds it).
 
 Nothing in the repository holds either secret; `scripts/check_secrets.py` runs in CI for exactly that
-reason (82 files scanned clean as of this writing — the count is what the script prints, so it moves when a file is added and nobody has to remember).
+reason (85 files scanned clean as of this writing — the count is what the script prints, so it moves when a file is added and nobody has to remember).
 
 ## 4. The live steps, in order, once the values are in
 
 1. Supabase → **SQL Editor** → paste all of [`ops/apply-all.sql`](../ops/apply-all.sql) → **Run**. Expect
-   `Success. No rows returned`. This is how `0009_announcement_approved.sql` lands on a database that
-   was built before it existed.
-2. Sanity check: `select count(*) from app.config;` must read **44**, and
+   `Success. No rows returned`. This is how `0009_announcement_approved.sql` and
+   `0010_join_message_and_updates_id.sql` land on a database that was built before they existed.
+2. Sanity check: `select count(*) from app.config;` must read **45**, and
    `select count(*) from information_schema.tables where table_schema='app';` must read **27**.
 3. Render → deploy, `APP_MODE` still `shadow` for the first day: real reads, no posts.
 4. Talk to the assistant: `/login` (pairing code in chat, nothing to paste into a terminal), then
@@ -82,13 +90,18 @@ reason (82 files scanned clean as of this writing — the count is what the scri
    and read the route it says out loud.
 7. Only then: `APP_MODE=live`.
 
-## 5. Four decisions that stay yours (from `docs/requirements-draft.md` §18)
+## 5. Four things that started as decisions and are now partly build work (from §18)
 
 - **Season → sticker mapping.** Auto-detected on the first season that goes out; you pick once if the
   channel already has stickers that do not follow the pattern. Waiting on the live session, not on an
   answer from you today.
-- **The join-request message text.** You deferred it deliberately: the app may not contact a
-  join-requester at all until you write the sentence it should receive. Nothing blocks anything else.
+- **The join-request message text — yours to write, whenever you want.** It stopped being a question
+  in the chat log on 2026-08-29: `/joinmsg options` in the assistant shows three drafts, `/joinmsg use 2`
+  saves one, `/joinmsg set <your own words>` saves those instead, and `/joinmsg clear` puts the gate back
+  up (empty means the app may contact nobody — that is still the shipped default, so nothing has been put
+  in your mouth). Saving is not sending: the sender is still the blocked job kind, and the message can
+  never carry an invite link or read like an approval — `/joinmsg` refuses both, in writing. What is still
+  a decision rather than a build task is **which** of those three sentences, or your own.
 - **The storage assistant's write layer, and three switches on your clone.** `/batch` and its two
   prompts are recorded, so what is left is the code that performs the flow and four readings: whether
   a link is a reference to the source post or a copy, and — on the clone's own `/settings` — whether
@@ -113,7 +126,8 @@ idle:
 - `publish_post` — the send itself: Channel Help's post for a destination, and the announcement
 - `edit_post` — `messages.editMessage` on a bot-created post, which is the in-place caption path
 - `season_sticker` — the sticker-pack label mapping
-- `join_request_campaign` — the owner-approved campaign sender with pacing
+- `join_request_campaign` — the owner-approved campaign sender with pacing (the *text* is a
+  setting now, `/joinmsg`; this is the delivery)
 - `link_health_check` — the periodic re-check of published links
 
 In plain words: **the reading half is built, the writing half is not.** A file is ingested, normalised,

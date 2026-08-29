@@ -9,6 +9,14 @@ with goes into the post; and the channel hosts no files.
 That is a different job from every other destination in this project. **Nothing is stored on this
 channel.** Files stay where they are; this channel carries a notice.
 
+Two things the operator settled on 2026-08-29, both recorded where the code reads them. The channel is
+`-1002072936982` — a private channel's numeric id, which is the normal spelling and not a fallback — and
+it is seeded by `supabase/migrations/0010_join_message_and_updates_id.sql` rather than left as a step for
+somebody to remember. And the post is made **by this program's own session**, as plain text carrying a
+link: Channel Help is not involved here at all, because nothing needs to be *configured* in a channel that
+hosts no files and takes no buttons. Channel Help stays exactly where it was already scoped — the series
+destination channels, and only what it is configured to do there.
+
 ## The flow, as the operator described it, with the one unknown named
 
 ```
