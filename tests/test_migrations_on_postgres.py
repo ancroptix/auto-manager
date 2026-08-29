@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import socket
 from pathlib import Path
+from types import SimpleNamespace
 
 from conftest import config_row_count
 
@@ -2497,3 +2498,340 @@ def test_the_per_episode_description_stops_promise_about_an_unapproved_box(conn)
     assert "the sender that does not exist yet" in text
     # And the row the operator cares about is still the row the code reads.
     assert val(conn, "select value from app.config where key = 'updates.per_episode'") is True
+# --- the write layer (app/writers.py), against the real schema -------------------------------------
+#
+# These run the eight writers with a *recording* client: the SQL is the shipped SQL against the
+# shipped schema, and the sends are captured instead of delivered. The fake is not a convenience —
+# it is what makes it possible to prove the two halves of the rule at once: that a plan never leaves
+# a row behind, and that a live write leaves exactly the rows the readers of /status expect.
+
+
+class RecordingClient:
+    """A Telethon stand-in that keeps every call and never talks to Telegram.
+
+    Four methods are enough, because `app/sender.py` owns the five verbs and nothing else may touch
+    the client. A writer that found another way to reach Telegram would raise here, which is the
+    guard rail this project needs most: one write path, so one place to audit.
+    """
+
+    def __init__(self, replies=()):
+        self.calls: list[tuple] = []
+        self._replies = list(replies)
+
+    async def send_message(self, peer, text, **kwargs):
+        self.calls.append(("send", str(peer), text, kwargs))
+        return SimpleNamespace(id=900 + len(self.calls), text=text, out=True, date=None)
+
+    async def edit_message(self, peer, message_id, text, **kwargs):
+        self.calls.append(("edit", str(peer), int(message_id), text, kwargs))
+        return SimpleNamespace(id=int(message_id), text=text, out=False, date=None)
+
+    async def forward_messages(self, to_peer, ids, **kwargs):
+        self.calls.append(("forward", str(to_peer), tuple(ids), kwargs))
+        return [SimpleNamespace(id=950 + i, text=None, out=False, date=None) for i in range(len(ids))]
+
+    async def iter_messages(self, peer, limit=None):
+        for message in self._replies:
+            yield message
+
+    async def get_input_entity(self, peer):
+        return peer
+
+    async def __call__(self, request):  # pending join requests, the one raw request there is
+        self.calls.append(("request", type(request).__name__))
+        return SimpleNamespace(count=0, importers=[], users=[])
+
+
+def _reply(text, *, message_id=1):
+    return SimpleNamespace(id=message_id, text=text, out=False, date=None)
+
+
+def _write_settings(**overrides):
+    from app.config import Settings
+
+    params = {
+        "_env_file": None,
+        "database_url": pg_uri,
+        "db_ssl": "disable",
+        "worker_enabled": False,
+        "telegram_api_id": "1",
+        "telegram_api_hash": "hash",
+        "telegram_session_string": "test-session",
+        "telegram_owner_user_ids": (7,),
+        "control_token": "test-control-token",
+    }
+    params.update(overrides)
+    return Settings(**params)
+
+
+def _seed_writable_episode(conn, seed, episode):
+    """One episode with a file, a source row to read it from, and an archive channel to copy into."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "insert into app.source_candidate (source_channel_id, message_id, media_idx, media_type,"
+            " file_name, season_number, episode_number, language_tag, quality, quality_rank,"
+            " thumbnail_status, disposition) values ((select id from app.source_channel where telegram_channel_id = -100999),"
+            " 4200, 0, 'video', 'Bleach_-_0420_[1080p].mkv', 1, 4200, 'hi', '1080p', 30, 'clean', 'accepted')"
+            " on conflict (source_channel_id, message_id, media_idx) do nothing returning id"
+        )
+        row = cur.fetchone()
+        if row is None:
+            cur.execute("select id from app.source_candidate where message_id = 4200")
+            row = cur.fetchone()
+        candidate_id = row[0]
+        cur.execute(
+            "insert into app.media_variant (episode_id, quality, quality_rank, language_tag, status,"
+            " source_candidate_id, file_name, thumbnail_status) values (%s, '1080p', 30, 'hi', 'pending', %s,"
+            " 'Bleach_-_0420_[1080p].mkv', 'clean') returning id",
+            (episode, candidate_id),
+        )
+        variant_id = cur.fetchone()[0]
+        cur.execute(
+            "insert into app.archive_channel (telegram_channel_id, title, is_primary) values"
+            " (-1005555, 'master archive', true) on conflict (telegram_channel_id) do nothing"
+        )
+    return {"variant_id": variant_id, "candidate_id": candidate_id}
+
+
+def test_a_shadow_run_plans_and_records_nothing(conn, seed, episode):
+    """APP_MODE=shadow: every writer says what it would do, and the database stays as it was.
+
+    The assertion that matters is the absence of rows. A shadow deployment that marked a variant
+    archived would go on to hand the storage bot a file it never copied, and the ladder would build a
+    post out of nothing — which is the failure this test exists to make impossible.
+    """
+    import asyncio
+
+    import pytest
+
+    from app.db import Database
+    from app.handlers import FeatureNotImplemented
+    from app.stages import JobKind
+    from app.writers import build_writers
+
+    settings = _write_settings()  # mode defaults to shadow
+    assert settings.outbound_enabled is False
+    client = RecordingClient(replies=[_reply("Here is your link: https://t.me/anime_hindifilesbot?start=k7f3")])
+    rows = _seed_writable_episode(conn, seed, episode)
+
+    async def scenario():
+        assert await db.connect()
+        handlers = build_writers(db, settings, client_factory=lambda: client)
+        try:
+            with pytest.raises(FeatureNotImplemented, match="shadow plan") as exc:
+                await handlers[JobKind.ARCHIVE_MEDIA.value]({"payload": {"variant_id": rows["variant_id"]}}, None)
+            assert "-1005555" in str(exc.value), "the plan must name the channel it would copy into"
+            assert not [c for c in client.calls if c[0] == "send"], "shadow sent something"
+            with conn.cursor() as cur:
+                cur.execute("select status, archive_message_id from app.media_variant where id = %s", (rows["variant_id"],))
+                assert cur.fetchone() == ("pending", None), "a plan wrote a result into the database"
+                cur.execute("select count(*) from app.storage_link")
+                assert cur.fetchone()[0] == 0
+            return True
+        finally:
+            await db.close()
+
+    db = Database(settings)
+    assert asyncio.run(scenario())
+
+
+def test_the_ladder_writes_the_rows_the_readers_expect(conn, seed, episode):
+    """Archive -> storage handoff -> link -> draft post, one live pass with a recording client.
+
+    ``publish.route`` is left at its seeded ``chelp_block`` for the first half: the post is *built*
+    and stored as an unpublished draft, which is how a Channel Help destination looks in this schema
+    (no ``published_at``), and how a restart knows not to hand the same range over again. Flipping
+    the row to ``own_session`` is the second half, and the only difference should be who pressed send.
+    """
+    import asyncio
+
+    from app.db import Database
+    from app.stages import JobKind
+    from app.writers import build_writers
+
+    settings = _write_settings(app_mode="live")
+    storage_link = "Here is your link: https://t.me/anime_hindifilesbot?start=k7f3"
+    announcement = "Here is your link: https://t.me/Link_providerobot?start=b8x2"
+    client = RecordingClient(replies=[_reply(storage_link), _reply(announcement, message_id=2)])
+    rows = _seed_writable_episode(conn, seed, episode)
+    with conn.cursor() as cur:
+        cur.execute(
+            "update app.destination set card_message_id = 77 where id = %s", (seed["destination_id"],)
+        )
+    db = Database(settings)
+
+    async def scenario():
+        assert await db.connect()
+        handlers = build_writers(db, settings, client_factory=lambda: client)
+        try:
+            await handlers[JobKind.ARCHIVE_MEDIA.value]({"payload": {"variant_id": rows["variant_id"]}}, None)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "select status, archive_chat_id, archive_message_id from app.media_variant where id = %s",
+                    (rows["variant_id"],),
+                )
+                assert cur.fetchone() == ("archived", -1005555, 950), "the archive copy was not recorded"
+
+            handed = await handlers[JobKind.STORAGE_UPLOAD.value](
+                {"payload": {"episode_id": episode, "destination_id": seed["destination_id"]}}, None
+            )
+            with conn.cursor() as cur:
+                cur.execute(
+                    "select url, token, kind, batch_ref, link_status from app.storage_link where episode_id = %s",
+                    (episode,),
+                )
+                link = cur.fetchone()
+            assert link is not None and link[1] == "k7f3", f"handoff did not store the link it was given: {handed}"
+            assert link[0].endswith("start=k7f3") and link[2] == "single" and "4200-4200" in link[3], link
+            assert link[4] == "active"
+            assert val(conn, "select status from app.media_variant where id = %s", (rows["variant_id"],)) == "linked"
+            assert val(conn, "select count(*) from app.job") >= 1, "the next rung must be queued, not assumed"
+
+            published = await handlers[JobKind.PUBLISH_POST.value](
+                {"payload": {"episode_id": episode, "destination_id": seed["destination_id"]}}, None
+            )
+            with conn.cursor() as cur:
+                cur.execute(
+                    "select body, buttons, message_id, published_at, quality_summary from app.destination_post"
+                    " where episode_id = %s and kind = 'episode'",
+                    (episode,),
+                )
+                post = cur.fetchone()
+            assert post is not None, f"publish left no draft: {published}"
+            body, buttons, message_id, published_at, quality_summary = post
+            # The approved box names no quality (that is what the button is for), so what proves the
+            # draft is the quality summary the post carries and the absence of a published_at.
+            assert message_id is None and published_at is None, post
+            assert "1080p" in str(quality_summary), post
+            assert "t.me/anime_hindifilesbot?start=k7f3" in body, "the button block belongs under the post"
+            assert buttons, "a chelp_block draft carries the button block as text, for a human to paste"
+            assert not [c for c in client.calls if c[0] == "send" and c[1].lstrip("-").startswith("1001234")], (
+                "chelp_block must not send the destination post itself"
+            )
+
+            # Flip the switch the operator can flip, and the same code sends for real.
+            conn.execute("update app.config set value = '\"own_session\"'::jsonb where key = 'publish.route'")
+            own = await handlers[JobKind.PUBLISH_POST.value](
+                {"payload": {"episode_id": episode, "destination_id": seed["destination_id"]}}, None
+            )
+            with conn.cursor() as cur:
+                cur.execute(
+                    "select message_id, published_at, body from app.destination_post"
+                    " where episode_id = %s and kind = 'episode'",
+                    (episode,),
+                )
+                sent_post = cur.fetchone()
+            assert sent_post[0] is not None and sent_post[1] is not None, f"own_session did not post: {own}"
+            assert val(conn, "select announcement_link from app.destination where id = %s", (seed["destination_id"],)) == (
+                "https://t.me/Link_providerobot?start=b8x2"
+            ), "the updates notice must carry the link the bot gave for the card, not the invite"
+            conn.execute("update app.config set value = '\"chelp_block\"'::jsonb where key = 'publish.route'")
+            return True
+        finally:
+            await db.close()
+
+    assert asyncio.run(scenario())
+
+
+def test_the_writers_refuse_what_only_a_human_can_supply(conn, seed, episode):
+    """Three facts no code may guess, each refused with the sentence the docs promise.
+
+    Posting the invite instead of the shareable link, choosing which sticker opens a season, and
+    messaging a stranger from an unapproved template are the three ways this program could do real
+    damage while still looking productive. ``DEPENDENCIES`` carries the same sentences, and the test
+    that they match is what keeps /status from telling a different story from the documentation.
+    """
+    import asyncio
+
+    import pytest
+
+    from app.db import Database
+    from app.handlers import DEPENDENCIES
+    from app.stages import JobKind
+    from app.writers import NeedsInput, build_writers
+
+    settings = _write_settings(app_mode="live")
+    client = RecordingClient()
+    db = Database(settings)
+
+    async def scenario():
+        assert await db.connect()
+        handlers = build_writers(db, settings, client_factory=lambda: client)
+        try:
+            with pytest.raises(NeedsInput, match=r"/sticker") as exc:
+                await handlers[JobKind.SEASON_STICKER.value]({"payload": {"season_id": seed["season_id"]}}, None)
+            sticker_refusal = str(exc.value)
+
+            # A fresh episode with one clean variant and a link of its own: the only thing that should
+            # be missing is the card post. Anything else would make this test depend on what another
+            # test left in the shared cluster — a stale thumbnail verdict on some other episode of the
+            # season, for instance, which would block the publish for a reason that is not the point.
+            _seed_writable_episode(conn, seed, episode)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "update app.destination set card_message_id = null, announcement_link = null,"
+                    " announcement_link_at = null, publish_mode = 'link_post' where id = %s",
+                    (seed["destination_id"],),
+                )
+                cur.execute(
+                    "insert into app.storage_link (url, kind, token, episode_id, destination_id, batch_ref)"
+                    " values ('https://t.me/anime_hindifilesbot?start=s1a2', 'single', 's1a2', %s, %s,"
+                    " '-100999#4200-4200') returning id",
+                    (episode, seed["destination_id"]),
+                )
+                season_link_id = cur.fetchone()[0]
+            with pytest.raises(NeedsInput) as exc:
+                await handlers[JobKind.PUBLISH_POST.value](
+                    {
+                        "payload": {
+                            "episode_id": episode,
+                            "destination_id": seed["destination_id"],
+                        }
+                    },
+                    None,
+                )
+            card_refusal = str(exc.value)
+            assert "/card" in card_refusal and "invite" in card_refusal, card_refusal
+            with conn.cursor() as cur:
+                cur.execute(
+                    "select count(*) from app.destination_post where destination_id = %s and kind = 'info'",
+                    (seed["destination_id"],),
+                )
+                # The updates notice is its own audience: refusing to invent a link means no info post
+                # was written, whatever the destination's own draft did in the meantime.
+                assert cur.fetchone()[0] == 0, "an announcement went out with no link in it"
+                cur.execute("select link_status from app.storage_link where id = %s", (season_link_id,))
+                assert cur.fetchone()[0] == "active"
+                cur.execute(
+                    "delete from app.destination_post where episode_id = %s",
+                    (episode,),
+                )
+                cur.execute("delete from app.storage_link where id = %s", (season_link_id,))
+            with conn.cursor() as cur:
+                cur.execute(
+                    "insert into app.join_campaign (destination_id, name, message_template, status)"
+                    " values (%s, %s, 'Welcome to the channel', 'draft') returning id",
+                    (seed["destination_id"], f"unconfirmed-{episode}"),
+                )
+                campaign_id = cur.fetchone()[0]
+            with pytest.raises(NeedsInput, match=r"confirm") as exc:
+                await handlers[JobKind.JOIN_REQUEST_CAMPAIGN.value]({"payload": {"campaign_id": campaign_id}}, None)
+            with conn.cursor() as cur:
+                cur.execute("delete from app.join_campaign where id = %s", (campaign_id,))
+            campaign_refusal = str(exc.value)
+            assert "ready" in campaign_refusal, campaign_refusal
+
+            for kind, refusal in (
+                (JobKind.SEASON_STICKER, sticker_refusal),
+                (JobKind.PUBLISH_POST, card_refusal),
+                (JobKind.JOIN_REQUEST_CAMPAIGN, campaign_refusal),
+            ):
+                documented = DEPENDENCIES[kind.value]
+                # The command the operator has to run is named in both places; that is the whole test.
+                named = [word for word in ("/sticker", "/card", "/campaign") if word in refusal]
+                assert named and all(word in documented for word in named), (kind.value, refusal, documented)
+            return True
+        finally:
+            await db.close()
+
+    assert asyncio.run(scenario())

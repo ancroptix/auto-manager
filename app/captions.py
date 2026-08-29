@@ -25,6 +25,7 @@ __all__ = [
     "Cleaned",
     "archive_values",
     "audio_label",
+    "button_entries",
     "button_lines",
     "APPROVED_FOOTER",
     "PRIMARY_HANDLES",
@@ -467,6 +468,54 @@ def render_caption(
     return text, tuple(dict.fromkeys(missing))
 
 
+def button_entries(
+    links: Sequence[Mapping[str, Any]],
+    *,
+    single: str | None = None,
+    multi: str | None = None,
+    rows: str = BUTTON_ROWS,
+) -> tuple[list[list[tuple[str, str]]], tuple[str, ...]]:
+    """The button block as ``[[("label", "url")], …]`` — one list per row, one pair per button.
+
+    Channel Help reads a line of ``text - url``; a user session hands Telegram a label and a url.
+    Two builders would be two chances to disagree about where the label ends, so this is the only
+    one and :func:`button_lines` renders its text from these pairs. The split is on the last
+    ``" - "``, which is exactly the syntax the bot documents, so a template that stops using it
+    fails here rather than publishing a button whose label contains a url.
+
+    Returns the rows and any placeholder names with no value, so a link we never received blocks
+    the post instead of putting a dead button under it.
+    """
+    chosen = [entry for entry in links if str(entry.get("link") or entry.get("storage_link") or "").strip()]
+    if not chosen:
+        return [], ("storage_link",)
+    single = single or APPROVED_TEMPLATES["templates.episode_button"]
+    multi = multi or APPROVED_TEMPLATES["templates.episode_button_multi"]
+    missing: list[str] = []
+    pairs: list[tuple[str, str]] = []
+    for entry in chosen:
+        template = single if len(chosen) == 1 else multi
+        values = {
+            "storage_link": str(entry.get("link") or entry.get("storage_link")),
+            "quality": str(entry.get("quality") or "").strip(),
+            "episode": pad_number(entry.get("episode")),
+            "season": pad_number(entry.get("season")),
+        }
+        text, lost = render_template(template, values)
+        # A multi-quality template with no quality on one entry would print the
+        # literal {quality}; fall back to the unlabelled form for that button.
+        if lost and "quality" in lost and len(chosen) > 1:
+            text, lost2 = render_template(single, values)
+            lost = tuple(k for k in lost2 if k != "quality")
+        missing.extend(lost)
+        label, sep, url = text.rpartition(" - ")
+        pairs.append((label if sep else text.strip(), (url or values["storage_link"]).strip()))
+    grouped = (
+        [pairs] if str(rows).casefold() in {"pair", "same_row", "one_row"} else [[pair] for pair in pairs]
+    )
+    return grouped, tuple(dict.fromkeys(missing))
+
+
 def button_lines(
     links: Sequence[Mapping[str, Any]],
     *,
@@ -486,28 +535,8 @@ def button_lines(
     no value, so a link we failed to receive blocks the post instead of publishing
     a button that goes nowhere.
     """
-    chosen = [entry for entry in links if str(entry.get("link") or entry.get("storage_link") or "").strip()]
-    if not chosen:
-        return "", ("storage_link",)
-    single = single or APPROVED_TEMPLATES["templates.episode_button"]
-    multi = multi or APPROVED_TEMPLATES["templates.episode_button_multi"]
-    missing: list[str] = []
-    built: list[str] = []
-    for entry in chosen:
-        template = single if len(chosen) == 1 else multi
-        values = {
-            "storage_link": str(entry.get("link") or entry.get("storage_link")),
-            "quality": str(entry.get("quality") or "").strip(),
-            "episode": pad_number(entry.get("episode")),
-            "season": pad_number(entry.get("season")),
-        }
-        text, lost = render_template(template, values)
-        # A multi-quality template with no quality on one entry would print the
-        # literal {quality}; fall back to the unlabelled form for that button.
-        if lost and "quality" in lost and len(chosen) > 1:
-            text, lost2 = render_template(single, values)
-            lost = tuple(k for k in lost2 if k != "quality")
-        missing.extend(lost)
-        built.append(text)
+    grouped, missing = button_entries(links, single=single, multi=multi, rows=rows)
+    if not grouped:
+        return "", missing or ("storage_link",)
     joiner = " && " if str(rows).casefold() in {"pair", "same_row", "one_row"} else "\n"
-    return joiner.join(built), tuple(dict.fromkeys(missing))
+    return "\n".join(joiner.join(f"{label} - {url}" for label, url in row) for row in grouped), missing

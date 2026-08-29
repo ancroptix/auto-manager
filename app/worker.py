@@ -22,6 +22,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+from . import sender
 from .config import Settings
 from .db import Database, DatabaseUnavailable
 from .keys import reconciliation_key
@@ -59,7 +60,21 @@ class Worker:
         if not self.handlers:
             from .handlers import build_registry
 
-            self.handlers = build_registry()
+            self.handlers = build_registry(self.db, self.settings, client_factory=self._outbound_client)
+
+    def _outbound_client(self) -> Any:
+        """The live session the writers may use, or None when there is none.
+
+        Deliberately *not* a lazy connection: opening a session from inside a job would mean a job
+        decides when the account logs in, and a second connection to the same account is exactly the
+        thing that gets a restricted account flagged. The owner of the session is the process, which
+        starts it at boot and reconnects it after /login; a handler that finds None blocks with the
+        reason, which is the same shape as every other thing this program cannot do by itself.
+        """
+        telegram = self.telegram
+        if telegram is None:
+            return None
+        return telegram.client if getattr(telegram, 'connected', False) else None
 
     # ------------------------------------------------------------ public API
     def start(self) -> None:
@@ -184,6 +199,9 @@ class Worker:
             await self.db.complete(job_id, result or {})
             self._processed += 1
             log.info("job %s (%s) completed", job_id, kind)
+        except sender.RetryLater as exc:
+            # Telegram's own number, once, and the queue waits: no inline sleep, no shorter retry.
+            await self.db.fail(job_id, f"flood wait honoured: {exc}", retry_after=exc.retry_after)
         except (FeatureNotImplemented, NotImplementedError) as exc:
             # Block, do not retry: a missing feature will not appear between
             # attempts, and 8 pointless attempts per hour burns the free hours.

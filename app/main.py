@@ -131,6 +131,20 @@ def create_app(settings: Settings | None = None, *, start_worker: bool | None = 
                     "control bot could not start (%s); queue and HTTP surface unaffected", exc
                 )
 
+        if app.state.user_client is not None:
+            # A stored session is enough to connect; nothing here asks for a code. A failure to
+            # connect is not fatal: the queue keeps reading, and the write jobs block with the one
+            # reason the operator can act on (/login).
+            try:
+                await app.state.user_client.start()
+                log.info("user session connected; write jobs may run")
+            except Exception as exc:
+                log.warning(
+                    "no user session yet (%s): reads and reconciliation continue, write jobs block "
+                    "until /login stores a session",
+                    type(exc).__name__,
+                )
+
         if settings.probe_on_boot:
             # Deliberately not awaited: a probe talks to two third-party bots and
             # waits for their replies, and health checks must not queue behind it.
@@ -166,7 +180,19 @@ def create_app(settings: Settings | None = None, *, start_worker: bool | None = 
     )
     app.state.settings = settings
     app.state.db = Database(settings)
-    app.state.worker = Worker(db=app.state.db, settings=settings) if settings.worker_enabled else None
+    # The user session the write jobs use. Built here, not inside a job, so exactly one thing owns
+    # the connection to the account; None when outbound Telegram is off, and every writer then
+    # refuses with "no session is open" rather than pretending.
+    app.state.user_client = None
+    if settings.outbound_enabled:
+        from .telegram_client import TelegramUserClient
+
+        app.state.user_client = TelegramUserClient(settings)
+    app.state.worker = (
+        Worker(db=app.state.db, settings=settings, telegram=app.state.user_client)
+        if settings.worker_enabled
+        else None
+    )
 
     app.include_router(router)
 

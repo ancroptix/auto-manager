@@ -43,8 +43,12 @@ paid, and nothing in this repo may be designed as though they were on.
 
 Where our code touches this: `app/captions.py` renders the text and the button block that steps 3–4
 consume, `app/config.py:destination_post_links` describes what a created post must carry, and
-`app/handlers.py:DEPENDENCIES` keeps `publish_post` and `edit_post` blocked until this flow has been
-walked once on a real channel of ours. Nothing here automates the bot's chat: no code drives its menu.
+`publish_post` renders the caption and the button block this bot consumes, and `edit_post` rewrites
+the same block on the post that already exists; both stop at the paste. Nothing here automates the
+bot's chat: **no code drives its menu**, and that is a rule, not a gap — until this flow has been
+walked once on a real channel of ours, the flow is documented and not observed. Set
+`publish.route` to `own_session` and the same rendered post goes out from our own account with real
+inline buttons instead, which is the comparison to make during the live run.
 
 ## Buttons, in the syntax the bot reads
 
@@ -109,7 +113,8 @@ is still the right we are least happy about — `docs/requirements-draft.md` car
 Everything above is **documented, not observed on our channels**. What has not been seen by this
 project's own session: a post created through this flow end to end, the bot's reaction list on a real
 episode post, what "Protected" does to a file post people want to forward, and whether the storage
-bot's thumbnail survives the bot's own media pipeline. Those four are why `publish_post` is blocked;
+bot's thumbnail survives the bot's own media pipeline. Those four are what the first live run has
+to answer, in the shadow plan's own words;
 each is a test on a channel we control, not a question for the guide.
 
 ## Sources

@@ -10,8 +10,12 @@ app/
   stages.py            the 7-stage ladder (contract with SQL)
   db.py                asyncpg pool: lazy connect, jsonb codecs, query timeouts, retry-on-stale
   worker.py            the queue loop: claim -> handle -> checkpoint, pause-aware, drain-on-stop
-  handlers.py          real: reconciliation, ingest_media, thumbnail_screen;
-                       the other 8 kinds are explicit "not implemented" markers
+  handlers.py          the registry: reconciliation, ingest_media, thumbnail_screen, plus the eight
+                       writers below; DEPENDENCIES says what each kind still waits on
+  sender.py            the ONE write path: plan/live, peer allowlist, write budget, audit row,
+                       flood waits turned into a re-queue (no handler sleeps on Telegram's clock)
+  writers.py           archive, storage handoff, the two link checks, publish, edit, season sticker,
+                       join-request campaign — each refuses what only a human can supply
   normalize.py         filename/caption parsing + the Hindi-eligibility decision
   ingest.py            one message -> candidate, episode and variant rows
   manifest.py          display order, create-vs-edit, season coverage

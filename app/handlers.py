@@ -1,19 +1,23 @@
-"""Job handlers.
+"""Job handlers: the two that need only a database, plus the eight that reach Telegram.
 
-Every media-path handler in this module is an explicit unimplemented marker, not
-an empty function. That is deliberate: an empty handler would let the queue
-"successfully" process episodes while nothing was archived, published, or
-linked — the worst possible failure mode for this project, because it looks
-healthy in /status.
+Readers first. ``reconciliation`` and ``ingest_media``/``thumbnail_screen`` work on rows and files
+and cannot put anything in front of an audience, so they were written first and are verified against
+the real schema.
 
-Each marker raises :class:`FeatureNotImplemented`, which the worker turns into a
-blocked job that /status reports. So the feature list is visible as a live
-backlog instead of a silently green pipeline.
+:mod:`app.writers` carries the eight that write — archive, storage handoff, the two link checks, the
+destination post, the edit, the season sticker and the join-request campaign. They landed on
+2026-08-29, the day the operator stopped asking for an explanation of the gap and said *"banao
+sabkuch complete karo"*; what keeps them safe is not a stub, it is `app.sender`'s plan mode, the
+approved-caption gate and the rights check, so the first run a session makes is a read of what the
+queue *would* have sent.
 
-Implemented for real here: ``reconciliation`` — the restart-safety job, which
-needs nothing but the database and is what guarantees nothing is lost while the
-free Render instance was asleep.
+``DEPENDENCIES`` used to mean "this kind is not implemented". It now means something narrower and
+more useful: **what each kind still waits on from the operator or a live session**, in the same
+sentence the job raises when it blocks. A test (``tests/test_writers.py``) keeps the two identical,
+because a block reason that drifts away from the documented one is how "we are waiting on you" turns
+into "the app is broken".
 """
+
 
 from __future__ import annotations
 
@@ -25,16 +29,19 @@ from . import ingest, storagebot, thumbnails
 from .db import Database
 from .keys import archive_key
 from .stages import JobKind, JobStage
+from .writers import FeatureNotImplemented, NeedsInput, build_writers
 
 log = logging.getLogger("auto_manager.handlers")
 
-__all__ = ["FeatureNotImplemented", "Context", "build_registry", "JobHandler"]
+__all__ = [
+    "Context",
+    "DEPENDENCIES",
+    "FeatureNotImplemented",
+    "NeedsInput",
+    "build_registry",
+]
 
 Handler = Callable[[dict[str, Any], "Context"], Awaitable[dict[str, Any] | None]]
-
-
-class FeatureNotImplemented(NotImplementedError):
-    """Raised by a stub handler so the job blocks visibly rather than passing."""
 
 
 @dataclass
@@ -50,54 +57,74 @@ class Context:
 
 # --- feature modules that land next -----------------------------------------
 
+#: What each write kind still waits on. Empty means "nothing: it runs the moment a session does".
 DEPENDENCIES: dict[str, str] = {
-    JobKind.ARCHIVE_MEDIA.value: "server-side copy into the private master archive channel",
-    JobKind.STORAGE_UPLOAD.value: (
-        "the @anime_hindifilesbot menu is known (app/storagebot.py: /genlink, /batch, "
-        "/custom_batch, /special_link, /universal_link) and so is the first conversation: "
-        + storagebot.flow_note()
-        + ". What is missing now is the write layer — the code that forwards, reads the reply back "
-        "and stores the token — and the behaviour only an authenticated run can settle, listed in "
-        "app.storagebot.still_unknown(). Which bot answered is read from the link's host, not from "
-        "its wording: @Link_providerobot is a sibling clone that says the same sentence "
-        "(app/linkprovider.py)"
+    JobKind.ARCHIVE_MEDIA.value: (
+        "a row in app.archive_channel naming the private master archive; this program never invents a "
+        "channel to hold the only spare copy of an episode"
     ),
-    JobKind.LINK_VERIFY.value: "link liveness probe",
-    # The publisher has two audiences, and only one of them is a series channel: the episode post
-    # goes to the destination, and the updates channel is owed a short announcement carrying the
-    # link-provider deep link. That announcement's box is approved (templates.announcement_post,
-    # 2026-08-28), and this job kind is *still* blocked, because approval is not a transport: what is
-    # missing is the send path. ``docs/channel-help.md`` is the documented flow the episode half has
-    # to match, and no part of it has been walked on a channel of ours yet.
+    JobKind.STORAGE_UPLOAD.value: (
+        "an authenticated session, because the handoff is a conversation with @anime_hindifilesbot "
+        "and not a description of one. The verbs it drives are exactly the ones the operator walked "
+        "through: "
+        + storagebot.flow_note()
+        + ". /genlink, /custom_batch and /special_link exist on that bot's menu and stay un-driven — "
+        "a single-message link, a custom-caption batch and a special link are each the operator's "
+        "call, and a handler that picked one would be picking their post format for them. What a menu "
+        "and a screenshot cannot say is whether the reply's link survives the source post, so the "
+        "handler reads the answer, refuses to store a link it did not receive, and blocks with the "
+        "shapes it saw. Which bot answered is read from the link's host, not its wording: "
+        "@Link_providerobot is a sibling clone that says the same sentence (app/linkprovider.py)"
+    ),
+    JobKind.LINK_VERIFY.value: (
+        "a session, for the half that reads the source range back; the shape half runs today and is "
+        "the half that catches a link belonging to another bot"
+    ),
+    JobKind.LINK_HEALTH_CHECK.value: (
+        "the same read as link_verify, plus the rate limit of a free deployment: it is bounded per run "
+        "on purpose, so a health check never becomes the outage it was meant to notice"
+    ),
     JobKind.PUBLISH_POST.value: (
-        "the MTProto send path — Channel Help's documented post flow for a destination episode "
-        "(docs/channel-help.md), and the updates-channel announcement, whose text is approved and "
-        "whose sender does not exist yet (app/linkprovider.py)"
+        "the caption box is approved (app/captions.py), so the only gate left is who presses send: "
+        "publish.route — chelp_block renders the approved caption and the button block for Channel "
+        "Help to paste (docs/channel-help.md is the documented flow it must match), own_session sends "
+        "it from our account with real inline buttons. Either way the announcement half needs a card "
+        "post named per destination (/card) so the notice carries a link-provider deep link rather "
+        "than the invite itself (app/linkprovider.py)"
     ),
     JobKind.EDIT_POST.value: (
-        "the session's messages.editMessage path: replacing the media on a post Channel Help made, or "
-        "editing its caption, is documented in docs/channel-help.md under My posts — which is a "
-        "description of the tool, not a test of ours"
+        "our own rights on that destination, read by /probe (app/rights.py) — and the same approved "
+        "box plus button block as publish_post, because an edit rewrites the post rather than "
+        "printing a second one (docs/channel-help.md)"
     ),
-    JobKind.SEASON_STICKER.value: "sticker-pack label mapping (S1, Season 2, ...)",
+    JobKind.SEASON_STICKER.value: (
+        "/sticker <series> <season> from <channel> <message id>: Telegram addresses a sticker by the "
+        "document that carries it, so a pack name or an install link is not enough to post from, and "
+        "guessing which sticker opens a season is not this program's call"
+    ),
     JobKind.JOIN_REQUEST_CAMPAIGN.value: (
-        "the owner-triggered sender itself. The wording is a setting now (/joinmsg writes "
-        "app.config key joinrequest.message; app/joinmsg.py holds the presets and the refusals), "
-        "and app.join_campaign already carries the pacing columns and the check that a send never "
-        "approves. What does not exist is the code that reads still-pending requests, honours every "
-        "FloodWait and stops on a restriction — the same missing MTProto write path that blocks "
-        "publish_post and edit_post"
+        "the campaign text (app/joinmsg.py, /joinmsg) and a campaign row set to ready by "
+        "/campaign … confirm with the code that command shows. The text is refused if it carries an "
+        "invite link or reads like a decision about the request, and the per-hour ceiling pauses the "
+        "campaign rather than pushing past it"
     ),
-    JobKind.LINK_HEALTH_CHECK.value: "periodic re-check of published storage links",
 }
 
 
 def _stub(kind: str) -> Handler:
+    """A handler that refuses, for a job kind nothing has claimed yet.
+
+    Marked with ``is_stub`` so a test can assert that no *supported* kind is served by one: "the
+    registry covers the vocabulary" is only worth saying if something checks it, and a kind that
+    quietly falls back to a stub would otherwise look like a queue that is merely idle.
+    """
+
     async def _handler(job: dict[str, Any], ctx: Context) -> dict[str, Any] | None:
         raise FeatureNotImplemented(
-            f"handler for {kind!r} is not implemented yet — {DEPENDENCIES.get(kind, 'awaiting design input')}"
+            f"nothing performs {kind!r} yet — {DEPENDENCIES.get(kind, 'awaiting design input')}"
         )
 
+    _handler.is_stub = True  # type: ignore[attr-defined]
     return _handler
 
 
@@ -284,13 +311,22 @@ async def thumbnail_screen(job: dict[str, Any], ctx: Context) -> dict[str, Any]:
     }
 
 
-def build_registry() -> dict[str, Handler]:
-    """Job kind -> handler. The keys are the whole supported vocabulary."""
+def build_registry(db: Any = None, settings: Any = None, *, client_factory: Any = None) -> dict[str, Handler]:
+    """Job kind -> handler. The keys are the whole supported vocabulary.
+
+    The writers are built here rather than at import time because they hold a database handle and a
+    session factory: a registry assembled at import would either need a global connection or hand
+    every handler ``None``, and a handler that quietly carries a None client is the bug this whole
+    module exists to avoid. Called with no arguments it still returns the two readers, so the
+    ``build_registry()[kind]`` lookups in the tests and in ``/status`` keep working.
+    """
     registry: dict[str, Handler] = {
         JobKind.RECONCILIATION.value: reconciliation,
         JobKind.INGEST_MEDIA.value: ingest_media,
         JobKind.THUMBNAIL_SCREEN.value: thumbnail_screen,
     }
+    if db is not None:
+        registry.update(build_writers(db, settings, client_factory=client_factory))
     for kind in JobKind:
         if kind.value not in registry:
             registry[kind.value] = _stub(kind.value)

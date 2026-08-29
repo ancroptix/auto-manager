@@ -175,30 +175,38 @@ def test_the_doc_lists_exactly_the_open_questions() -> None:
     assert len(numbered) == len(storagebot.still_unknown())
 
 
-def test_the_handler_still_refuses_and_says_which_half_is_missing() -> None:
-    """`storage_upload` must stay a loud failure while the link's durability is unobserved.
+def test_the_handler_drives_only_the_verb_that_was_walked() -> None:
+    """`storage_upload` exists now, and what it refuses is the *undriven* half of that bot's menu.
 
-    This test exists because the temptation, once a protocol is half-known, is to write the handler
-    and let the queue go green. The flow *is* known now — the operator walked through `/batch` on
-    2026-08-29 — and the job still blocks, because "forward two messages, get a link" is not the
-    thing that decides whether a published post survives: whether the link is a reference to a
-    source post or a copy is (still_unknown's second item), and a handler written before that
-    reading is a handler that can orphan every link in a season.
+    This test used to say "the handler must stay a loud failure". The handler is written, so the
+    promise moved: `/batch` is what the operator walked through on 2026-08-29 and it is the only verb
+    this program sends. `/genlink`, `/custom_batch` and `/special_link` are real — the menu proves
+    that — but each one is a choice about how the operator's post reads, and a handler that picked one
+    would be making that choice on their behalf. The sentence `/status` prints is checked against the
+    data it is built from, so a docstring cannot drift away from the queue's own words.
     """
-    from app.handlers import DEPENDENCIES, FeatureNotImplemented, JobKind  # noqa: PLC0415
+    from app.handlers import DEPENDENCIES, JobKind, _stub, build_registry  # noqa: PLC0415
 
     reason = DEPENDENCIES[JobKind.STORAGE_UPLOAD.value]
     for fragment in ("/genlink", "/custom_batch", "/special_link"):
-        assert fragment in reason, "the blocked reason should name what the operator has to approve"
-    assert "authenticated" in reason.lower()
+        assert fragment in reason, "the reason must name the verbs this program refuses to drive"
+    assert "authenticated" in reason.lower(), "and name the session the conversation needs"
     # The observed flow reaches the operator through this same string, not through a summary someone
     # wrote by hand next to it: `/status` prints what the data says.
     assert storagebot.flow_note() in reason
-    with pytest.raises(FeatureNotImplemented):
-        # The stub itself: importing and calling the builder must not silently succeed.
-        from app.handlers import _stub
+    assert "Link_providerobot" in reason, "the sibling clone that answers the same sentence is a trap"
 
-        raise FeatureNotImplemented(reason)
+    # No kind in the supported vocabulary is served by a stub any more — and the marker that proves
+    # that has to exist, or the assertion below would pass on a typo. The registry is built with
+    # placeholders because a registry built *without* a database is the shadow-of-a-shadow: it holds
+    # only the readers, and every write kind would fall back to a stub for a reason that has nothing
+    # to do with this assertion.
+    registry = build_registry(db=object(), settings=object())
+    assert not any(getattr(handler, "is_stub", False) for handler in registry.values()), (
+        "a job kind the queue can claim but nobody performs"
+    )
+    assert getattr(_stub(JobKind.STORAGE_UPLOAD.value), "is_stub", False) is True
+    assert len(registry) == len(list(JobKind))
 
 
 # --- the observed /batch flow, and the vendor's claims ----------------------------------------

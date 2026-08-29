@@ -65,6 +65,9 @@ HELP = """auto-manager control
 /source      say what a source channel carries (series, audio, season) — for bare-file channels
 /inplace     caption the files already posted in your own channel (no delete; link + post still run)
 /joinmsg     what a join requester is told: options, your own words, or switch it off
+/card        name the post a shareable link is made from, per destination channel (the announcement)
+/sticker     which sticker message opens a season, and from where
+/campaign    draft, plan, confirm a join-request campaign: two steps before anyone is messaged
 /sessions    stored Telegram sessions (never their contents)
 /use <name>  make one session the active account
 /forget <n>  delete a stored session from the database
@@ -98,6 +101,9 @@ _ROUTES: dict[str, str] = {
     "source": "_source",
     "inplace": "_inplace",
     "joinmsg": "_joinmsg",
+    "card": "_card",
+    "sticker": "_sticker",
+    "campaign": "_campaign",
     "sessions": "_sessions",
     "use": "_use",
     "forget": "_forget",
@@ -1127,6 +1133,436 @@ class ControlBot:
             "session, and while the publish layer is unwired that is the part still missing."
         )
         return "\n".join(lines)
+
+    # --- the three things a write job cannot do without ------------------------------------------
+    #
+    # `/card`, `/sticker` and `/campaign` exist because `app/writers.py` refuses to guess the same
+    # three facts: which post a shareable link was made for, which message carries a season's sticker,
+    # and when a campaign of DMs to strangers is allowed to run. Each command writes a row, shows what
+    # it wrote, and never sends anything itself.
+
+    _CARD_USAGE = (
+        "usage: /card <@handle, channel id or title> <message id>\n"
+        "  /card -1001234567890 42      the card post in that destination, message 42\n"
+        "  /card @bleach_hindi 42       same, by the channel's own handle\n"
+        "  /card @bleach_hindi show     what is recorded, and whether a link was ever returned\n"
+        "  /card @bleach_hindi clear    stop announcing that channel\n"
+        "  /card                        every destination and its card state\n\n"
+        "the card is the post we forward to the link bot to get a shareable link; the announcements "
+        "channel carries that link and never the invite itself. The message id is a number inside "
+        "that channel — copy it from Copy Link, where it is the digits after /."
+    )
+
+    async def _find_destination(self, handle: str) -> list | str:
+        """Look a destination channel up by id, title, or the handle of the source paired with it.
+
+        `app.destination` stores no username of its own, so a `@handle` is matched through the source
+        channel that publishes into it — which is how the operator names these channels anyway.
+        """
+        stripped = handle.lstrip("@")
+        numeric = int(stripped) if stripped.lstrip("-").isdigit() and stripped != "-" else None
+        rows = await self.db.fetch(
+            """
+            select d.id, d.title, d.telegram_channel_id, d.publish_mode, d.card_message_id,
+                   d.announcement_link, d.announcement_link_at, sr.title as series
+              from app.destination d
+              join app.series sr on sr.id = d.series_id
+              left join app.source_channel sc on sc.destination_id = d.id
+             where ($1::bigint is not null and d.telegram_channel_id = $1)
+                or ($2::text is not null and lower(btrim(coalesce(d.title, ''))) = lower($2))
+                or ($2::text is not null and lower(btrim(coalesce(sc.username, ''), '@')) = lower($2))
+             order by d.id
+            """,
+            numeric,
+            stripped,
+        )
+        if not rows:
+            return (
+                f"`{handle}` matches no destination channel, by its own id or title or the source "
+                "channel that publishes into it. /destinations lists what exists; a destination row "
+                "is written by the ingest side when a series first arrives."
+            )
+        return list(rows)
+
+    @staticmethod
+    def _card_line(row: dict) -> str:
+        card = row.get("card_message_id")
+        link = row.get("announcement_link")
+        state = f"card message {card}" if card else "no card message named"
+        got = f", link recorded {link}" if link else ", no link recorded yet"
+        return f"• {row.get('title') or row.get('series')} ({row.get('telegram_channel_id')}): {state}{got}"
+
+    async def _card(self, update: Update, args: list[str]) -> list[Reply]:
+        """``/card <channel> <message id|show|clear>`` — the post the shareable link is made from.
+
+        One number, per destination, chosen by the operator. Everything about the announcement
+        follows from it, and nothing here asks the link bot a second time in the same run: the bot
+        answers once, to the forward, so the link that comes back is stored (`app.destination
+        .announcement_link`) and the job that could not reach it blocks instead of posting the invite.
+        """
+        if self.db is None or not getattr(self.db, "connected", False):
+            return [Reply("the database is not reachable, so I cannot record a card post.")]
+        if not args:
+            rows = await self.db.fetch(
+                "select d.id, d.title, d.telegram_channel_id, d.card_message_id, d.announcement_link,"
+                " d.announcement_link_at, null::text as series from app.destination d order by d.id limit 25"
+            )
+            if not rows:
+                return [Reply("no destination channels exist yet, so there is nothing to name.")]
+            return [Reply("\n".join(self._card_line(row) for row in rows))]
+        if args[0].strip().casefold() in {"help", "-h", "?"}:
+            return [Reply(self._CARD_USAGE)]
+        handle, rest = args[0].strip(), [a.strip() for a in args[1:]]
+        found = await self._find_destination(handle)
+        if isinstance(found, str):
+            return [Reply(f"{found}\n\n{self._CARD_USAGE}")]
+        if len(found) > 1:
+            names = ", ".join(str(row.get("title") or row.get("id")) for row in found)
+            return [Reply(f"`{handle}` matches {len(found)} destinations ({names}). Use the channel id.")]
+        row = found[0]
+        action = (rest[0] if rest else "show").casefold()
+        if action == "show" or not rest:
+            return [Reply(self._card_line(row))]
+        if action == "clear":
+            await self.db.execute(
+                "update app.destination set card_message_id = null, announcement_link = null,"
+                " announcement_link_at = now() where id = $1",
+                int(row["id"]),
+            )
+            return [Reply(
+                "card message cleared for " + str(row.get("title") or row["id"])
+                + ". The stored link is left in place on purpose: deleting is not this program's "
+                "verb, and a link that exists can still be announced until you say otherwise."
+            )]
+        if not action.isdigit():
+            return [Reply(f"`{rest[0]}` is not a message id.\n\n{self._CARD_USAGE}")]
+        await self.db.execute(
+            "update app.destination set card_message_id = $2 where id = $1",
+            int(row["id"]),
+            int(action),
+        )
+        return [Reply(
+            f"card post for {row.get('title') or row['id']} is now message {action}.\n\n"
+            "the next publish for that channel asks @Link_providerobot for a shareable link to it, "
+            "in shadow mode by planning the ask. Nothing was sent just now — this recorded a number."
+        )]
+
+    _STICKER_USAGE = (
+        "usage: /sticker <series> <season> from <@handle or channel id> <message id>\n"
+        "  /sticker Bleach 2 from @anime_uploads4u 8812\n"
+        "  /sticker Bleach 2 show          what is recorded\n"
+        "  /sticker Bleach 2 clear         no sticker for that season\n\n"
+        "Telegram addresses a sticker by the message that carries it, so a pack name or an install "
+        "link is not enough: name one message in one channel and the season sticker is forwarded from "
+        "it, before that season's first episode post."
+    )
+
+    async def _sticker(self, update: Update, args: list[str]) -> list[Reply]:
+        """``/sticker <series> <season> from <peer> <message id>`` — which sticker opens a season.
+
+        The mapping this program will not do for you: which of a pack's stickers means "season 2
+        starts here". The command stores the address and the writer forwards the message; the pack
+        url from `/sticker-pack` stays what the post *links to*, which is a different thing.
+        """
+        from . import keys  # noqa: PLC0415  (the dedup key for the job this queues)
+        from .stages import JobKind  # noqa: PLC0415
+
+        if self.db is None or not getattr(self.db, "connected", False):
+            return [Reply("the database is not reachable, so I cannot record a sticker source.")]
+        text = [a.strip() for a in args if a.strip()]
+        if not text or text[0].casefold() in {"help", "-h", "?"}:
+            return [Reply(self._STICKER_USAGE)]
+        lowered = [a.casefold() for a in text]
+        try:
+            tail = lowered.index("from")
+        except ValueError:
+            tail = -1
+        if tail < 1 or tail + 2 >= len(text):
+            if lowered[-1] in {"show", "clear"} and len(text) >= 2:
+                head, action = text[:-1], lowered[-1]
+                peers = None
+            else:
+                return [Reply(f"that is not a sticker address.\n\n{self._STICKER_USAGE}")]
+        else:
+            head, action, peers = text[:tail], "set", text[tail + 1 : tail + 3]
+
+        *series_words, season_token = head
+        series = " ".join(str(word) for word in series_words).strip()
+        if not series or not season_token.isdigit():
+            return [Reply(f"need a series name and a season number.\n\n{self._STICKER_USAGE}")]
+        season_number = int(season_token)
+        row = await self.db.fetchrow(
+            "select s.id as season_id, s.season_number, s.sticker_source_chat_id, s.sticker_source_message_id,"
+            " s.sticker_posted, sr.title, sr.id as series_id, d.id as destination_id"
+            " from app.season s join app.series sr on sr.id = s.series_id"
+            " left join app.destination d on d.series_id = sr.id"
+            " where lower(sr.title) = lower($1) and s.season_number = $2 order by s.id limit 1",
+            series,
+            season_number,
+        )
+        if row is None:
+            return [Reply(
+                f"no season {season_number} for a series called {series!r} yet. Seasons come from the "
+                "files that arrive (or from /declare); I do not create a season to hold a sticker."
+            )]
+        if action == "show":
+            state = (
+                f"source {row['sticker_source_chat_id']}#{row['sticker_source_message_id']}"
+                if row.get("sticker_source_message_id")
+                else "no source message named"
+            )
+            posted = " already posted" if row.get("sticker_posted") else ""
+            return [Reply(f"{row['title']} S{season_number}: {state}{posted}")]
+        if action == "clear":
+            await self.db.execute(
+                "update app.season set sticker_source_chat_id = null, sticker_source_message_id = null,"
+                " updated_at = now() where id = $1",
+                int(row["season_id"]),
+            )
+            return [Reply(f"sticker source cleared for {row['title']} S{season_number}.")]
+        peer_text, message_id = peers
+        numeric = peer_text.lstrip("@")
+        if not numeric.lstrip("-").isdigit():
+            found = await self.db.fetchrow(
+                "select telegram_channel_id from app.source_channel"
+                " where lower(btrim(coalesce(username, ''), '@')) = lower($1) order by id limit 1",
+                numeric,
+            )
+            if found is None:
+                return [Reply(
+                    f"I do not know a channel called {peer_text!r}, and a sticker must be forwarded "
+                    "from a channel this program already reads or publishes to. Give me the numeric id "
+                    "if the handle is not one of those."
+                )]
+            chat_id = int(found["telegram_channel_id"])
+        else:
+            chat_id = int(numeric)
+        await self.db.execute(
+            "update app.season set sticker_source_chat_id = $2, sticker_source_message_id = $3,"
+            " updated_at = now() where id = $1",
+            int(row["season_id"]),
+            chat_id,
+            int(message_id),
+        )
+        queued = None
+        if row.get("destination_id") is not None:
+            queued = await self.db.enqueue(
+                JobKind.SEASON_STICKER.value,
+                keys.sticker_key(int(row["season_id"])),
+                payload={"season_id": int(row["season_id"]), "destination_id": int(row["destination_id"])},
+                season_id=int(row["season_id"]),
+                destination_id=int(row["destination_id"]),
+            )
+        return [Reply(
+            f"{row['title']} S{season_number} will open with the sticker in {chat_id}#{message_id}."
+            + (
+                "\n\nthe sticker job is queued; in shadow mode it plans the forward and blocks with "
+                "the plan, which is the point of the run."
+                if queued
+                else "\n\nnothing is queued: that series has no destination channel row to post into."
+            )
+        )]
+
+    _CAMPAIGN_USAGE = (
+        "usage: /campaign <channel> [new <name> | text <name> <words…> | plan <name> |"
+        " confirm <name> <code> | pause <name> | abort <name>]\n"
+        "  /campaign @bleach_hindi new wave1      draft it from the saved /joinmsg wording\n"
+        "  /campaign @bleach_hindi plan wave1       who would be contacted, and the code\n"
+        "  /campaign @bleach_hindi confirm wave1 4F2A   let it run\n\n"
+        "a campaign messages people whose join request is still pending, one message each, at "
+        "campaign.rate_per_hour at most. It is the only job kind here that contacts a stranger, so it "
+        "takes two deliberate steps and an unreadable-by-accident code; aborting leaves every row in "
+        "place, and a contact is never contacted twice."
+    )
+
+    async def _campaign(self, update: Update, args: list[str]) -> list[Reply]:
+        """``/campaign`` — draft, plan, confirm. Two human steps before any DM goes out.
+
+        The plan is computed from the same two sources the job will use — `app.sender`'s read of the
+        channel's pending requests and `app.joinmsg`'s refusal rules — so what the operator reads is
+        not a promise about the run but the first half of it. The read is real even in shadow mode,
+        because reading a list is not a write; sending still needs `confirm`, and the sending itself
+        plans and blocks until the deployment is live.
+        """
+        from . import joinmsg, keys  # noqa: PLC0415
+        from .stages import JobKind, JobStage  # noqa: PLC0415
+
+        if self.db is None or not getattr(self.db, "connected", False):
+            return [Reply("the database is not reachable, so I cannot draft a campaign.")]
+        text = [a.strip() for a in args if a.strip()]
+        if not text or text[0].casefold() in {"help", "-h", "?"}:
+            return [Reply(self._CAMPAIGN_USAGE)]
+        handle, rest = text[0], text[1:]
+        found = await self._find_destination(handle)
+        if isinstance(found, str):
+            return [Reply(f"{found}\n\n{self._CAMPAIGN_USAGE}")]
+        if len(found) > 1:
+            return [Reply("that handle matches more than one destination; use the channel id.")]
+        destination = found[0]
+        action = (rest[0] if rest else "list").casefold()
+
+        async def _row(name: str) -> dict | None:
+            return await self.db.fetchrow(
+                "select id, name, status, message_template, rate_per_hour, confirm_required"
+                " from app.join_campaign where destination_id = $1 and lower(name) = lower($2)",
+                int(destination["id"]),
+                name,
+            )
+
+        if action == "list":
+            rows = await self.db.fetch(
+                "select c.name, c.status, c.rate_per_hour,"
+                " (select count(*) from app.join_campaign_contact k where k.campaign_id = c.id"
+                "   and k.status = 'sent') as sent"
+                " from app.join_campaign c where c.destination_id = $1 order by c.id",
+                int(destination["id"]),
+            )
+            if not rows:
+                return [Reply(f"no campaigns for {destination.get('title') or destination['id']} yet.")]
+            lines = [
+                f"• {row['name']}: {row['status']}, {row['sent']} sent, {row['rate_per_hour']}/hour"
+                for row in rows
+            ]
+            return [Reply("\n".join(lines))]
+
+        if action in {"new", "text"}:
+            if len(rest) < 2:
+                return [Reply(f"`{action}` needs a name.\n\n{self._CAMPAIGN_USAGE}")]
+            name = rest[1]
+            body = " ".join(rest[2:]).strip() if action == "text" else ""
+            if action == "new":
+                body = str(await self.db.config(joinmsg.CONFIG_KEY, "") or "").strip()
+                if not body:
+                    return [Reply(
+                        "there is no saved wording to draft from — /joinmsg options, then /joinmsg use "
+                        "<n> or /joinmsg set <text>. A campaign with no text is not an empty campaign, "
+                        "it is no campaign."
+                    )]
+            problems = joinmsg.refusals(body)
+            if problems:
+                return [Reply("I will not save that:\n" + "\n\n".join(f"• {p}" for p in problems))]
+            existing = await _row(name)
+            if existing is not None and action == "new":
+                return [Reply(
+                    f"`{name}` already exists ({existing['status']}). Use `text {name} <words>` to "
+                    "rewrite it, or pick another name — a campaign is not overwritten by accident."
+                )]
+            if existing is not None:
+                await self.db.execute(
+                    "update app.join_campaign set message_template = $2, updated_at = now()"
+                    " where id = $1",
+                    int(existing["id"]),
+                    body,
+                )
+                campaign_id = int(existing["id"])
+            else:
+                inserted = await self.db.fetchrow(
+                    "insert into app.join_campaign (destination_id, name, message_template, status)"
+                    " values ($1, $2, $3, 'draft') returning id",
+                    int(destination["id"]),
+                    name,
+                    body,
+                )
+                campaign_id = int(inserted["id"])
+            return [Reply(
+                f"campaign `{name}` saved as a draft (id {campaign_id}), {len(body)} chars.\n\n"
+                f"plan it: /campaign {handle} plan {name}"
+            )]
+
+        if action in {"plan", "confirm", "pause", "abort"}:
+            if len(rest) < 2:
+                return [Reply(f"`{action}` needs a name.\n\n{self._CAMPAIGN_USAGE}")]
+            name = rest[1]
+            campaign = await _row(name)
+            if campaign is None:
+                return [Reply(f"no campaign called `{name}` for that channel. /campaign {handle} list")]
+
+            if action == "plan":
+                pending = ""
+                if getattr(self.settings, "outbound_enabled", False) and self.telegram is not None:
+                    from . import sender  # noqa: PLC0415
+
+                    client = getattr(self.telegram, "client", None)
+                    if client is not None:
+                        reader = sender.Sender(
+                            client,
+                            db=None,
+                            policy=sender.WritePolicy(mode="plan", allow_peers=()),
+                        )
+                        ok, requests = await reader.pending_requests(
+                            str(destination.get("telegram_channel_id") or ""), limit=100
+                        )
+                        waiting = [row for row in requests if not row.get("approved_by")]
+                        pending = (
+                            f"\n\n{len(waiting)} request(s) are pending right now"
+                            + ("" if ok.ok else f" (the read said: {ok.detail})")
+                        )
+                else:
+                    pending = (
+                        "\n\nI cannot count the pending requests without a live session; the job reads "
+                        "them again when it runs, so this plan shows the rules and not the headcount."
+                    )
+                code = joinmsg.confirm_code(campaign["id"], campaign["message_template"])
+                return [Reply(
+                    f"campaign `{name}` ({campaign['status']}) on "
+                    f"{destination.get('title') or destination['id']}:\n\n"
+                    f"• text: {campaign['message_template']}\n"
+                    f"• at most {campaign['rate_per_hour']} people per hour, one message each\n"
+                    f"• nobody is contacted twice, and a message never approves or declines the request"
+                    f"{pending}\n\n"
+                    f"to run it: /campaign {handle} confirm {name} {code}\n"
+                    f"the code is that campaign and that exact text; change the wording and it changes."
+                )]
+
+            if action == "confirm":
+                if len(rest) < 3:
+                    return [Reply(f"`confirm` needs the code `plan` printed.\n\n{self._CAMPAIGN_USAGE}")]
+                wanted = joinmsg.confirm_code(campaign["id"], campaign["message_template"])
+                if rest[2].strip().upper() != wanted:
+                    return [Reply(
+                        f"that is not the code for `{name}`. Run /campaign {handle} plan {name} — and "
+                        "no, I will not tell you the code here: the point of typing it is that you read "
+                        "the plan first."
+                    )]
+                problems = joinmsg.refusals(campaign["message_template"])
+                if problems:
+                    return [Reply("that text breaks a rule, so it will not be sent:\n" + "\n".join(f"• {p}" for p in problems))]
+                await self.db.execute(
+                    "update app.join_campaign set status = 'ready', updated_at = now() where id = $1",
+                    int(campaign["id"]),
+                )
+                queued = await self.db.enqueue(
+                    JobKind.JOIN_REQUEST_CAMPAIGN.value,
+                    keys.campaign_key(int(destination["id"]), str(campaign["name"])),
+                    stage=JobStage.DISCOVERED,
+                    payload={"campaign_id": int(campaign["id"]), "destination_id": int(destination["id"])},
+                    destination_id=int(destination["id"]),
+                )
+                return [Reply(
+                    f"`{name}` is ready and the job is {'queued' if queued else 'already queued'}. "
+                    + (
+                        "In shadow mode each message plans and blocks, which is the read-only version "
+                        "of this run."
+                        if not getattr(self.settings, "outbound_enabled", False)
+                        else "It will send at the campaign's own rate and stop at the ceiling."
+                    )
+                )]
+
+            status = {"pause": "paused", "abort": "aborted"}[action]
+            await self.db.execute(
+                "update app.join_campaign set status = $2, updated_at = now(),"
+                " finished_at = case when $2 = 'aborted' then now() else finished_at end where id = $1",
+                int(campaign["id"]),
+                status,
+            )
+            return [Reply(
+                f"`{name}` is {status}. Contacts already sent stay sent — this program does not "
+                "un-send a message to a stranger, and it does not delete the record of one."
+            )]
+
+        return [Reply(f"I do not know `/campaign {handle} {rest[0]}`.\n\n{self._CAMPAIGN_USAGE}")]
+
+
 
     async def _find_source_channel(self, handle: str) -> list | str:
         """Look a source channel up by @handle or numeric Telegram id.

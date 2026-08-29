@@ -112,6 +112,31 @@ class FakeDb:
         # /inplace: the destination row for the channel being switched, the messages it would
         # edit, and the episode numbers of the channel it is compared against.
         self.destination: dict | None = None
+        # /card, /sticker and /campaign: one destination and one drafted campaign, shaped like the
+        # rows those queries select, so the commands can be tested on their parsing and their
+        # promises rather than on a database they do not need.
+        self.destinations: list[dict] = [
+            {
+                "id": 21,
+                "title": "Dekin no mogura Anime in Hindi",
+                "telegram_channel_id": -1001234,
+                "publish_mode": "link_post",
+                "card_message_id": None,
+                "announcement_link": None,
+                "announcement_link_at": None,
+                "series": "Dekin no mogura",
+                "source_username": "bleach_hindi",
+            }
+        ]
+        self.campaign: dict | None = {
+            "id": 9,
+            "name": "wave1",
+            "status": "draft",
+            "message_template": "welcome {name}",
+            "rate_per_hour": 20,
+            "confirm_required": True,
+        }
+        self.seasons: list[dict] = []
         self.inplace_rows: list[dict] = []
         self.inplace_source: list[int] = []
         self.config_rows: dict[str, Any] = {}
@@ -140,6 +165,23 @@ class FakeDb:
             needle = str(args[0] or "")
             hits = [row for row in self.series if needle and needle in row["normalized_title"]]
             return hits or ([] if needle else [dict(row) for row in self.series])
+        if "from app.destination d" in sql:  # /card and /campaign name a channel three ways
+            if not args:
+                return [dict(row) for row in self.destinations]  # /card's bare listing
+            numeric, needle = args[0], str(args[1] or "").casefold()
+
+            def _hit(row: dict) -> bool:
+                if numeric is not None and row.get("telegram_channel_id") == numeric:
+                    return True
+                if not needle:
+                    return False
+                return needle in {
+                    str(row.get("title") or "").casefold(),
+                    str(row.get("source_username") or "").casefold(),
+                    str(row.get("series") or "").casefold(),
+                }
+
+            return [dict(row) for row in self.destinations if _hit(row)]
         if "as is_media" in sql:  # /inplace's plan query
             return [dict(row) for row in self.inplace_rows]
         if "select distinct episode_number" in sql:
@@ -161,6 +203,21 @@ class FakeDb:
         return []
 
     async def fetchrow(self, sql: str, *args: Any):
+        if "sticker_source_chat_id" in sql:  # /sticker's season lookup
+            needle = str(args[0] or "").casefold()
+            hit = next(
+                (
+                    row
+                    for row in self.seasons
+                    if str(row.get("title") or "").casefold() == needle and row.get("season_number") == args[1]
+                ),
+                None,
+            )
+            return dict(hit) if hit else None
+        if "select telegram_channel_id from app.source_channel" in sql:
+            return None
+        if "from app.join_campaign" in sql:
+            return dict(self.campaign) if self.campaign else None
         if "from app.destination" in sql:
             return dict(self.destination) if self.destination else None
         if "delete from app.telegram_session" in sql:
@@ -223,6 +280,14 @@ class FakeDb:
                 else:
                     row[f"declared_{name}"] = str(value)
             self.declared_history.append(dict(row))
+            self.writes.append((sql, args))
+            return 1
+        if "update app.join_campaign set" in sql:
+            # /campaign's two state changes, mirrored onto the fake row so a test can read the
+            # status back instead of pattern-matching the SQL it was written with.
+            status = re.search(r"status = '([a-z_]+)'", sql)
+            if status and self.campaign is not None:
+                self.campaign["status"] = status.group(1)
             self.writes.append((sql, args))
             return 1
         if "insert into app.season" in sql:
@@ -1513,3 +1578,123 @@ async def test_a_channel_of_text_posts_is_still_recorded_and_its_posts_left_alon
     assert "1 ignore" in text, text
     assert "1 text message" not in text  # the summary names the action, not a count of messages
     assert db.destination["publish_mode"] == "link_post", "a plan preview must not flip the mode"
+
+
+@pytest.mark.asyncio
+async def test_card_records_the_post_the_announcement_is_built_from(make_settings) -> None:
+    """`/card` writes one number per destination and says plainly that it wrote only that.
+
+    The card is the whole difference between an announcement that carries a shareable link and one
+    that carries the channel invite — which is the thing that gets an invite revoked. So the promise
+    under test is twofold: the row is updated, and nothing was sent. Replies are read off the command
+    itself, because a command that answers the owner is not the same act as one that posts anywhere.
+    """
+    db = FakeDb()
+    control = ControlBot(
+        api=FakeApi(), db=db, settings=make_settings(), owner_ids=frozenset({OWNER})  # type: ignore[arg-type]
+    )
+
+    def text_of(replies) -> str:
+        return "\n".join(reply.text for reply in replies)
+
+    first = text_of(await control._card(None, ["-1001234", "42"]))
+    assert "message 42" in first, first
+    assert db.writes, "the card message id was never written"
+    sql, args = db.writes[-1]
+    assert "card_message_id = $2" in sql and args == (21, 42), (sql, args)
+
+    shown = text_of(await control._card(None, ["-1001234", "show"]))
+    assert "no card message named" in shown, "show reads the row, not what the command just said"
+
+    listed = text_of(await control._card(None, []))
+    assert "Dekin no mogura" in listed, "the bare command lists what exists"
+
+    await control._card(None, ["-1001234", "clear"])
+    clear_sql = db.writes[-1][0]
+    assert "card_message_id = null" in clear_sql, clear_sql
+
+    unknown = text_of(await control._card(None, ["@nope_here", "42"]))
+    assert "matches no destination" in unknown, unknown
+
+
+@pytest.mark.asyncio
+async def test_a_campaign_needs_the_code_that_the_plan_printed(make_settings) -> None:
+    """`/campaign … confirm` refuses without the code, and queues the job with it.
+
+    The code is derived from the campaign row and its exact text, so the test asserts the mismatch
+    first (nothing queued) and then the match (the job is queued, status ready). A campaign that could
+    be started by typing a name is a campaign that gets started by accident.
+    """
+    from app import joinmsg
+
+    db = FakeDb()
+    control = ControlBot(
+        api=FakeApi(), db=db, settings=make_settings(), owner_ids=frozenset({OWNER})  # type: ignore[arg-type]
+    )
+
+    def text_of(replies) -> str:
+        return "\n".join(reply.text for reply in replies)
+
+    wrong = text_of(await control._campaign(None, ["-1001234", "confirm", "wave1", "0000"]))
+    assert db.queued == [], "a wrong code must not queue anything"
+    assert "not the code" in wrong, wrong
+    assert "not tell you the code" in wrong, "and it must not simply print the real one"
+
+    planned = text_of(await control._campaign(None, ["-1001234", "plan", "wave1"]))
+    assert "at most 20 people per hour" in planned, planned
+    code = joinmsg.confirm_code(9, "welcome {name}")
+    assert code in planned, "the plan prints the code it will accept"
+
+    confirmed = text_of(await control._campaign(None, ["-1001234", "confirm", "wave1", code.lower()]))
+    assert "ready" in confirmed, confirmed
+    assert [row[0] for row in db.queued] == ["join_request_campaign"], db.queued
+    assert db.campaign["status"] == "ready", db.campaign
+    assert any("status = 'ready'" in sql for sql, _ in db.writes), db.writes
+
+
+@pytest.mark.asyncio
+async def test_the_sticker_command_needs_a_season_that_exists(make_settings) -> None:
+    """`/sticker` refuses to invent a season, and refuses a peer it cannot name.
+
+    Both refusals are the interesting half of this command: the write itself is a forward, and the
+    judgement about *which* sticker opens a season is entirely the operator's.
+    """
+    db = FakeDb()
+    db.seasons = []
+    control = ControlBot(
+        api=FakeApi(), db=db, settings=make_settings(), owner_ids=frozenset({OWNER})  # type: ignore[arg-type]
+    )
+
+    def text_of(replies) -> str:
+        return "\n".join(reply.text for reply in replies)
+
+    usage = text_of(await control._sticker(None, []))
+    assert "usage: /sticker" in usage, usage
+
+    no_season = text_of(await control._sticker(None, ["Dekin", "no", "mogura", "2", "from", "@x", "88"]))
+    assert "no season 2" in no_season, no_season
+    assert "/declare" in no_season, "and say where a season comes from"
+
+    bad_shape = text_of(await control._sticker(None, ["Dekin", "2", "@x", "88"]))
+    assert "not a sticker address" in bad_shape, bad_shape
+    assert db.writes == [], "a refused command writes nothing"
+
+
+def test_the_three_write_commands_are_reachable_and_documented() -> None:
+    """The commands exist in the table, in the help text and in the refusal sentences.
+
+    `app/writers.py` names `/card`, `/sticker` and `/campaign` in the reason each blocked job shows, so
+    a command that drifted out of the registry would leave the operator with an instruction to run
+    something that answers `unknown command`. That is what this guards, and it costs nothing.
+    """
+    from pathlib import Path
+
+    from app.controlbot import HELP, _ROUTES
+
+    for name in ("card", "sticker", "campaign"):
+        assert name in _ROUTES, f"/{name} is not wired"
+        assert f"/{name}" in HELP, f"/{name} is wired but nobody will find it"
+
+    doc = (Path(__file__).resolve().parents[1] / "docs" / "control-bot.md").read_text(encoding="utf-8")
+    for name in ("card", "sticker", "campaign"):
+        assert f"`/{name}" in doc, f"docs/control-bot.md does not document /{name}"

@@ -78,7 +78,7 @@ reason (85 files scanned clean as of this writing — the count is what the scri
 1. Supabase → **SQL Editor** → paste all of [`ops/apply-all.sql`](../ops/apply-all.sql) → **Run**. Expect
    `Success. No rows returned`. This is how `0009_announcement_approved.sql` and
    `0010_join_message_and_updates_id.sql` land on a database that was built before they existed.
-2. Sanity check: `select count(*) from app.config;` must read **45**, and
+2. Sanity check: `select count(*) from app.config;` must read **48**, and
    `select count(*) from information_schema.tables where table_schema='app';` must read **27**.
 3. Render → deploy, `APP_MODE` still `shadow` for the first day: real reads, no posts.
 4. Talk to the assistant: `/login` (pairing code in chat, nothing to paste into a terminal), then
@@ -89,6 +89,26 @@ reason (85 files scanned clean as of this writing — the count is what the scri
 6. Teach it the source: `/source <@handle> series <name> audio hindi`, then `/inplace <@handle> plan`
    and read the route it says out loud.
 7. Only then: `APP_MODE=live`.
+
+## 4b. Five things the write layer cannot do without you
+
+These are not code work. Each one is a fact only you have, and each is refused in the same words by
+the job that needs it, so `/status` names the missing thing rather than a stack trace:
+
+1. **One session, live.** `/login` with the account that owns the channels. Nothing writes until
+   `APP_MODE=live` and a session is stored, and the first run of every job kind is a plan.
+2. **The private master archive.** A row in `app.archive_channel` with that channel's numeric id (and
+   `is_primary = true`). This program will not choose where the only spare copy of an episode lives.
+3. **`/card <destination> <message id>`**, once per destination channel — the post that gets forwarded
+   to the link bot so the announcement carries its shareable link. No card, no announcement; the
+   invite link never goes out on its own.
+4. **`/sticker <series> <season> from <channel> <message id>`**, per season, if you want a sticker to
+   open it. Nothing here decides which sticker means "season 2".
+5. **`publish.route`.** Leave it at `chelp_block` and every destination post is prepared for Channel
+   Help to paste, exactly as before; set it to `own_session` and the same rendered post is sent from
+   your account with real buttons. It is one row, and the first live run is the time to compare the
+   two — which is also the moment to look at whether `announcement.style` renders the box the way you
+   want it.
 
 ## 5. Four things that started as decisions and are now partly build work (from §18)
 
@@ -114,24 +134,48 @@ reason (85 files scanned clean as of this writing — the count is what the scri
   channel). Grant it by editing that one row; `can_add_admins` and `can_ban_users` are refused whatever
   the row says.
 
-## 6. What is *not* waiting on you — so nobody reads this page as "nearly running"
+## 6. What the write layer is, and what it still waits on
 
-Eight job kinds are blocked because the code that would perform them is not written. `app/handlers.py`
-carries each reason in `DEPENDENCIES`, and `/status` prints the count, so a blocked queue never looks
-idle:
+Eight job kinds reach Telegram. They were built on 2026-08-29 and every one of them is *routed
+through one writer* (`app/sender.py`), which refuses to send unless the deployment says live, keeps a
+per-job write budget, and records each real write in `app.audit_log`. Nothing sends in shadow: a
+shadow run returns the sentence of what it would have done and **blocks the job with it**, so a plan
+can never be mistaken for a result.
 
-- `archive_media` — the copy into the private master archive channel
-- `storage_upload` — the file handoff to the storage assistant (needs section 5's run)
-- `link_verify` — liveness of a published link
-- `publish_post` — the send itself: Channel Help's post for a destination, and the announcement
-- `edit_post` — `messages.editMessage` on a bot-created post, which is the in-place caption path
-- `season_sticker` — the sticker-pack label mapping
-- `join_request_campaign` — the owner-approved campaign sender with pacing (the *text* is a
-  setting now, `/joinmsg`; this is the delivery)
-- `link_health_check` — the periodic re-check of published links
+The list below is the residual — what still stops each kind from completing, in the same words
+`app/handlers.py:DEPENDENCIES` and `/status` print:
 
-In plain words: **the reading half is built, the writing half is not.** A file is ingested, normalised,
-captioned and matched today; nothing yet creates a channel, uploads to a storage service, posts to a
-channel, edits a caption in place, or sends the announcement. That is the difference between "approved
-text" and "posts going out", and it is why `publish_post` still says no. Filling this page changes what
-the app can *tell you*, not what it can *do*.
+- `archive_media` — needs a row in `app.archive_channel` naming the private master archive. This
+  program never picks the channel that holds the only spare copy of an episode.
+- `storage_upload` — `/batch` is recorded step for step (`app/storagebot.py`); the handler sends it,
+  forwards the first and last message with the tag, and reads the reply back. It refuses to store a
+  link it did not receive, and blocks with the shapes it saw. `/genlink`, `/custom_batch` and
+  `/special_link` are not driven: the other verbs stay the operator's choice, not our default.
+- `link_verify` — the url's shape, its host and the token stored beside it run today with no session
+  at all. The half that reads the source range back needs an authenticated session.
+- `link_health_check` — the same check, bounded per run (a health check must not become the outage it
+  was meant to notice), and its result says plainly that the clone's link was never opened.
+- `publish_post` — renders the approved caption plus the button block, and `publish.route` decides who
+  presses send: `chelp_block` (the default) stores the post in `app.destination_post` with no
+  `published_at`, which is this schema's own word for "draft"; `own_session` sends it with real inline
+  buttons. The updates-channel notice is separate and needs `/card` for that destination — the link
+  the provider bot made for the forwarded card, never the bare invite.
+- `edit_post` — the same box and block, applied to the post that already exists; gated on our own
+  rights in that channel, read by `/probe` (`app/rights.py`).
+- `season_sticker` — forwards the sticker message named by `/sticker <series> <season> from <channel>
+  <message id>`, before any episode post of that season. A pack name or an install link is not an
+  address, and which sticker opens a season is not this program's call.
+- `join_request_campaign` — reads the still-pending requests of one channel, sends the wording of
+  `/joinmsg`, and stops at `campaign.rate_per_hour` by pausing the campaign rather than pushing past
+  it. A campaign runs only after `/campaign … confirm <code>`.
+
+Three config rows carry the switches that decide the rest: `publish.route` (who presses send),
+`announcement.style` (how the notice is rendered, because the sampled posts were read and not asked
+about) and `updates.card_link` (a link you pasted by hand, which then goes unchecked — the normal path
+is `/card` naming the message). The sanity check must read **48** rows in `app.config`.
+
+In plain words: **the reading half is built; the writing half is not yet *run*.** Each of those eight
+handlers has been executed against the real schema with a client that records instead of sending —
+which proves the SQL and the refusal paths, and proves nothing about Telegram's answer. The first run
+with your session is the test of that, and it starts in shadow: the queue tells you what it intends to
+post, button for button, before anything reaches a channel.

@@ -30,6 +30,7 @@ from dataclasses import dataclass
 
 __all__ = [
     "CONFIG_KEY",
+    "confirm_code",
     "PRESETS",
     "Preset",
     "PLACEHOLDERS",
@@ -128,6 +129,21 @@ def stored_value(value: object) -> str:
 def find_placeholders(text: str | None) -> tuple[str, ...]:
     """Every ``{word}`` in a template, whether or not we can fill it."""
     return tuple(f"{{{name}}}" for name in _PLACEHOLDER_RE.findall(str(text or "")))
+
+
+def confirm_code(campaign_id: object, template: object) -> str:
+    """The four characters that turn a drafted campaign into a runnable one.
+
+    Derived from the row and its text rather than stored, for one reason: editing the wording *is* a
+    different campaign, so an old code must stop working the moment the text changes. It is not a
+    secret — the control bot answers to one owner, and anything they can read in `/campaign plan`
+    they could type anyway — it is the pause that makes "send this to everyone waiting" a decision
+    with a step in it.
+    """
+    import hashlib  # noqa: PLC0415  (only this function needs the digest)
+
+    seed = f"{campaign_id}|{str(template or '').strip()}"
+    return hashlib.sha256(seed.encode("utf-8")).hexdigest()[:4].upper()
 
 
 def unknown_placeholders(text: str | None) -> tuple[str, ...]:
