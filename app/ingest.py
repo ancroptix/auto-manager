@@ -29,7 +29,6 @@ from typing import Any, Mapping
 
 from . import normalize, seasons
 from .keys import (
-    discovery_key,
     normalize_title,
     screening_key,
 )

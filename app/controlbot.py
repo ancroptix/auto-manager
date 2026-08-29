@@ -1573,11 +1573,16 @@ class ControlBot:
                 )]
 
             status = {"pause": "paused", "abort": "aborted"}[action]
+            # Two parameters, not one used twice. `set status = $2 ... case when $2 = 'aborted'` asks
+            # Postgres to make $2 the enum type and a text value at the same time, and it refuses rather
+            # than guessing: the statement never parses, so /campaign pause was dead on arrival. The
+            # explicit cast names the type on the way in, and the flag is a plain boolean.
             await self.db.execute(
-                "update app.join_campaign set status = $2, updated_at = now(),"
-                " finished_at = case when $2 = 'aborted' then now() else finished_at end where id = $1",
+                "update app.join_campaign set status = $2::app.campaign_status, updated_at = now(),"
+                " finished_at = case when $3 then now() else finished_at end where id = $1",
                 int(campaign["id"]),
                 status,
+                action == "abort",
             )
             return [Reply(
                 f"`{name}` is {status}. Contacts already sent stay sent — this program does not "

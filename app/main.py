@@ -47,7 +47,7 @@ def configure_logging(level: str) -> None:
     )
 
 
-def _build_control_bot(settings: Settings, db: Any, *, user_client: Any = None) -> Any:
+async def _build_control_bot(settings: Settings, db: Any, *, user_client: Any = None) -> Any:
     """Assemble the control bot. Separate so the wiring itself can be tested."""
     from .botapi import BotApi
     from .controlbot import ControlBot
@@ -61,6 +61,20 @@ def _build_control_bot(settings: Settings, db: Any, *, user_client: Any = None) 
             api_hash=settings.telegram_api_hash.get_secret_value(),
         )
     api = BotApi(settings.reveal("telegram_bot_token") or "")
+
+    # The two login settings that exist as `app.config` rows, read once here instead of per message. They
+    # are the ones an operator may want mid-troubleshooting — a code that arrives late wants a longer
+    # window, a chat that must keep its history wants no deletions at all — and neither is worth an
+    # environment variable and a redeploy. A database that cannot answer is not an emergency: the
+    # ControlBot defaults are the same numbers, and the log says which one was unreadable.
+    login_ttl = 600.0
+    delete_sensitive = True
+    if db is not None:
+        try:
+            login_ttl = float(await db.config("bot.login_ttl_seconds", 600) or 600)
+            delete_sensitive = bool(await db.config("bot.delete_sensitive", True))
+        except Exception as exc:  # noqa: BLE001 - the defaults are the answer
+            log.info("the bot's login settings are unreadable (%s); defaults stand", type(exc).__name__)
 
     async def adopt_session() -> None:
         """Give the freshly logged-in account to the client that performs the writes.
@@ -91,6 +105,8 @@ def _build_control_bot(settings: Settings, db: Any, *, user_client: Any = None) 
         allow_login=settings.bot_allow_login,
         background=lambda coro: asyncio.create_task(coro),
         on_session_stored=adopt_session,
+        login_ttl_seconds=login_ttl,
+        delete_sensitive=delete_sensitive,
     )
 
 
@@ -144,7 +160,9 @@ def create_app(settings: Settings | None = None, *, start_worker: bool | None = 
             app.state.worker.start()
         if settings.bot_should_run:
             try:
-                app.state.control_bot = _build_control_bot(settings, db, user_client=app.state.user_client)
+                app.state.control_bot = await _build_control_bot(
+                    settings, db, user_client=app.state.user_client
+                )
                 app.state.control_bot_task = asyncio.create_task(app.state.control_bot.run())
             except Exception as exc:  # noqa: BLE001 - /health must survive a bad bot token
                 app.state.control_bot = None

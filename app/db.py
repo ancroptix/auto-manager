@@ -16,7 +16,6 @@ Design constraints, in order of importance:
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
 import logging
 import re
@@ -34,6 +33,13 @@ __all__ = ["Database", "DatabaseUnavailable", "DatabaseState"]
 
 _MAX_ERROR_LEN = 400
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+#: `app.config` rows this process reads at connect, once, rather than per use. See `Database.load_policy`.
+#: `jobs.max_attempts` is deliberately not here: attempts are enforced per *row* (`app.job.max_attempts`,
+#: default 8, which `app.fail_job` turns into 'blocked'), and a boot-time override would silently rewrite
+#: the number attached to work that is already queued. That row is a record of the policy, not a knob.
+POLICY_KEYS = ("worker.lease_seconds",)
+
 #: One-file installer generated from supabase/migrations/*.sql
 MIGRATION_BUNDLE = REPO_ROOT / "ops" / "apply-all.sql"
 
@@ -57,6 +63,8 @@ class Database:
     _last_error: str | None = None
     _last_attempt: float = 0.0
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    #: `POLICY_KEYS` as read at connect. Public because /status and the tests read it back.
+    policy: dict[str, Any] = field(default_factory=dict)
 
     # ------------------------------------------------------------ lifecycle
     @property
@@ -127,6 +135,7 @@ class Database:
                 self._state = DatabaseState.CONNECTED
                 self._last_error = None
                 log.info("database connected (pooler=%s)", self.settings.uses_transaction_pooler)
+                await self.load_policy()
                 return True
             except Exception as exc:  # noqa: BLE001 - report, do not crash boot
                 self._fail(str(exc))
@@ -392,8 +401,24 @@ class Database:
         return await self.fetchval(
             "select to_jsonb(app.claim_next_job($1, $2))",
             worker_id,
-            self.settings.claim_lease_seconds,
+            self.lease_seconds(),
         )
+
+    def lease_seconds(self) -> int:
+        """How long a claimed job is ours for: the `app.config` row when it is sane, else the setting.
+
+        The row exists because "the free instance was killed mid-upload and the lease outlived the
+        afternoon" is a tuning problem, not a code problem. The bounds are `app.claim_next_job`'s own,
+        checked here so a typo in a settings table produces a fallback rather than an exception inside
+        every claim of the loop.
+        """
+        row = self.policy.get("worker.lease_seconds")
+        fallback = int(self.settings.claim_lease_seconds)
+        try:
+            seconds = int(row)
+        except (TypeError, ValueError):
+            return fallback
+        return seconds if 5 <= seconds <= 3600 else fallback
 
     async def checkpoint(
         self, job_id: int, stage: JobStage, data: dict[str, Any] | None = None
@@ -424,6 +449,30 @@ class Database:
 
     async def queue_health(self) -> dict[str, Any] | None:
         return await self.fetchrow("select * from app.v_queue_health")
+
+    async def load_policy(self) -> dict[str, Any]:
+        """Read POLICY_KEYS once, at connect, instead of at each use.
+
+        The queue asks these questions every poll, and a settings table that costs a query per claim is a
+        settings table nobody can afford. An operator who edits a row gets it honoured on the next boot,
+        which is the honest promise to make: this process does not watch the table.
+
+        Failure is not an event. A deployment whose migrations have not run has no `app.config` to read,
+        and that must not stop the loop — the settings default is a fine answer, and /ready already says
+        what the schema looks like.
+        """
+        if not self.connected:
+            return self.policy
+        try:
+            rows = await self.fetch(
+                "select key, value from app.config where key = any($1::text[])", list(POLICY_KEYS)
+            )
+        except Exception as exc:  # noqa: BLE001 - the defaults are the answer, not a crash
+            log.info("queue policy unreadable (%s); settings defaults stand", str(exc)[:120])
+            return self.policy
+        for row in rows:
+            self.policy[str(row["key"])] = row["value"]
+        return self.policy
 
     async def config(self, key: str, default: Any = None) -> Any:
         """Read one row of app.config, decoded.

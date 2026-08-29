@@ -117,6 +117,11 @@ The bot's own replies are never deleted. An earlier version deleted them after a
 bot, not a careful one. Deleting the secret means deleting the copy that holds the
 secret, and the only such copies are your messages.
 
+If you would rather keep those messages — an audit you want to hold — set
+`bot.delete_sensitive` to `false` in `app.config`. The service reads that row, and
+`bot.login_ttl_seconds` (how long a code stays acceptable), when it builds this bot;
+both take effect on the next boot, and nothing else in the login flow moves.
+
 The connection that request runs on belongs to the attempt: it is opened before the
 code is asked for, kept alive only while your code (and 2FA password, if you use
 one) is being typed, and closed when the attempt ends. An abandoned or failed login

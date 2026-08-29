@@ -26,7 +26,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Sequence
 
 from . import rights as channel_rights
@@ -412,6 +412,25 @@ async def run_probe(
     use, and what a dry run should do.
     """
     run = _Run()
+    # The three bots are addressed by the rows the operator set, not by the handles compiled into the
+    # policy. This matters because /probe is the operator's proof that a bot answers *at all*: a report
+    # about `chelpbot` while `bots.channel_help_username` names their clone is a certainty about the
+    # wrong peer, and the writers will send to the configured one.
+    for field_name, config_key in (
+        ("storage_bot", "bots.storage_username"),
+        ("channel_help", "bots.channel_help_username"),
+    ):
+        read = getattr(db, "config", None) if db is not None and getattr(db, "connected", False) else None
+        if read is None:
+            continue
+        try:
+            named = str(await read(config_key, "") or "").strip().lstrip("@")
+        except Exception as exc:  # noqa: BLE001 - an unreadable row is the default's turn, not a crash
+            log.info("probe: %s unread (%s); the policy default stands", config_key, str(exc)[:90])
+            continue
+        if named and named != getattr(policy, field_name):
+            log.info("probe: %s addressed as @%s (from app.config)", config_key, named)
+            policy = replace(policy, **{field_name: named})
     expected: list[dict[str, Any]] = []
     if db is not None and getattr(db, "connected", False):
         try:

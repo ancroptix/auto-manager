@@ -802,18 +802,23 @@ async def edit_post(self: Writers, job: dict[str, Any], ctx: Any) -> dict[str, A
 
     peer = self._peer(post)
     result = await self._writer([peer], max_writes=1).edit_text(peer, int(post["message_id"]), f"{body}\n\n{block}" if block else body)
-    if result.ok and result.action == "edited":
-        await self.db.execute(
-            "update app.destination_post set body = $2, buttons = $3::jsonb, quality_summary = $4::jsonb, edited_at = now()"
-            " where id = $1",
-            int(post_id),
-            f"{body}\n\n{block}" if block else body,
-            [[f"{label} - {url}" for label, url in row] for row in entries],
-            [{"quality": link["quality"], "storage_link": link["link"]} for link in links],
-        )
-        # The post's own history is kept where the in-place mode keeps it (app.media_variant's
-        # caption columns are written by app.inplace), so this handler updates one row and does not
-        # invent a second place for the same edit to be recorded.
+    if not result.ok or result.action != "edited":
+        # An edit that did not land must not be recorded as one. `edit_post` exists to change a post
+        # that is already out, so when the change is refused — a flood, no rights, a peer this session
+        # cannot see — the honest outcome is a blocked job, and `app.destination_post` keeps the body
+        # the channel still shows instead of being stamped edited.
+        return self._stop(result, what=f"edit {peer}#{post['message_id']} to the links stored now")
+    await self.db.execute(
+        "update app.destination_post set body = $2, buttons = $3::jsonb, quality_summary = $4::jsonb, edited_at = now()"
+        " where id = $1",
+        int(post_id),
+        f"{body}\n\n{block}" if block else body,
+        [[f"{label} - {url}" for label, url in row] for row in entries],
+        [{"quality": link["quality"], "storage_link": link["link"]} for link in links],
+    )
+    # The post's own history is kept where the in-place mode keeps it (app.media_variant's
+    # caption columns are written by app.inplace), so this handler updates one row and does not
+    # invent a second place for the same edit to be recorded.
     return {"destination_post_id": int(post_id), "result": sender.describe(result)}
 
 
@@ -984,11 +989,17 @@ async def join_request_campaign(self: Writers, job: dict[str, Any], ctx: Any) ->
                 result.detail[:400],
             )
     remaining = len(waiting) - (sent + failed)
+    finished = remaining <= 0
+    # The status is passed as text and cast, and the "did we run out of people" flag is its own
+    # parameter: reusing $2 for both the enum column and a `case when $2 = 'completed'` comparison makes
+    # Postgres unable to settle on one type for it, and it answers with an error before anything runs.
+    # A campaign that had sent every contact and then failed here would have looked unfinished forever.
     await self.db.execute(
-        "update app.join_campaign set status = $2, updated_at = now(),"
-        " finished_at = case when $2 = 'completed' then now() else finished_at end where id = $1",
+        "update app.join_campaign set status = $2::app.campaign_status, updated_at = now(),"
+        " finished_at = case when $3 then now() else finished_at end where id = $1",
         int(campaign_id),
-        "completed" if remaining <= 0 else "running",
+        "completed" if finished else "running",
+        finished,
     )
     return {"campaign_id": int(campaign_id), "sent": sent, "failed": failed, "waiting_after": max(0, remaining)}
 

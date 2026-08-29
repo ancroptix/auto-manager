@@ -223,3 +223,31 @@ def test_every_waiting_kind_names_its_command() -> None:
     # Two kinds need nothing from the operator beyond a session, so they are not in the map at all.
     assert JobKind.RECONCILIATION.value not in DEPENDENCIES
     assert JobKind.INGEST_MEDIA.value not in DEPENDENCIES
+
+
+def test_no_write_result_is_consumed_without_a_gate() -> None:
+    """Every sender verb is followed by a gate: `_stop` or an explicit `result.ok`.
+
+    One handler (`edit_post`) read its own `Result` and returned a dict without ever asking whether the
+    edit landed, so a refused edit was recorded as a succeeded job with `edited_at` left null — green in
+    /status, unchanged in the channel. The verb list is what makes this checkable without a database:
+    `app/sender.py` owns the five verbs, so a writer that ignores one of their answers is a bug in the
+    one place this project promises it will not have.
+    """
+    import re
+    from pathlib import Path
+
+    src = Path("app/writers.py").read_text(encoding="utf-8")
+    verbs = "|".join(sorted({"send_text", "edit_text", "forward", "read_back"}))
+    offenders = []
+    for match in re.finditer(rf"=\s*await\s+self\._writer\([^)]*\)\.(?:{verbs})\(", src):
+        # The rest of the block, up to the next `return` at the same indent, is where the answer is used.
+        tail = src[match.end() : src.find("\n    return", match.end())]
+        if "_stop(" not in tail and ".ok" not in tail and "result.detail" not in tail:
+            line = src[: match.start()].count("\n") + 1
+            offenders.append(f"app/writers.py:{line} -> {ast_unparse_line(src, line)}")
+    assert not offenders, "write results consumed without a gate: " + "; ".join(offenders)
+
+
+def ast_unparse_line(src: str, line: int) -> str:  # noqa: D103 - a helper for the message above
+    return src.splitlines()[line - 1].strip()[:60]

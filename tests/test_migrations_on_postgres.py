@@ -11,6 +11,7 @@ Skipped automatically when pgserver/psycopg are unavailable.
 
 from __future__ import annotations
 
+import ast
 import json
 import socket
 from pathlib import Path
@@ -2847,5 +2848,110 @@ def test_the_writers_refuse_what_only_a_human_can_supply(conn, seed, episode):
             return True
         finally:
             await db.close()
+
+    assert asyncio.run(scenario())
+
+
+def test_every_statement_this_project_writes_parses_against_the_real_schema(conn):
+    """The fake databases in this suite accept any SQL string. Postgres does not, and neither does asyncpg.
+
+    Four bugs of this shape were found by hand and only after they were live: a column read under a name
+    the query never aliased; a row id and a channel id selected under one name so the wrong one won; a
+    statement whose `__all__` promised a function that does not exist; and two updates that reused one
+    parameter as both an enum and a text value, which Postgres refuses to *parse* — so `/campaign pause`
+    and the closing update of a join-request campaign could never run at all.
+
+    A fake database cannot see any of that, so this prepares every statement-shaped string in `app/`
+    against a migrated cluster with the driver the deployment uses. Reconstructions of f-strings are
+    skipped where the substitution cannot parse, and parameters whose type only the caller knows are
+    Postgres's business, not ours; everything else is a real finding.
+    """
+    import asyncio
+    import re
+
+    asyncpg = pytest.importorskip("asyncpg", reason="the parse check runs on the production driver")
+
+    items: list[tuple[str, int, str]] = []
+    for path in sorted((ROOT / "app").glob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            sql: str | None = None
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                sql = node.value
+            elif isinstance(node, ast.JoinedStr):
+                sql = "".join(str(v.value) if isinstance(v, ast.Constant) else "1" for v in node.values)
+            if not sql:
+                continue
+            sql = sql.strip().rstrip(";")
+            if len(sql) < 40 or not re.match(r"(?is)^(with|select|insert|update|delete)\b", sql):
+                continue
+            items.append((path.name, int(getattr(node, "lineno", 0)), sql))
+    assert len(items) > 100, f"the scanner found only {len(items)} statements, which means it stopped working"
+
+    async def check() -> list[str]:
+        client = await asyncpg.connect(pg_uri)
+        problems: list[str] = []
+        try:
+            for name, line, sql in items:
+                try:
+                    await client.prepare(sql)
+                except asyncpg.PostgresSyntaxError:
+                    continue
+                except Exception as exc:  # noqa: BLE001 - the class name is the finding
+                    first = str(exc).strip().splitlines()[0]
+                    if "could not determine data type" in first:
+                        continue
+                    problems.append(f"{name}:{line} {type(exc).__name__}: {first[:140]}")
+        finally:
+            await client.close()
+        return problems
+
+    problems = asyncio.run(check())
+    assert not problems, "statements that do not parse on a migrated database: " + "; ".join(problems)
+
+
+def test_the_lease_a_claim_grants_comes_from_the_settings_table(conn):
+    """`worker.lease_seconds` is a row an operator can edit, so the queue has to read it.
+
+    It is read once, at connect, because the alternative is a query per poll for a number that changes
+    about as often as a deployment does. And an out-of-range value falls back instead of raising inside
+    `app.claim_next_job`, whose own bounds would otherwise reject the whole claim loop over a typo in a
+    table — a settings row should never be able to stop the queue.
+    """
+    import asyncio
+
+    from app.db import Database
+
+    def lease_of(job_id: int) -> float:
+        with conn.cursor() as cur:
+            cur.execute("select extract(epoch from (locked_until - now())) from app.job where id = %s", (job_id,))
+            return float(cur.fetchone()[0])
+
+    async def scenario() -> bool:
+        db = Database(_ingest_settings())
+        assert await db.connect(), await db.last_error
+        try:
+            assert db.policy.get("worker.lease_seconds") == 120, db.policy  # the seeded default
+            await db.enqueue("reconciliation", "lease-from-config-1", payload={"probe": 1})
+            first = await db.claim("lease-probe")
+            assert first is not None, "nothing was claimed, so the lease was never exercised"
+            assert 100 <= lease_of(int(first["id"])) <= 125, lease_of(int(first["id"]))
+
+            conn.execute("update app.config set value = '30'::jsonb where key = 'worker.lease_seconds'")
+            db.policy.clear()
+            await db.load_policy()
+            assert db.lease_seconds() == 30
+            await db.enqueue("reconciliation", "lease-from-config-2", payload={"probe": 2})
+            second = await db.claim("lease-probe")
+            assert 25 <= lease_of(int(second["id"])) <= 35, lease_of(int(second["id"]))
+
+            conn.execute("update app.config set value = '1'::jsonb where key = 'worker.lease_seconds'")
+            db.policy.clear()
+            await db.load_policy()
+            assert db.lease_seconds() == db.settings.claim_lease_seconds, "an impossible row must not reach the SQL"
+            return True
+        finally:
+            await db.close()
+            conn.execute("update app.config set value = '120'::jsonb where key = 'worker.lease_seconds'")
 
     assert asyncio.run(scenario())

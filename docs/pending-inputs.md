@@ -174,6 +174,30 @@ Three config rows carry the switches that decide the rest: `publish.route` (who 
 about) and `updates.card_link` (a link you pasted by hand, which then goes unchecked — the normal path
 is `/card` naming the message). The sanity check must read **48** rows in `app.config`.
 
+### Which rows change behaviour, and which ones only record it
+
+Reading is not uniform across those rows, and an operator who edits a decorative one loses an evening
+figuring out why nothing changed, so the split is written down:
+
+- **Live knobs, read while the work runs:** `templates.*`, `branding.*`, `caption.*`, `quality.order`,
+  `ingest.*`, `inplace.*`, `thumbnail.*`, `seasons.confirm_unlabelled_reset`, `publish.route`,
+  `announcement.style`, `updates.*`, `stickers.*`, `joinrequest.message`, `campaign.rate_per_hour`,
+  `bots.storage_username` and `bots.channel_help_username` (the latter is the peer `/probe` stands in
+  front of, so a re-cloned help bot needs no redeploy).
+- **Read once, when the service starts:** `worker.lease_seconds` (how long a claimed job stays claimed),
+  `bot.login_ttl_seconds` and `bot.delete_sensitive`. Editing one takes effect on the next boot.
+- **A record of a policy enforced elsewhere:** `jobs.max_attempts`, which lives on each `app.job` row
+  (default 8) and is what `app.fail_job` turns into `blocked`; and the `destination.*` rows — name
+  template, visibility, per-series, keep-both, description, auto-create — which describe the channel a
+  *human* opens, because nothing here calls `channels.createChannel`.
+- **A record of a decision with no code to obey it yet:** `bots.channel_help_rights` and
+  `templates.channel_about` (both read only by `app.channels.setup_plan`, the plan no executor runs
+  today), `campaign.mode`, `campaign.forward_replies_to_main` (forwarding a stranger's reply to you is a
+  Telegram action nobody has asked for), and `bot.enabled_commands`.
+
+The rule the last two groups are held to: a row that nothing reads says so here, instead of sitting in a
+table that looks like a control panel.
+
 In plain words: **the reading half is built; the writing half is not yet *run*.** Each of those eight
 handlers has been executed against the real schema with a client that records instead of sending —
 which proves the SQL and the refusal paths, and proves nothing about Telegram's answer. The first run

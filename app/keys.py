@@ -107,6 +107,15 @@ def reconciliation_key(when: dt.datetime | None = None) -> str:
 
 
 def discovery_key(source_channel_id: int, message_id: int, media_idx: int = 0) -> str:
+    """The key one source message's discovery would queue under.
+
+    Its caller is the scanner that does not exist yet: the Telethon event loop that reads a source
+    channel and enqueues `ingest_media` per message. Until that is written, `ingest_media` is a handler
+    with no producer, and the queue starts one rung later (thumbnail_screen, enqueued by
+    :func:`app.ingest.record_message`). The key is spelled here rather than at the future call site for
+    the reason this whole module exists, and it is tested here so the day the scanner lands it cannot
+    quietly invent a second shape.
+    """
     return f"discover:{int(source_channel_id)}:{int(message_id)}:{int(media_idx)}"
 
 

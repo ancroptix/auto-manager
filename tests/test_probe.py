@@ -476,3 +476,56 @@ class TestRightsWiring:
         assert report["account"]["rights"]["updates"], "the read still happened"
         assert report["rights_recorded"] == {"considered": 1, "written": 0}
         assert "could not be recorded" in format_report(report) or report["rights_error"]
+
+
+class TestConfiguredBotHandles:
+    """`/probe` has to stand in front of the same bot the writers will write to.
+
+    `bots.storage_username` and `bots.channel_help_username` are rows for a reason — a re-cloned bot is
+    a different handle and the same protocol — and `ProbePolicy`'s own defaults are the last resort, not
+    the answer. A probe that reported on the default while the job sent to the configured peer would have
+    been a confident, wrong document.
+    """
+
+    class Db:
+        connected = True
+
+        def __init__(self, values: dict[str, Any]) -> None:
+            self.values = values
+            self.asked: list[str] = []
+
+        async def config(self, key: str, default: Any = None) -> Any:
+            self.asked.append(key)
+            return self.values.get(key, default)
+
+        async def fetch(self, sql: str, *args: Any) -> list[dict]:
+            return []
+
+    def test_the_handles_named_in_the_database_are_the_ones_probed(self) -> None:
+        db = self.Db({"bots.storage_username": "@my_clone_bot", "bots.channel_help_username": "help_clone"})
+        client = FakeClient()
+        report = run(run_probe(client, policy=policy(), db=db, send=False))
+
+        peers = [str(peer) for peer, _text, _kw in client.sent]
+        assert "my_clone_bot" in peers and "help_clone" in peers, peers
+        assert report["storage_bot"]["username"] == "my_clone_bot", report["storage_bot"]
+        assert report["channel_help"]["username"] == "help_clone", report["channel_help"]
+        assert sorted(db.asked) == ["bots.channel_help_username", "bots.storage_username"]
+
+    def test_an_absent_row_leaves_the_policy_default_alone(self) -> None:
+        client = FakeClient()
+        report = run(run_probe(client, policy=policy(), db=self.Db({}), send=False))
+
+        assert report["channel_help"]["username"] == policy().channel_help.lstrip("@")
+        assert not [p for p, _t, _k in client.sent if "clone" in str(p)], "an empty row must not invent a peer"
+
+    def test_a_database_that_cannot_answer_does_not_stop_the_probe(self) -> None:
+        class Grumpy(self.Db):
+            async def config(self, key: str, default: Any = None) -> Any:
+                raise RuntimeError("relation app.config does not exist")
+
+        client = FakeClient()
+        report = run(run_probe(client, policy=policy(), db=Grumpy({}), send=False))
+
+        assert report["storage_bot"]["username"] == policy().storage_bot.lstrip("@")
+        assert "steps" in report

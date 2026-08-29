@@ -19,7 +19,7 @@ with no database.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Iterable, Mapping, Sequence
 
 from .keys import quality_rank, variant_identity

@@ -22,7 +22,7 @@ __all__ = [
     "SESSION_NAME_RE",
     "active_session_string",
     "activate",
-    "describe",
+    "describe_one",
     "forget",
     "list_sessions",
     "mask_phone",
