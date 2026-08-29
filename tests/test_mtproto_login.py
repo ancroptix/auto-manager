@@ -320,34 +320,99 @@ def test_every_telethon_keyword_argument_this_project_passes_still_exists() -> N
     assert not offenders, "Telethon does not accept these: " + "; ".join(offenders)
 
 
-def test_every_raw_request_this_project_builds_matches_the_installed_layer() -> None:
-    """Same idea for the typed requests: ``functions.*`` names arguments too, and they drift as well."""
+def _paren_balanced(source: str, start: int) -> int:
+    """Index just past the ``)`` that closes the call opened at ``start``."""
+    depth = 0
+    for index in range(start, len(source)):
+        if source[index] in "([{":
+            depth += 1
+        elif source[index] in ")]}":
+            depth -= 1
+            if depth == 0:
+                return index + 1
+    return len(source)
+
+
+def _request_calls(source: str) -> list[tuple[str, set[str], bool]]:
+    """``(dotted class, keyword names, passed anything positionally)`` for each typed request."""
+    out: list[tuple[str, set[str], bool]] = []
+    for match in re.finditer(r"(functions\.[A-Za-z.]+|types\.[A-Za-z.]+)\(", source):
+        open_at = match.end() - 1
+        tail = source[open_at + 1 : _paren_balanced(source, open_at) - 1]
+        parts = [part for part in tail.split(",") if part.strip()]
+        keyword = re.compile(r"^\s*(\w+)\s*=(?!=)")
+        keywords = {found.group(1) for part in parts if (found := keyword.match(part))}
+        positional = any(not keyword.match(part) for part in parts)
+        out.append((match.group(1), keywords, positional))
+    return out
+
+
+def _request_problems(source: str) -> list[str]:
+    """Everything wrong with the MTProto requests in this source, against the installed Telethon.
+
+    Two ways to be wrong, and the first version of this guard only looked for one of them.
+    """
     pytest.importorskip("telethon")
     from telethon import functions, types
 
     namespaces = {"functions": functions, "types": types}
+    problems: list[str] = []
+    for dotted, keywords, positional in _request_calls(source):
+        try:
+            cls = eval(dotted, dict(namespaces))  # noqa: S307 - names come from this repo's source
+        except Exception:  # noqa: BLE001
+            continue
+        parameters = inspect.signature(cls.__init__).parameters
+        if any(p.kind is p.VAR_KEYWORD for p in parameters.values()):
+            continue
+        named = {name for name in parameters if name != "self"}
+        if unknown := keywords - named:
+            problems.append(f"{dotted}({', '.join(sorted(unknown))})")
+        if positional:
+            continue  # a positional argument could be the required one; keyword style is what is checkable
+        required = [
+            name
+            for name, p in parameters.items()
+            if name != "self"
+            and p.default is inspect.Parameter.empty
+            and p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)
+        ]
+        for name in required:
+            if name not in keywords:
+                problems.append(f"{dotted} is missing the required argument {name!r}")
+    return problems
+
+
+def test_every_raw_request_this_project_builds_matches_the_installed_layer() -> None:
+    """Same idea for the typed requests: ``functions.*`` names arguments too, and they drift as well."""
     offenders: list[str] = []
     checked = 0
-    pattern = re.compile(r"(functions\.[A-Za-z.]+|types\.[A-Za-z.]+)\(")
     for path in sorted((ROOT / "app").rglob("*.py")):
         source = path.read_text(encoding="utf-8")
-        for match in pattern.finditer(source):
-            dotted = match.group(1)
-            try:
-                cls = eval(dotted, dict(namespaces))  # noqa: S307 - names come from this repo's source
-            except Exception:  # noqa: BLE001
-                continue
-            tail = source[match.end() : source.find(")", match.end()) + 1]
-            keywords = set(re.findall(r"(\w+)\s*=", tail))
-            if not keywords:
-                continue
-            allowed = set(inspect.signature(cls.__init__).parameters) - {"self"}
-            checked += 1
-            unknown = keywords - allowed
-            if unknown:
-                offenders.append(f"{path.name} {dotted}({', '.join(sorted(unknown))})")
+        checked += len(_request_calls(source))
+        for problem in _request_problems(source):
+            offenders.append(f"{path.name} {problem}")
     assert checked >= 1, "the request scan found nothing to check; it is not reading the source"
-    assert not offenders, "these MTProto requests were built with arguments they do not take: " + "; ".join(offenders)
+    assert not offenders, "these MTProto requests were built wrong: " + "; ".join(offenders)
+
+
+def test_the_request_guard_also_notices_an_argument_that_was_never_passed() -> None:
+    """The hole the operator's probe fell through, closed permanently.
+
+    ``GetBotInfoRequest(bot=…)`` looks fine to a check that only asks "is `bot` a real argument?" — and
+    raises ``TypeError: missing 1 required positional argument: 'lang_code'`` in the Telethon this project
+    installs. A guard over extra keywords alone cannot see a bug of omission, so this emulates the offender
+    and requires the guard to name it, then requires the fixed spelling to be clean.
+    """
+    broken = "x = await client(functions.bots.GetBotInfoRequest(bot=entity))\n"
+    assert any("lang_code" in problem for problem in _request_problems(broken)), _request_problems(broken)
+
+    fixed = 'x = functions.bots.GetBotInfoRequest(lang_code="", bot=utils.get_input_user(entity))\n'
+    assert _request_problems(fixed) == [], _request_problems(fixed)
+
+    # Positional style is not checkable, and saying so is better than passing silently: the scan
+    # records the call, and the app-wide test above still sees the extra-keyword half.
+    assert not _request_problems("x = functions.bots.GetBotInfoRequest('en', entity)")
 
 
 def _client_holding(session) -> Any:

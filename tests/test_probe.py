@@ -10,6 +10,7 @@ ever reaches outside two bot chats and a dozen menu commands.
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -53,6 +54,7 @@ class FakeClient:
 
     def __init__(self, buttons: list[list[FakeButton]] | None = None) -> None:
         self.sent: list[tuple[Any, str, dict[str, Any]]] = []
+        self.requests: list[Any] = []
         self.buttons = buttons if buttons is not None else [[FakeButton("Cancel", data=b"cancel")]]
         self.message = FakeMessage("Welcome! Send me a file to store.", self.buttons)
         self.authorized = True
@@ -101,8 +103,25 @@ class FakeClient:
 
         return gen()
 
+    async def get_entity(self, username: Any) -> Any:
+        """What a handle resolves to, shaped just enough for ``utils.get_input_user``.
+
+        ``0xe669bf46`` is that helper's test for "already an InputUser", and the probe needs an
+        ``InputUser`` — not a username string — in ``bots.getBotInfo``.
+        """
+        return SimpleNamespace(id=77, access_hash=99, username=username, SUBCLASS_OF_ID=0xE669BF46)
+
     async def __call__(self, request: Any) -> Any:  # any typed MTProto request
-        raise RuntimeError("typed requests are not needed by the probe")
+        name = type(request).__name__
+        if name == "GetBotInfoRequest":
+            self.requests.append(request)
+            return SimpleNamespace(
+                commands=[
+                    SimpleNamespace(command="batch", description="Store files"),
+                    SimpleNamespace(command="start", description=""),
+                ]
+            )
+        raise RuntimeError(f"unexpected typed request: {name}")
 
     # -- helpers for assertions
     @property
@@ -590,3 +609,84 @@ class TestDeliveryKeepsEveryCharacter:
         delivered = [text for peer, text in ((str(p), t) for p, t in zip(client.peers, client.texts)) if peer == "999"]
         assert all(len(part) <= 4096 for part in delivered)
         assert "\n".join(delivered) == long_text, "split, never shortened"
+
+
+class TestCommandList:
+    """The line that ends every bot section, and the one bug that made it useless.
+
+    ``commands:`` is the cheapest protocol hint in the whole probe — a bot's own declared list — and the
+    first live run reported ``(unavailable: TypeError)`` three times. That was never about the bots.
+    """
+
+    def test_the_command_list_request_carries_what_this_telethon_requires(self) -> None:
+        import pytest
+
+        pytest.importorskip("telethon")
+        client = FakeClient()
+        report = run(run_probe(client, policy=policy(), send=False))
+
+        assert report["storage_bot"]["command_list"] == [
+            "/batch=Store files",
+            "/start",
+        ], "a command with no description is still a command"
+        assert client.requests, "the probe asked nothing, so the report is a guess"
+        request = client.requests[0]
+        assert request.lang_code == "", (
+            "lang_code is required in the installed Telethon; omitting it is a TypeError raised before "
+            "Telegram is contacted, which the report then blamed on the bot"
+        )
+        assert request.bot.id == 77, "the field is an InputUser, and a username string is not one"
+
+    def test_an_unavailable_hint_names_the_real_reason(self) -> None:
+        class Broken(FakeClient):
+            async def get_entity(self, username: Any) -> Any:
+                raise TypeError("Cannot find any entity corresponding to no-such-bot")
+
+        report = run(run_probe(Broken(), policy=policy(), send=False))
+        note = report["storage_bot"]["command_list"][0]
+        assert note.startswith("(unavailable: TypeError:") and "no-such-bot" in note, note
+
+
+class TestRefusedButtons:
+    def test_buttons_the_policy_walks_past_are_still_reported(self) -> None:
+        """Not pressing something is a decision; the report used to keep it to itself.
+
+        The storage bot spells its menu in decorative letters — ``ʜᴇʟᴘ``, ``ᴀʙᴏᴜᴛ`` — and the allowlist is
+        made of plain words it trusts, which is the right way to refuse a string a bot chose. What was
+        wrong is that a reader saw "safe buttons pressed:" and two URL notes, and could only conclude the
+        bot had nothing else on screen.
+        """
+        client = FakeClient([[FakeButton("ʙțȜȠ", data=b"help"), FakeButton("ᴀȚȏȢȜ", data=b"about")]])
+        report = run(run_probe(client, policy=policy(), send=False))
+
+        assert report["storage_bot"]["refused_buttons"] == ["ʙțȜȠ", "ᴀȚȏȢȜ"]
+        assert report["storage_bot"]["pressed"] == [], "a refused button must not spend the press budget"
+        assert "left alone by policy (2):" in format_report(report)
+
+    def test_a_allowed_button_is_still_pressed(self) -> None:
+        client = FakeClient()
+        report = run(run_probe(client, policy=policy(), send=False))
+        assert report["storage_bot"]["refused_buttons"] == []
+        assert report["storage_bot"]["pressed"][0]["reply_chars"] > 0
+
+    def test_a_full_press_budget_stops_the_clicks_and_not_the_reading(self) -> None:
+        """The limit exists to bound what gets *pressed*; it must not also bound what gets seen.
+
+        It used to be a break at the top of the loop, so a menu longer than the budget simply stopped
+        being read, and the report could not tell a refusal from a button nobody looked at.
+        """
+        client = FakeClient(
+            [
+                [
+                    FakeButton("help", data=b"help"),
+                    FakeButton("ᴅᴄᴀᴏᴛᴄᴇ ᴀᴡᴇ", data=b"del"),
+                    FakeButton("menu", data=b"menu"),
+                    FakeButton("ᴜᴘᴅᴀᴛᴏᴟ", url="https://t.me/x"),
+                ]
+            ]
+        )
+        report = run(run_probe(client, policy=policy(max_button_probes=1), send=False))
+        section = report["storage_bot"]
+        clicks = [entry for entry in section["pressed"] if "skipped" not in entry]
+        assert len(clicks) == 1, "one click, as budgeted - and a url note is not a click"
+        assert section["refused_buttons"] == ["ᴅᴄᴀᴏᴛᴄᴇ ᴀᴡᴇ"], "the scan ran to the end of the menu"

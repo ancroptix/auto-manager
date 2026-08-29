@@ -274,14 +274,26 @@ async def probe_bot(client: Any, username: str, *, policy: ProbePolicy, run: _Ru
 
     pressed: list[dict[str, Any]] = []
     result["pressed"] = pressed
+    # Buttons the probe walked past on purpose are counted somewhere the press budget cannot reach.
+    # They used to be recorded in the same list as skips, which meant a bot with enough unpressable
+    # buttons could push its interesting ones out of the report; and when they were not recorded at
+    # all, "safe buttons pressed:" followed by two URL notes read as "the bot offered nothing else".
+    refused: list[str] = []
+    result["refused_buttons"] = refused
     if message is not None and not result["error"]:
         for button in (result["first"].get("buttons") or []):
-            if len(pressed) >= policy.max_button_probes or run.out_of_time:
-                break
+            # The budget is about *clicking*, and it used to be a `break` at the top of the loop: a bot
+            # with a long menu then stopped being read as well as stopped being pressed, and the report
+            # could not tell "refused" from "never looked". The limit guards the clicks alone now, and the
+            # scan runs to the end of the menu.
             if button["kind"] == "url":
                 pressed.append({"button": button["text"], "skipped": "url button; opening it needs no automation"})
                 continue
             if not policy.allows_button(button.get("text")):
+                refused.append(str(button.get("text")))
+                continue
+            clicks = [entry for entry in pressed if "skipped" not in entry]
+            if run.out_of_time or len(clicks) >= policy.max_button_probes:
                 continue
             try:
                 click = getattr(message, "click", None)
@@ -315,18 +327,34 @@ async def probe_bot(client: Any, username: str, *, policy: ProbePolicy, run: _Ru
 
 
 async def _bot_commands(client: Any, username: str, *, timeout: float) -> list[str]:
-    """The bot's declared command list — the cheapest protocol hint available."""
-    try:
-        from telethon import functions
+    """The bot's declared command list — the cheapest protocol hint available.
 
-        result = await asyncio.wait_for(client(functions.bots.GetBotInfoRequest(bot=username.lstrip("@"))), timeout)
+    Two arguments, and both of them are version notes. ``lang_code`` is a required argument in the
+    Telethon this project installs: leaving it out raised ``TypeError`` here, three times in a row, in
+    the middle of the operator's first live probe — and because an unavailable hint is deliberately not a
+    probe failure, all that survived of the bug was one line per bot reading ``(unavailable: TypeError)``.
+    A hint nobody reads is a bug that reports itself as a shrug, so this function names what it could not
+    do, but the reason has to be findable.
+
+    ``bot`` is the other half: the field takes a :tl:`InputUser`, not a username, so the entity is
+    resolved first and the request carries the access hash Telegram asks for.
+    """
+    try:
+        from telethon import functions, utils
+
+        entity = await asyncio.wait_for(client.get_entity(username), timeout)
+        request = functions.bots.GetBotInfoRequest(lang_code="", bot=utils.get_input_user(entity))
+        result = await asyncio.wait_for(client(request), timeout)
         commands = []
         for item in getattr(result, "commands", None) or []:
             description = (getattr(item, "description", "") or "").strip()
             commands.append(f"/{item.command}" + (f"={description[:24]}" if description else ""))
         return commands[:20]
     except Exception as exc:  # noqa: BLE001 - an unavailable hint is not a probe failure
-        return [f"(unavailable: {type(exc).__name__})"]
+        # The class *and* the message: "unavailable: TypeError" sent an operator and an agent hunting
+        # for a broken bot, when the sentence that mattered was "missing 1 required positional
+        # argument: 'lang_code'". A hint this cheap should never cost a second probe run to diagnose.
+        return [f"(unavailable: {type(exc).__name__}: {str(exc)[:120]})"]
 
 
 async def probe_account(
@@ -610,6 +638,9 @@ def format_report(report: dict[str, Any], *, limit: int | None = MAX_REPORT_CHAR
                     lines.append(f"    - {entry.get('button')}: {entry['skipped']}")
                 else:
                     lines.append(f"    - {entry.get('button')} -> {entry.get('reply_chars')} chars; then {entry.get('buttons_after')}")
+        if section.get("refused_buttons"):
+            named = ", ".join(str(b)[:24] for b in section["refused_buttons"][:8])
+            lines.append(f"  left alone by policy ({len(section['refused_buttons'])}): {named}")
         if section.get("command_list"):
             lines.append("  commands: " + " ".join(str(c) for c in section["command_list"][:10]))
 
