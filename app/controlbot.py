@@ -38,6 +38,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from . import sourcecfg
 from .botapi import BotApi, Update
 from .sessions import forget as forget_session
 from .sessions import list_sessions, mask_phone, scrub, store as store_session, valid_name
@@ -69,7 +70,8 @@ HELP = """auto-manager control
 /reconcile   reclaim stale leases + queue a reconciliation now
 /probe       ask the storage bot and Channel Help their questions (report arrives here)
 /declare     say how long a season is (Total Episodes, and the batch post)
-/source      say what a source channel carries (series, audio, season) — for bare-file channels
+/source      add a source channel, say what it carries (series, audio, season), flip its switches
+/archive     which private channel holds the master copy: /archive <@handle|id> add title <name>
 /inplace     caption the files already posted in your own channel (no delete; link + post still run)
 /joinmsg     what a join requester is told: options, your own words, or switch it off
 /card        name the post a shareable link is made from, per destination channel (the announcement)
@@ -106,6 +108,7 @@ _ROUTES: dict[str, str] = {
     "probe": "_probe",
     "declare": "_declare",
     "source": "_source",
+    "archive": "_archive",
     "inplace": "_inplace",
     "joinmsg": "_joinmsg",
     "card": "_card",
@@ -759,8 +762,16 @@ class ControlBot:
         if self.db is None or not getattr(self.db, "connected", False):
             return [Reply("the database is not reachable, so I cannot record a channel declaration.")]
 
+        # One verb of its own, so that "start watching this channel" is never a side effect of a
+        # command that was asking what a channel carries. That was the whole reason the bot refused
+        # to create rows at all; the operator's answer on 2026-08-29 was that they would not keep
+        # opening a dashboard to click through a form, and they are the owner of the database.
+        if args[1:2] and args[1].strip().casefold() == "add":
+            return await self._source_add(handle, args[2:])
+
         keys = self._SOURCE_KEYS
         tokens = args[1:]
+        flips: dict[str, tuple[sourcecfg.Toggle, bool]] = {}
         wanted: dict[str, object] = {}
         index = 0
         while index < len(tokens):
@@ -769,16 +780,34 @@ class ControlBot:
                 wanted = {name: None for name in keys}
                 index = len(tokens)
                 break
+            toggle = sourcecfg.parse_toggle(key)
+            if toggle is not None:
+                if toggle.name in flips:
+                    return [Reply(f"you gave me `{toggle.name}` twice — which one did you mean?")]
+                word = tokens[index + 1].strip().casefold() if index + 1 < len(tokens) else ""
+                if word in sourcecfg.ON_WORDS:
+                    flips[toggle.name] = (toggle, True)
+                elif word in sourcecfg.OFF_WORDS:
+                    flips[toggle.name] = (toggle, False)
+                else:
+                    return [Reply(
+                        f"`{toggle.name}` needs on or off — I read `{word or 'nothing'}` as neither."
+                        f"\n{self._SOURCE_USAGE}"
+                    )]
+                index += 2
+                continue
             if key not in keys:
                 return [
                     Reply(
-                        f"I only take {', '.join(keys)} (or clear) after the channel — not "
-                        f"`{tokens[index]}`.\n{self._SOURCE_USAGE}"
+                        f"I only take {', '.join(keys)}, {' / '.join(sourcecfg.TOGGLES)} or clear after "
+                        f"the channel — not `{tokens[index]}`.\n{self._SOURCE_USAGE}"
                     )
                 ]
             pieces: list[str] = []
             index += 1
-            while index < len(tokens) and tokens[index].strip().casefold() not in keys:
+            while index < len(tokens) and tokens[index].strip().casefold() not in keys and (
+                sourcecfg.parse_toggle(tokens[index].strip().casefold()) is None
+            ):
                 pieces.append(tokens[index])
                 index += 1
             if not pieces:
@@ -790,6 +819,8 @@ class ControlBot:
         rows = await self._find_source_channel(handle)
         if isinstance(rows, str):  # a message to send instead of a lookup result
             return [Reply(rows)]
+        if not rows:  # `refuse=False` never returns here; the refusal above always answers first
+            return [Reply(sourcecfg.setup_refusal(handle))]
         if len(rows) > 1:
             listed = "\n".join(
                 f"  {row['id']}: @{row['username'] or '?'} — {row['title'] or 'no title'}" for row in rows
@@ -810,16 +841,130 @@ class ControlBot:
                 channel["id"],
                 *[wanted[name] for name in columns],
             )
-        return [Reply(self._source_summary(channel, wanted))]
+        flipped: list[str] = []
+        for toggle, state in flips.values():
+            await sourcecfg.set_flag(self.db, int(channel["id"]), toggle, state)
+            flipped.append(f"  {toggle.name}: {toggle.on_text if state else toggle.off_text}")
+        summary = self._source_summary(channel, wanted)
+        if flipped:
+            summary += "\n\nswitched:\n" + "\n".join(flipped) + "\n"
+            summary += (
+                "each one wrote a single column of that row, and the same words switch it back. the "
+                "file messages themselves were not touched, so nothing that already went out changes."
+            )
+        return [Reply(summary)]
+
+    async def _source_add(self, handle: str, rest: list[str]) -> list[Reply]:
+        """Create the source-channel row the operator used to be sent to a dashboard for.
+
+        Deliberately not part of `_source`'s normal path: this is the one write in the command that
+        decides something outside the database — from this line forward, files arriving in that channel
+        are something to read. Everything else about the row is a default that can be switched.
+        """
+        series = None
+        title = None
+        index = 0
+        while index < len(rest):
+            word = rest[index].strip().casefold()
+            if word not in {"series", "title"} or index + 1 >= len(rest):
+                return [Reply(
+                    f"`add` takes the channel and, if you want them now, `series <name>` and "
+                    f"`title <text>` — not `{rest[index]}`.\n{self._SOURCE_USAGE}"
+                )]
+            pieces = []
+            index += 1
+            while index < len(rest) and rest[index].strip().casefold() not in {"series", "title"}:
+                pieces.append(rest[index])
+                index += 1
+            value = " ".join(pieces).strip()
+            if not value:
+                return [Reply(f"`{word}` needs a value.\n{self._SOURCE_USAGE}")]
+            if word == "series":
+                series = value
+            else:
+                title = value
+
+        rows = await self._find_source_channel(handle, refuse=False)
+        if isinstance(rows, str):
+            return [Reply(rows)]
+        if rows:
+            row = rows[0]
+            return [Reply(
+                f"that channel is already configured (row {row['id']}, "
+                f"{row.get('title') or row.get('username') or 'no title'}), so I wrote nothing — "
+                "adding it twice would only put two sources in front of the same files.\n\n"
+                f"{sourcecfg.flags_line(row)}\n\n"
+                f"to change any of that: /source {handle} <name> on|off, or /source {handle} "
+                "series <name> to declare what it carries."
+            )]
+
+        entity, problem = await self._resolve_channel_entity(handle)
+        if entity is None and problem and not handle.lstrip("-").isdigit():
+            # A @handle cannot be inserted without Telegram's answer: the channel number is the only
+            # thing that names the channel, and inventing one from a username is the guess this program
+            # refuses to make. A number the operator typed is allowed through unverified instead, and
+            # `render_plan` says so out loud rather than hiding it.
+            return [Reply(
+                f"I cannot write a row for `{handle}` yet: {problem}\n"
+                "a @handle has no channel number until Telegram says one, and I will not guess it. "
+                "either send me the number (the -100xxxxxxxxxx form your channel's t.me link and "
+                "/status both use) or make this deployment live and send me the handle again."
+            )]
+        plan = sourcecfg.plan_new(handle, entity=entity, title=title, series=series)
+        if isinstance(plan, str):
+            return [Reply(plan)]
+        new_id = await sourcecfg.insert_channel(self.db, plan)
+        if new_id is None:
+            return [Reply(
+                "somebody configured that channel number in the last few seconds — the table holds one "
+                "row per channel, so mine was dropped. /status is the one to read now."
+            )]
+        return [Reply(
+            f"watching it (row {new_id}).\n\n{sourcecfg.render_plan(plan)}\n\n"
+            "next, if you want the rest of the pipeline: /source "
+            f"{handle} series <name> audio <kind>, and /status shows the queue it lands in."
+        )]
+
+    async def _resolve_channel_entity(self, handle: str) -> tuple[dict | None, str | None]:
+        """Ask Telegram who a @handle is. ``({id, username, title}, None)`` or ``(None, why not)``.
+
+        Its own client, for the reason `app.telegram_client.probe_once` gives: a failure here must not
+        be able to take the worker's connection down with it. One call, no menu questions, so this is
+        seconds rather than the minutes a probe costs — and it sends nothing to anyone.
+        """
+        if handle.lstrip("-").isdigit():
+            return None, "you gave me a number, which needs no checking to be written down"
+        if not getattr(self.settings, "outbound_enabled", False):
+            return None, "this deployment is in shadow mode, so it cannot ask Telegram anything"
+        from .telegram_client import TelegramUserClient
+
+        wrapper = TelegramUserClient(settings=self.settings, db=self.db)
+        try:
+            client = await wrapper.start()
+            raw = await client.get_entity(handle.lstrip("@"))
+        except Exception as exc:  # noqa: BLE001 - an entity lookup failing is a fact, not a crash
+            return None, f"Telegram would not answer for `{handle}` ({type(exc).__name__})"
+        finally:
+            await wrapper.stop()
+        checked = sourcecfg.channel_entity(raw)
+        if isinstance(checked, str):
+            return None, checked
+        return checked, None
 
     _SOURCE_KEYS = ("series", "audio", "season")
     _SOURCE_USAGE = (
         "usage: /source <@handle or channel id> [series <name>] [audio <kind>] [season <n>]\n"
+        "  /source @anime_uploads4u add           (start watching it — the row is written here)\n"
+        "  /source @anime_uploads4u add series Bleach   (and say what it carries, in the same line)\n"
         "  /source @anime_uploads4u series Bleach audio hindi\n"
         "  /source @anime_uploads4u season 2      (a numbering default, never a season claim)\n"
-        "  /source @anime_uploads4u               (show what is declared)\n"
+        "  /source @anime_uploads4u               (show what is declared and what is switched)\n"
+        "  /source @anime_uploads4u gate off      (switches: gate, subs, watch — each on or off)\n"
         "  /source @anime_uploads4u clear         (stop assuming anything)\n\n"
-        "audio is one of: hindi, dual, multi, subbed, subbed_only, unknown."
+        "audio is one of: hindi, dual, multi, subbed, subbed_only, unknown.\n"
+        "the switches write the three columns this program reads: gate is require_hindi_audio, "
+        "subs is include_subbed, watch is mode (on is full, off is ignore). priority and is_joined "
+        "are in the table and have no toggle, because nothing here acts on them."
     )
 
     _INPLACE_USAGE = (
@@ -1630,7 +1775,123 @@ class ControlBot:
 
 
 
-    async def _find_source_channel(self, handle: str) -> list | str:
+    _ARCHIVE_USAGE = (
+        "usage: /archive [<@handle or channel id> add [title <name>]]\n"
+        "  /archive                          which archive rows are recorded, and which one is primary\n"
+        "  /archive @master_archive add title \"Bleach master\"   (start the list)\n\n"
+        "the archive is the private channel every file is copied into first, so it is the one channel "
+        "this program will not choose for you: it holds the only spare copy. The first row added is the "
+        "primary one; a second row waits its turn, because app/writers.py picks the archive by "
+        "`is_primary` and two primaries would make the choice Postgres's to make."
+    )
+
+    async def _archive(self, update: Update, args: list[str]) -> list[Reply]:
+        """``/archive`` to read, ``/archive <channel> add [title <name>]`` to write.
+
+        This is the row `docs/pending-inputs.md` has been asking for by hand. The operator's answer on
+        2026-08-29 was that a form in a database dashboard was not the interface they wanted for the
+        whole setup, and the two rows the pipeline is waiting on are the same shape of row — so both
+        are writable from here now, with the same refusal to invent anything the table needs.
+        """
+        if args and args[0].strip().lower() in {"help", "?"}:
+            return [Reply(self._ARCHIVE_USAGE)]
+        if self.db is None or not getattr(self.db, "connected", False):
+            return [Reply("the database is not reachable, so I cannot read or write the archive list.")]
+
+        rows = await self.db.fetch(
+            "select id, telegram_channel_id, title, is_primary from app.archive_channel order by id"
+        )
+        # With no channel in front of it the command is a read, so it falls through to the list below.
+        handle = args[0].strip() if args else ""
+        if handle.casefold() in {"list", "show"}:
+            handle = ""
+        if handle.casefold() == "add":
+            # The word typed first, which is a guessable mistake and worth one line to correct. An
+            # exact match, not a prefix: `@additional_uploads` is a channel handle, and a bot that
+            # treated it as a stray keyword would be refusing to see a real channel.
+            return [Reply(
+                "`add` comes after the channel: /archive <@handle or channel id> add title <name>.\n"
+                "bare /archive reads the list."
+            )]
+        if not handle:
+            # Reading the list is the same command without a channel in front of it, and it answers
+            # before anything is resolved: the empty case is the one the operator sees first, and it
+            # has to say what is missing in the words the job itself blocks with.
+            if not rows:
+                return [Reply(
+                    "no archive channel is recorded, so the archive job blocks with a refusal rather "
+                    f"than picking one for you.\n{self._ARCHIVE_USAGE}"
+                )]
+            listed = "\n".join(
+                f"  {'primary' if row.get('is_primary') else 'spare  '} {row.get('title') or 'no title'} "
+                f"(`{row['telegram_channel_id']}`)"
+                for row in rows
+            )
+            return [Reply(
+                f"archive channels, in the order the archive job reads them:\n{listed}\n\n"
+                "the job takes the primary row. adding another spare is the same command with a "
+                "different channel; nothing here removes one."
+            )]
+
+        rest = [token.strip() for token in args[1:]]
+        if not rest or rest[0].casefold() != "add":
+            return [Reply(
+                f"`add` comes after the channel, and a name after that: /archive {handle} add "
+                "title <what you call it>.\n"
+                "bare /archive reads the list; it writes nothing."
+            )]
+        rest = rest[1:]
+        title = None
+        if rest:
+            if rest[0].casefold() != "title" or len(rest) < 2:
+                return [Reply(
+                    f"I only take `title <name>` after `add` — not `{rest[0]}`.\n{self._ARCHIVE_USAGE}"
+                )]
+            # Quotes arrive as characters from Telegram, and a title that starts with one is a title
+            # with a quote in it: this row is read out to the operator in /status and in the archive
+            # job's block reason, so it is stored as the words they meant.
+            title = " ".join(rest[1:]).strip().strip("\"'").strip() or None
+        # A missing title is not refused here. When Telegram can answer for the handle it supplies the
+        # title, and `plan_archive` is the one place that knows whether a name arrived from either
+        # side — refusing before the ask would turn a public channel into a command that cannot work.
+
+        entity, problem = await self._resolve_channel_entity(handle)
+        if entity is None and problem and not handle.lstrip("-").isdigit():
+            return [Reply(
+                f"I cannot write an archive row for `{handle}` yet: {problem}\n"
+                "the channel number is the only thing that addresses a *private* channel, and a "
+                "@handle that Telegram will not resolve leaves me guessing. send the -100xxxxxxxxxx "
+                "number instead — /status prints it for a channel the session can see."
+            )]
+        plan = sourcecfg.plan_archive(handle, entity=entity, title=title, primary=not rows)
+        if isinstance(plan, str):
+            return [Reply(plan)]
+        # By channel number, which is the only key two listings of one channel share: matching on the
+        # title would call "Bleach master" and "bleach master" two archives, and matching on nothing
+        # would let the same channel be listed twice for the same files.
+        clash = next(
+            (row for row in rows if row.get("telegram_channel_id") == plan["telegram_channel_id"]), None
+        )
+        if clash is not None:
+            return [Reply(
+                f"that channel is already the archive (row {clash['id']}, "
+                f"{clash.get('title') or 'no title'}), so I wrote nothing — a second row for it would "
+                "not make a second copy, it would only make the job choose between two spellings."
+            )]
+        new_id = await sourcecfg.insert_archive(self.db, plan)
+        if new_id is None:
+            return [Reply(
+                "that channel number is already in the archive list — somebody added it a moment ago, "
+                "and the table keeps one row per channel, so mine was dropped."
+            )]
+        return [Reply(
+            f"archive row {new_id} written.\n\n{sourcecfg.render_archive_plan(plan)}\n\n"
+            "the archive job reads this row on its next run; /status will stop naming it as missing. "
+            "Nothing was copied or deleted by writing it — the first copy is a job, and jobs only run "
+            "when the worker is enabled."
+        )]
+
+    async def _find_source_channel(self, handle: str, *, refuse: bool = True) -> list | str:
         """Look a source channel up by @handle or numeric Telegram id.
 
         Both, because the operator reads handles in Telegram and the database keys on the
@@ -1638,6 +1899,10 @@ class ControlBot:
         (`@1000hours`) is handled by matching the text form too. A stored ``@`` is trimmed on
         our side as well: these rows are also edited by hand in the dashboard, and a row saved
         as ``@some_channel`` must still answer to ``/source @some_channel``.
+
+        ``refuse=False`` returns an empty list instead of the "not configured" message, because the
+        ``add`` path has to be able to tell "no row yet" from "a row I may not write" — and it is the
+        caller that decides whether an absent row is an invitation.
         """
         stripped = handle.lstrip("@")
         # Negative on purpose: every Telegram channel id the operator will copy out of a
@@ -1647,6 +1912,7 @@ class ControlBot:
         rows = await self.db.fetch(
             """
             select id, username, title, telegram_channel_id, series_id, destination_id,
+                   mode, active, require_hindi_audio, include_subbed,
                    we_are_admin, publish_role,
                    coalesce(declared_series, '') as declared_series,
                    coalesce(declared_audio, '') as declared_audio,
@@ -1661,28 +1927,9 @@ class ControlBot:
             numeric,
         )
         if not rows:
-            # The refusal has to leave the operator somewhere to go. This is the one command whose subject
-            # is a row this bot will not make, and "created in the dashboard table app.source_channel" is
-            # a sentence nobody can act on from a phone — which is how it read when the operator tried
-            # `/source -1002575861262 …` on 2026-08-29 and got it back. So the steps are here, with the
-            # one required field named, and the reason for the refusal said once.
-            wanted = numeric if numeric is not None else "the channel number, minus sign and all"
-            return (
-                f"`{handle}` is not a configured source channel, so there is nothing to declare about it.\n"
-                "I read and update that table, but I do not create rows in it: adding a channel is what "
-                "starts the service watching it, and that is your decision to make, never a side effect of "
-                "a command I answer.\n\n"
-                "To add it, in the Supabase dashboard: Table editor → app.source_channel → Insert row.\n"
-                f"telegram_channel_id: {wanted} — the only field this table needs.\n"
-                "username: @the_handle, or leave it empty if the channel has no @name.\n"
-                "title: what you call it. This is what /status prints.\n"
-                "mode: leave it on full. active: leave it on.\n"
-                "require_hindi_audio: leave it on. It is the check that a file has Hindi audio before it is "
-                "posted, and it stays on until you tell me otherwise for this channel.\n"
-                "series_id and destination_id: leave them empty here — /source records the series, /card "
-                "the destination, and both check the numbers for you.\n\n"
-                "Save, then send me the same /source command again and it will take the declaration."
-            )
+            if not refuse:
+                return []
+            return sourcecfg.setup_refusal(handle)
         return list(rows)
 
     async def _check_declarations(self, wanted: dict[str, object]) -> str | None:
@@ -1730,6 +1977,13 @@ class ControlBot:
         for name in self._SOURCE_KEYS:
             value = current[name]
             lines.append(f"  {name}: {value if value not in (None, '') else 'not declared'}")
+        lines.append("")
+        lines.append("switches:")
+        lines.append(sourcecfg.flags_line(channel))
+        lines.append(
+            "  `/source %s <name> on|off` flips one — gate, subs or watch."
+            % (channel.get("username") or channel["telegram_channel_id"])
+        )
         lines.append("")
         if current["audio"]:
             lines.append(

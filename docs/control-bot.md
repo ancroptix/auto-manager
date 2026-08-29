@@ -144,7 +144,10 @@ session at boot, if it restarts on its own.
 | `/resume` | claims again on the next poll |
 | `/reconcile` | reclaims expired leases and queues a reconciliation pass |
 | `/probe` | discovery against the storage bot and Channel Help: it opens both from the logged-in account and reads their menus back, and it posts nothing in your channels. But it *does* send, so it refuses to run in shadow mode. To probe without launching the pipeline: `APP_MODE=live` **and** `WORKER_ENABLED=false` in Render, save, `/probe`, then put `WORKER_ENABLED` back — with the worker off no job is claimed, so nothing reaches your channels while the questions are asked. The report is written to this chat, never to a channel |
-| `/source <@handle\|channel id> [series <name>] [audio <kind>] [season <n>]` | what a *files-only* source channel carries, stated once for the whole channel instead of guessed per file. With no arguments it shows what is declared; `clear` stops assuming. It never re-decides a file that was already decided — parked ones are re-read on the next scan |
+| `/source <@handle\|channel id> [series <name>] [audio <kind>] [season <n>]` | what a *files-only* source channel carries, stated once for the whole channel instead of guessed per file. With no arguments it shows what is declared **and what is switched**; `clear` stops assuming. It never re-decides a file that was already decided — parked ones are re-read on the next scan |
+| `/source <@handle\|channel id> add [series <name>] [title <text>]` | start watching that channel: the row in `app.source_channel` is written here, with its defaults printed back. Its own verb on purpose — a row is the decision to read a channel, so no other command makes one, and a lookup that finds nothing says `add` instead of naming a table |
+| `/source <channel> gate\|subs\|watch on\|off` | the three switches whose columns production code reads: `gate` is `require_hindi_audio`, `subs` is `include_subbed`, `watch` is `mode` (`on` is `full`, `off` is `ignore`). One column per command, and the same words switch it back |
+| `/archive [<@handle\|channel id> add [title <name>]]` | which private channel holds the master copy: bare `/archive` reads the list, `add` writes the missing row the archive job blocks on. The first row added is `is_primary`, because two primaries would make `app/writers.py` pick between them |
 | `/joinmsg [show\|options\|use <n>\|set <text>\|clear]` | what a join requester is told, when you later run a campaign at them. `options` lists three drafts with the promise each one makes; `use 2` saves one, `set …` saves your own words (`{name}` and `{series}` are filled at send time), `clear` empties it so the app may contact nobody. Saving is not sending, and the reply says so — the sender is the blocked job kind `join_request_campaign`. It cannot approve or decline anyone, and it refuses a message that carries an invite link |
 | `/inplace <@handle\|channel id> [from <@other>] [plan\|off]` | publish by editing instead of posting: the channel's own file messages get the approved caption written onto them. No new channel, no copy, no delete, no buttons. `plan` shows what it would do and changes nothing; `from` compares with a second channel so episodes only *it* has are forwarded in; `off` goes back to the link route |
 | `/declare <series> <season> <episodes>` | state how long a season is — the only thing that can fill **◎ Total Episodes**, and the only thing that can make a season count as complete. It publishes nothing itself; the batch post stays the publisher's decision. `/declare bleach 2 tba` takes the claim back |
@@ -205,6 +208,33 @@ Three replies to expect, all deliberate:
 * **"this command changed the plan, not the channel"** — true until the MTProto write
   layer is wired on the live account. `/inplace` is safe to run today; the edits follow
   once the session can send `EditMessage`.
+
+### Configuring a channel from this chat, not from the dashboard
+
+On 2026-08-29 the operator put the reason plainly: *"mai baar baar supabase nhi kholne wala … bot me hi
+toggle on/off jaise options jod do"*. The bot already writes this database — that is what `/card`,
+`/sticker`, `/declare` and `/source … series` have always done — so making it able to write the two rows
+the whole setup was waiting on (`app.source_channel`, `app.archive_channel`) moves no authority, it only
+moves the form. `app/sourcecfg.py` is where those rules live, and three of them are held by tests rather
+than by intent:
+
+* **A row that starts something gets its own verb.** `/source <channel> add` exists as a command because
+  adding a source channel is the decision to read that channel. A `/source` that finds no row now names
+  `add` rather than a table, and nothing in the bot creates a row as a side effect of a question.
+* **Only a column something reads may be switched.** `app.source_channel` also holds `priority`,
+  `is_joined`, `active` and the `monitor_only` mode, and no code outside a probe query acts on them — so
+  there is deliberately no switch for them, and `watch` writes `mode` rather than `active` for exactly
+  that reason: `app/ingest.py` compares against `ignore`, and nothing at all compares against `false` in
+  `active`. A toggle that looks like a pause button and is not one is worse than no toggle.
+  `tests/test_sourcecfg.py` checks each column named in an insert against the rest of `app/`.
+* **Nothing destructive, and nothing invented.** One insert with `on conflict do nothing`, updates that
+  name a single column, no delete anywhere in the module. A `@handle` is resolved with one Telegram call
+  and the title comes from the answer; if this deployment cannot ask Telegram, a channel *number* is
+  written with the reply saying "not checked against Telegram" out loud, and a handle is refused outright
+  rather than given an invented id.
+
+The dashboard still works, and is still the only way to set a column with no switch. What changed is that
+it stopped being the first step.
 
 ## 4. Closing the door afterwards
 

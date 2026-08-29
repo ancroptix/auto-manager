@@ -98,8 +98,9 @@ the job that needs it, so `/status` names the missing thing rather than a stack 
 1. **One session, live.** Done on 2026-08-29: the account is logged in and its session is stored, and
    the probe has since run against it four times. `BOT_ALLOW_LOGIN=false` is the loose end, and it is a
    switch on your side, not a row here — leave the login door shut now that you are through it.
-2. **The private master archive.** A row in `app.archive_channel` with that channel's numeric id (and
-   `is_primary = true`). This program will not choose where the only spare copy of an episode lives.
+2. **The private master archive.** `/archive <@handle|channel id> add title <name>` writes the row in
+   `app.archive_channel`, and the first row added is the primary one — so what is still yours to supply is
+   the *channel*: this program will not choose where the only spare copy of an episode lives.
 3. **`/card <destination> <message id>`**, once per destination channel — the post that gets forwarded
    to the link bot so the announcement carries its shareable link. No card, no announcement; the
    invite link never goes out on its own.

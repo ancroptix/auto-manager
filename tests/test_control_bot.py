@@ -109,6 +109,9 @@ class FakeDb:
             }
         ]
         self.declared_history: list[dict] = []
+        # /archive: the private master archive list, empty by default because that is the state the
+        # archive job blocks in, and the one the command's reply has to describe rather than guess.
+        self.archive_channels: list[dict] = []
         # /inplace: the destination row for the channel being switched, the messages it would
         # edit, and the episode numbers of the channel it is compared against.
         self.destination: dict | None = None
@@ -188,6 +191,8 @@ class FakeDb:
             return [{"episode_number": number} for number in self.inplace_source]
         if "from app.source_candidate" in sql:
             return list(self.parked)
+        if "from app.archive_channel" in sql:
+            return [dict(row) for row in self.archive_channels]
         if "from app.source_channel" in sql:
             handle, numeric = args[0], args[1]
             hits = [
@@ -234,6 +239,42 @@ class FakeDb:
         return {"id": 42}
 
     async def fetchval(self, sql: str, *args: Any):
+        if "insert into app.archive_channel" in sql:
+            names = [
+                name.strip()
+                for name in re.search(r"insert into app\.archive_channel \((.*?)\)", sql, re.S)
+                .group(1)
+                .split(",")
+                if name.strip() and "_at" not in name
+            ]
+            row = {"id": 950 + len(self.archive_channels)}
+            row.update(dict(zip(names, args)))
+            self.archive_channels.append(row)
+            self.writes.append((sql, args))
+            return row["id"]
+        if "insert into app.source_channel" in sql:
+            # Mirror the row the way the table would: the column list in the statement, zipped onto
+            # the arguments, so a test reads back `mode` and not a string it has to squint at.
+            import re as _re
+
+            names = [
+                name.strip()
+                for name in _re.search(r"insert into app.source_channel \((.*?)\)", sql, _re.S)
+                .group(1)
+                .split(",")
+                if name.strip() and "_at" not in name
+            ]
+            row = {
+                "id": 900 + len(self.source_channels),
+                "declared_series": "",
+                "declared_audio": "",
+                "declared_season": -1,
+                "we_are_admin": None,
+            }
+            row.update(dict(zip(names, args)))
+            self.source_channels.append(row)
+            self.writes.append((sql, args))
+            return row["id"]
         if "session_string" in sql:
             return next((row.get("session_string") for row in self.stored if row.get("active")), None)
         if "thumbnail_review" in sql:
@@ -271,6 +312,15 @@ class FakeDb:
             row = next((r for r in self.source_channels if r["id"] == args[0]), None)
             if row is None:
                 return 0
+            if not columns:
+                # A switch: one named column, one value. `/source <ch> gate off` writes exactly that
+                # shape, and the fake that ignores it would let a test pass on a command that wrote
+                # nothing at all.
+                single = _re.search(r"set (\w+) = \$", sql)
+                if single is not None:
+                    row[single.group(1)] = args[1]
+                    self.writes.append((sql, args))
+                return 1
             for position, name in enumerate(columns):
                 value = args[position + 1]
                 if value is None:
@@ -1948,21 +1998,191 @@ async def test_a_reply_over_telegrams_limit_arrives_in_pieces_instead_of_cut_sho
 
 
 @pytest.mark.asyncio
-async def test_a_source_channel_that_does_not_exist_yet_says_where_to_create_it() -> None:
-    """The refusal the operator actually hit, and what it owed them.
+async def test_a_missing_source_channel_is_answered_with_the_command_that_adds_it() -> None:
+    """The refusal the operator hit, and where it sends them now.
 
-    `/source -1002575861262 series …` was answered with "the row itself is created in the dashboard table
-    app.source_channel — I can read and update it, not create it". True, and useless to someone working on
-    a phone: the refusal to create the row is a decision this program keeps, so the *steps* have to come
-    with it, including which field the table actually requires.
+    `/source -1002575861262 …` used to answer "the row itself is created in the dashboard table
+    app.source_channel — I can read and update it, not create it": true, and no use to someone on a
+    phone. The bot can write that row, and the operator said in one sentence why the dashboard was not
+    the answer (*"mai baar baar supabase nhi kholne wala"*), so the refusal's first line is the command
+    that works and the dashboard is the fallback for whoever wants more than the defaults.
     """
     control, _api, db = bot()
     (text,) = await say(control, "/source -1002575861262 series Bleach")
 
-    assert "-1002575861262" in text, "the id they typed, echoed back so the number is checkable"
-    assert "Table editor" in text and "app.source_channel" in text, "the path, not just the table name"
-    assert "telegram_channel_id" in text, "the one required column, by name"
-    assert "Insert row" in text
-    assert "I do not create rows" in text, "and the reason stays said: watching a channel is their call"
-    assert "/probe" not in text and "grant" not in text.lower(), "no invented capability in a refusal"
-    assert db.queued == [], "a refusal queues nothing"
+    assert "/source -1002575861262 add" in text, "the next click, in the first breath"
+    assert "Table editor" in text and "app.source_channel" in text, "the fallback path, still named"
+    assert "telegram_channel_id" in text, "and the one column that table needs, still by name"
+    assert "the decision to start reading a channel" in text, "why it stays its own command"
+    assert db.queued == [] and db.writes == [], "a refusal writes nothing and queues nothing"
+
+
+# --------------------------------------------------------------------------- /source add
+# The row itself, from the chat window: what the operator asked for on 2026-08-29, and the one write in
+# this command that changes what the service reads rather than what it says about a file.
+
+
+@pytest.mark.asyncio
+async def test_add_writes_the_row_and_prints_the_defaults_it_chose() -> None:
+    db = FakeDb()
+    db.source_channels = []
+    control, _api, _db = bot(db=db)
+    (text,) = await say(control, "/source -1002575861262 add series Bleach")
+
+    assert "watching it" in text, text[:120]
+    row = db.source_channels[0]
+    assert row["telegram_channel_id"] == -1002575861262
+    assert row["mode"] == "full" and row["active"] is True
+    assert row["require_hindi_audio"] is True, "the gate is on until the operator switches it off"
+    assert row["include_subbed"] is False, "subbed-only files are not in scope by default"
+    assert row["declared_series"] == "Bleach"
+    assert "priority" not in row and "is_joined" not in row, "only columns something reads are named"
+    assert "not checked against Telegram" in text, "a number nobody looked up is said, not smoothed over"
+    assert "nothing was deleted" in text
+
+
+@pytest.mark.asyncio
+async def test_add_never_configures_one_channel_twice() -> None:
+    db = FakeDb()
+    before = [dict(row) for row in db.source_channels]
+    control, _api, _db = bot(db=db)
+    (text,) = await say(control, "/source @anime_uploads4u add")
+
+    assert "already configured" in text, "and it says so instead of adding a second source"
+    assert db.source_channels == before, "nothing written, nothing changed"
+    assert "gate" in text and "watch" in text, "the row it found is shown with its switches"
+
+
+@pytest.mark.asyncio
+async def test_a_switch_writes_one_column_and_names_what_it_changes() -> None:
+    db = FakeDb()
+    control, _api, _db = bot(db=db)
+    (text,) = await say(control, "/source @anime_uploads4u gate off")
+
+    row = db.source_channels[0]
+    assert row["require_hindi_audio"] is False, "the switch reached the row, not just the reply"
+    assert "switched" in text and "gate" in text
+    assert "Hindi-audio" in text, "what the word means, not only the word for it"
+
+    (back,) = await say(control, "/source @anime_uploads4u gate on")
+    assert db.source_channels[0]["require_hindi_audio"] is True, "the same words switch it back"
+    assert "gate" in back
+
+
+@pytest.mark.asyncio
+async def test_watch_off_is_the_pause_that_ingest_reads() -> None:
+    """`watch` writes `mode`, because `mode` is the column with a reader.
+
+    `active` sits next to it in the table and would read like the natural switch — nothing that claims a
+    job looks at it, so a toggle there would be a pause button that pauses nothing.
+    """
+    db = FakeDb()
+    control, _api, _db = bot(db=db)
+    (_text,) = await say(control, "/source @anime_uploads4u watch off")
+
+    assert db.source_channels[0]["mode"] == "ignore"
+    assert "active" not in db.source_channels[0], "the row was not touched where nothing reads it"
+
+
+@pytest.mark.asyncio
+async def test_a_switch_that_is_not_a_switch_says_so() -> None:
+    """One word, and a choice of what to type instead — never a half-applied change.
+
+    `subs on on`, `gate maybe`, and an unknown flag all answer with the usage; what they must not do is
+    write one column and refuse the next, which is how a config command earns distrust.
+    """
+    db = FakeDb()
+    control, _api, _db = bot(db=db)
+    texts = await say(control, "/source @anime_uploads4u gate maybe")
+    assert "on or off" in texts[0] and db.writes == []
+    texts = await say(control, "/source @anime_uploads4u volume up")
+    assert "gate" in texts[0] and "subs" in texts[0] and db.writes == []
+
+
+# --------------------------------------------------------------------------- /archive
+# The other row the setup was waiting on, and the one place this program refuses to pick a channel:
+# the archive holds the only spare copy of an episode, so it is named or the job blocks.
+
+
+@pytest.mark.asyncio
+async def test_archive_without_a_row_says_what_is_missing_and_how_to_write_it() -> None:
+    db = FakeDb()
+    control, _api, _db = bot(db=db)
+    (text,) = await say(control, "/archive")
+
+    assert "no archive channel is recorded" in text
+    assert "add title" in text, "the answer names the command that fills it in"
+    assert db.writes == [], "reading the list writes nothing"
+
+
+@pytest.mark.asyncio
+async def test_the_first_archive_row_becomes_the_primary_one() -> None:
+    db = FakeDb()
+    control, _api, _db = bot(db=db)
+    (text,) = await say(control, '/archive -1002072936982 add title "Master archive"')
+
+    row = db.archive_channels[0]
+    assert row["telegram_channel_id"] == -1002072936982
+    assert row["is_primary"] is True, "the first one is the primary one, and the reply says so"
+    assert "primary: yes" in text and "archive row" in text
+    assert "not checked against Telegram" in text, "a number we could not ask about is called what it is"
+
+
+@pytest.mark.asyncio
+async def test_a_second_archive_row_waits_its_turn() -> None:
+    db = FakeDb()
+    db.archive_channels = [{"id": 1, "telegram_channel_id": -1001, "title": "First", "is_primary": True}]
+    control, _api, _db = bot(db=db)
+    (text,) = await say(control, "/archive -1002 add title Second")
+
+    assert db.archive_channels[1]["is_primary"] is False
+    assert "waits its turn" in text
+    (listed,) = await say(control, "/archive")
+    assert "primary" in listed and "spare" in listed, "and the list says which is which"
+
+
+@pytest.mark.asyncio
+async def test_an_archive_channel_is_not_listed_twice() -> None:
+    db = FakeDb()
+    db.archive_channels = [{"id": 1, "telegram_channel_id": -100777, "title": "First", "is_primary": True}]
+    control, _api, _db = bot(db=db)
+    (text,) = await say(control, "/archive -100777 add title Renamed")
+
+    assert "already the archive" in text
+    assert len(db.archive_channels) == 1, "the row it found is left alone"
+
+
+@pytest.mark.asyncio
+async def test_an_archive_row_without_a_name_is_refused() -> None:
+    """Titles are decoration in a source channel and the whole description of an archive.
+
+    Nobody reads messages out of an archive, so `title` is the only thing that tells a person which
+    channel number they trusted with the spare copies. An empty one is refused rather than stored.
+    """
+    db = FakeDb()
+    control, _api, _db = bot(db=db)
+    (text,) = await say(control, "/archive -100777 add")
+
+    assert "needs a title" in text and "/archive -100777 add title" in text
+    assert db.archive_channels == [] and db.writes == []
+
+
+@pytest.mark.asyncio
+async def test_a_handle_is_never_written_as_a_row_with_a_guessed_number() -> None:
+    """Shadow mode cannot ask Telegram who owns a @handle, so the command stops instead of filling it in.
+
+    A row's `telegram_channel_id` is the only thing that says which channel this service reads, and an id
+    invented from a username means watching somebody else's channel — the one failure a config command
+    must not be able to cause, so it is refused loudly and the number is asked for instead.
+    """
+    db = FakeDb()
+    db.source_channels = []
+    control, _api, _db = bot(db=db)
+    (text,) = await say(control, "/source @bleach_hindi add")
+
+    assert "cannot write a row" in text and "shadow mode" in text, text[:160]
+    assert db.source_channels == [] and db.writes == [], "no row, no id, no promise"
+
+    (archive,) = await say(control, '/archive @bleach_master add title "Master"')
+    assert "cannot write an archive row" in archive
+    assert db.archive_channels == []
