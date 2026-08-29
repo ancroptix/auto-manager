@@ -176,6 +176,33 @@ def test_the_control_bot_documents_every_command_it_advertises() -> None:
     assert not undocumented, f"the bot answers commands the operator was never told about: {undocumented}"
 
 
+def test_the_menu_page_names_every_screen_the_console_has() -> None:
+    """The screen map in `docs/control-bot.md` is `console.NAV`, in both directions.
+
+    A table a developer can forget to update is worse than no table: the operator reads `bots` where the
+    module now says `settings`, taps the row that is not there, and finds out that the documentation is the
+    part that was lying. So the row keys are compared to the module's own tuple, and a row for a screen that
+    does not exist is as much a failure as a missing one.
+    """
+    import sys
+
+    sys.path.insert(0, str(ROOT))
+    from app import console, normalize
+
+    doc = read("docs/control-bot.md")
+    assert "### The menu" in doc, "the page lost the section"
+    section = doc.split("### The menu", 1)[1].split("\n## ", 1)[0]
+    named = set(re.findall(r"^\| `([a-z]+)` \|", section, re.M))
+    assert named == set(console.NAV), (
+        f"the page does not describe: {sorted(set(console.NAV) - named)}; "
+        f"the page invents: {sorted(named - set(console.NAV))}"
+    )
+    for kind in sorted(normalize.DECLARED_AUDIO):
+        assert f"`{kind}`" in section, f"the audio picks are documented without {kind}"
+    for promise in ("`↻ Refresh`", "✖ Stop here", "ran: ", "drops the button"):
+        assert promise in section, f"the page no longer states the rule behind {promise!r}"
+
+
 def test_the_kill_switch_stays_http_only_in_every_doc() -> None:
     """`/shutdown` is deliberately not on Telegram: a kill switch reachable from a
     chat window is one lost phone away from being pressed by someone else."""

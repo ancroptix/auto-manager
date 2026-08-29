@@ -200,6 +200,13 @@ class FakeDb:
         if "from app.archive_channel" in sql:
             return [dict(row) for row in self.archive_channels]
         if "from app.source_channel" in sql:
+            if "where id = $1" in sql:
+                # The console resolves a tap's row id to a handle, because a button carries the id and a
+                # command takes the handle. A fake that could not answer that hides a real fault.
+                return [dict(row) for row in self.source_channels if row["id"] == args[0]]
+            if not args:
+                # The list screen asks for every row and nothing else.
+                return [dict(row) for row in self.source_channels]
             handle, numeric = args[0], args[1]
             hits = [
                 dict(row)
@@ -2336,3 +2343,238 @@ async def test_a_channel_added_by_number_can_be_named_afterwards() -> None:
 
     (missing,) = await say(control, "/source @anime_uploads4u title")
     assert "`title` needs a value" in missing and db.source_channels[0]["title"] == "Bleach in Hindi"
+
+
+# --------------------------------------------------------------------- the console, tapped
+#
+# `tests/test_console.py` checks what a screen is made of. These check the other half: that a press is
+# answered by the same handler the words go through, and that the row ends up where the tap said it would.
+# A keyboard is only safe while both statements hold, and only this file can hold them at once.
+
+
+@pytest.mark.asyncio
+async def test_a_tap_opens_the_menu_with_no_command_typed() -> None:
+    control, api, db = bot()
+    await control.dispatch(parse_update(_press(api, "n:main")))
+    assert "mode:" in api.sent[-1][1]
+    first = api.markups[-1]["inline_keyboard"][0][0]
+    assert first["text"] == "📊 Status" and first["callback_data"] == "x:/status"
+    assert db.writes == [], "a screen is read-only, even the one that looks like a dashboard"
+
+
+@pytest.mark.asyncio
+async def test_the_source_list_names_every_configured_channel_by_name() -> None:
+    control, api, db = bot()
+    await control.dispatch(parse_update(_press(api, "n:sources")))
+    assert "anime_uploads4u" in api.sent[-1][1], "the handle, which is what the operator knows it as"
+    rows = api.markups[-1]["inline_keyboard"]
+    assert rows[0][0]["callback_data"] == "r:3:open"
+
+
+@pytest.mark.asyncio
+async def test_a_switch_on_a_screen_writes_the_row_and_returns_to_the_screen() -> None:
+    """Two replies, and the second is the truth rather than the intention.
+
+    The audit line names the command the tap became, and it is not decoration: `/source … gate off` is the
+    line that goes in a bug report, and an operator who cannot see it has no way to tell a screen that lied
+    from a write that worked.
+    """
+    control, api, db = bot()
+    db.source_channels[0]["require_hindi_audio"] = True
+    await control.dispatch(parse_update(_press(api, "r:3:gate:off")))
+    assert db.source_channels[0]["require_hindi_audio"] is False
+    assert "gate: off" in api.texts
+    assert "ran: `/source @anime_uploads4u gate off`" in api.sent[-1][1]
+    assert "○ Hindi-audio check: off" in api.sent[-1][1], "and the screen already reflects it"
+
+
+@pytest.mark.asyncio
+async def test_tapping_a_switch_from_a_screen_and_typing_the_words_leave_the_same_row() -> None:
+    """The same claim as the `app/keyboards.py` parity test, through the console's own translator."""
+    typed, typed_api, typed_db = bot()
+    await say(typed, "/source @anime_uploads4u audio dual")
+    tapped, tapped_api, tapped_db = bot()
+    await tapped.dispatch(parse_update(_press(tapped_api, "r:3:audio:dual")))
+    assert tapped_db.source_channels[0]["declared_audio"] == typed_db.source_channels[0]["declared_audio"]
+    assert tapped_db.declared_history == typed_db.declared_history
+
+
+@pytest.mark.asyncio
+async def test_add_a_channel_asks_for_the_one_thing_a_button_cannot_carry() -> None:
+    """`p:add`, then a bare id: the only text in the flow, requested by the bot and answered once.
+
+    The negative half is in the same test on purpose — once the row exists there is no question outstanding,
+    so the next thing typed is not quietly taken as another channel to create.
+    """
+    control, api, db = bot()
+    db.source_channels = []
+    await control.dispatch(parse_update(_press(api, "p:add")))
+    labels = [one["text"] for one in api.markups[-1]["inline_keyboard"][-1]]
+    assert "its @handle" in api.sent[-1][1] and "✖ Stop here" in labels
+    replies = await say(control, "-1002575861262")
+    assert db.source_channels, "the row was created by the tap's answer"
+    assert any("watching it" in line for line in replies), replies
+    assert "ran: `/source -1002575861262 add`" in replies[-1], "and the list came back with the audit line"
+    assert await say(control, "-1002575861263") == [], "the question was asked once, and no more"
+
+
+@pytest.mark.asyncio
+async def test_pressing_anything_else_abandons_an_open_question() -> None:
+    control, api, db = bot()
+    await control.dispatch(parse_update(_press(api, "p:series:3")))
+    await control.dispatch(parse_update(_press(api, "n:main")))
+    assert await say(control, "Naruto") == []
+    assert db.source_channels[0]["declared_series"] == "", "and the half-finished rename was not written"
+
+
+@pytest.mark.asyncio
+async def test_a_command_typed_while_a_question_is_open_is_not_taken_as_the_answer() -> None:
+    """The operator stopped to check something, and the question is still waiting when they come back.
+
+    Taking any message as the answer would turn `/status` into a series name — which the parser would
+    refuse, so the harm would be only the lost rename. Losing it silently is the harm.
+    """
+    control, api, db = bot()
+    await control.dispatch(parse_update(_press(api, "p:series:3")))
+    assert any("queue:" in line for line in await say(control, "/status"))
+    await say(control, "Bleach")
+    assert db.source_channels[0]["declared_series"] == "Bleach"
+
+
+@pytest.mark.asyncio
+async def test_a_row_that_vanished_between_the_question_and_the_answer_is_refused_loudly() -> None:
+    control, api, db = bot()
+    await control.dispatch(parse_update(_press(api, "p:series:3")))
+    db.source_channels.clear()
+    replies = await say(control, "Bleach")
+    assert replies and "not configured any more" in replies[0]
+    assert db.declared_history == []
+
+
+@pytest.mark.asyncio
+async def test_a_button_for_a_row_that_is_gone_writes_nothing() -> None:
+    """Stale screens happen — the tab from this morning, a second device. The reply says what to do about it.
+
+    A button nobody is looking at any more must not take a wrong action, and the way out has to be in the
+    refusal: the list to re-read, or the button that starts over.
+    """
+    control, api, db = bot()
+    db.source_channels[0]["require_hindi_audio"] = True
+    replies = await control.dispatch(parse_update(_press(api, "r:999:gate:off")))
+    assert replies and "not configured any more" in replies[0].text
+    assert "➕ Add a channel" in replies[0].text, "and the button that fixes it is named"
+    assert db.source_channels[0]["require_hindi_audio"] is True, "the real row was left alone"
+
+
+@pytest.mark.asyncio
+async def test_a_stranger_pressing_a_console_button_gets_nothing_at_all() -> None:
+    """The tap is not a login, and the row id in the payload is not a capability.
+
+    Worth pinning again on this path specifically: the console's payloads name rows by number, which is
+    shorter and easier to guess than a command, so this is the version an attacker would try.
+    """
+    control, api, db = bot()
+    db.source_channels[0]["require_hindi_audio"] = True
+    update_ = {
+        "update_id": 1,
+        "callback_query": {
+            "id": "cb-x",
+            "from": {"id": STRANGER},
+            "message": {"message_id": 3, "chat": {"id": STRANGER}},
+            "data": "r:3:gate:off",
+        },
+    }
+    from app.botapi import parse_update
+
+    replies = await control.handle(parse_update(update_))
+    assert replies == [] and api.sent == []
+    assert db.source_channels[0]["require_hindi_audio"] is True
+
+
+@pytest.mark.asyncio
+async def test_the_bare_command_and_the_prefixed_one_are_the_same_tap() -> None:
+    """`app/keyboards.py` sends `/pause` as callback data; the console sends `x:/pause`.
+
+    Both have to land on the same method with the same args, or the previous round's buttons are dead buttons
+    in this round's build — which is the specific way a layered interface breaks.
+    """
+    prefixed, api_a, db_a = bot()
+    await prefixed.handle(parse_update(_press(api_a, "x:/pause")))
+    bare, api_b, db_b = bot()
+    await bare.handle(parse_update(_press(api_b, "/pause")))
+    assert api_a.sent == api_b.sent
+    assert db_a.paused[-1][0] is True and db_b.paused[-1][0] is True
+
+
+@pytest.mark.asyncio
+async def test_help_offers_the_menu_beside_the_command_list() -> None:
+    control, api, db = bot()
+    await control.dispatch(update("/help"))
+    assert api.markups[-1]["inline_keyboard"][0][0]["callback_data"] == "n:main"
+    assert "/help" in api.sent[-1][1], "the text is not replaced by the button"
+
+
+@pytest.mark.asyncio
+async def test_a_screen_this_build_does_not_have_says_so() -> None:
+    control, api, db = bot()
+    replies = await control.dispatch(parse_update(_press(api, "n:sources_but_nicer")))
+    assert replies and "does not exist in this build" in replies[0].text
+
+
+@pytest.mark.asyncio
+async def test_the_joinmsg_screen_shows_the_saved_wording_or_says_it_is_empty() -> None:
+    control, api, db = bot()
+    await control.dispatch(parse_update(_press(api, "n:joinmsg")))
+    assert "saved now: nothing" in api.sent[-1][1]
+    await say(control, "/joinmsg set waiting for you, {name}")
+    await control.dispatch(parse_update(_press(api, "n:joinmsg")))
+    assert "waiting for you, {name}" in api.sent[-1][1]
+
+
+@pytest.mark.asyncio
+async def test_the_queue_screen_names_the_state_it_cannot_read_rather_than_picking_one() -> None:
+    """`paused: no` offers Pause, `paused: yes` offers Resume, and the buttons come from the read.
+
+    A screen that guessed at a state is the one place a button can be built that runs the command the
+    operator did not want; `console.queue_screen` deliberately has no third case, and this keeps it that way.
+    """
+    control, api, db = bot()
+    await control.dispatch(parse_update(_press(api, "n:queue")))
+    assert "paused: no" in api.sent[-1][1]
+    labels = [one["text"] for row in api.markups[-1]["inline_keyboard"] for one in row]
+    assert labels == ["⏸ Pause", "♻ Reconcile now", "↻ Refresh", "◀ Menu"], labels
+    db.paused.append((True, "maintenance"))
+    await control.dispatch(parse_update(_press(api, "n:queue")))
+    labels = [one["text"] for row in api.markups[-1]["inline_keyboard"] for one in row]
+    assert labels == ["▶ Resume", "♻ Reconcile now", "↻ Refresh", "◀ Menu"], labels
+    assert "maintenance" in api.sent[-1][1]
+
+
+@pytest.mark.asyncio
+async def test_a_tap_answers_the_callback_so_the_button_stops_spinning() -> None:
+    """Telegram keeps a button in its pressed state until `answerCallbackQuery` says otherwise.
+
+    A screen that redraws itself while the old copy still spins looks like a bot still thinking about it,
+    and an operator who waits for thinking that already finished is an operator who stops tapping — which
+    is how a queue pause gets missed.
+    """
+    control, api, db = bot()
+    await control.dispatch(parse_update(_press(api, "n:main")))
+    assert api.callbacks[-1] == ("cb-1", ""), "answered, with no alert text to explain a screen that worked"
+
+
+@pytest.mark.asyncio
+async def test_no_tap_deletes_the_message_it_was_pressed_on() -> None:
+    """Screens are not the operator's spent secrets — and this catches it if a handler starts thinking so.
+
+    `dispatch` deletes the message a reply was answering, which is right for a pairing code and wrong for a
+    tap: a callback's `message_id` is the message the button sits in, i.e. the screen itself. Every command
+    a button can reach is run here, and the chat is checked for deletions.
+    """
+    for data in ("n:main", "n:sources", "n:queue", "n:bots", "n:joinmsg", "n:help", "r:3:open", "r:3:subs:on"):
+        control, api, db = bot()
+        await control.dispatch(parse_update(_press(api, data)))
+        assert api.deleted == [], f"{data} deleted a message"
+    control, api, db = bot()
+    await control.dispatch(parse_update(_press(api, "p:series:3")))
+    assert api.deleted == [], "the question a screen asked is not a secret either"

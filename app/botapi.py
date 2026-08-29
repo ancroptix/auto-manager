@@ -132,7 +132,10 @@ def parse_update(raw: dict[str, Any]) -> Update | None:
             text=str(source.get("data") or ""),
             message_id=message.get("message_id"),
             kind="callback",
-            callback_id=str(raw.get("id") or ""),
+            # The callback's own id, which lives inside `callback_query`. `raw["id"]` is nothing at all —
+            # an update's number is `update_id` — and reading it here meant every button on a phone kept
+            # its "loading" shimmer for ever, because `answerCallbackQuery` was never sent.
+            callback_id=str(source.get("id") or ""),
         )
     chat = source.get("chat") or {}
     return Update(

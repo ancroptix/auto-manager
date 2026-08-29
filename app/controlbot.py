@@ -36,9 +36,9 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
-from . import keyboards, sourcecfg
+from . import console, keyboards, sourcecfg
 from .botapi import BotApi, Update
 from .sessions import forget as forget_session
 from .sessions import list_sessions, mask_phone, scrub, store as store_session, valid_name
@@ -60,6 +60,14 @@ _ADOPT_TIMEOUT = 20.0
 #: Wrong codes tolerated in one flow before it is closed outright. A fourth guess is
 #: worthless (Telegram invalidates the code long before) and costs the account.
 MAX_CODE_TRIES = 3
+
+#: The pause state, in the one spelling this service uses. `/status`, the queue screen and the main screen
+#: all read it, and a second copy of the text is how a screen ends up asking for a column that the schema
+#: does not have (`reason`, where the table says `paused_reason`).
+_SERVICE_STATE_SQL = (
+    "select paused, coalesce(paused_reason,'') as reason, last_reconcile_at from app.service_state "
+    "where id = 1"
+)
 
 HELP = """auto-manager control
 
@@ -238,6 +246,11 @@ class ControlBot:
     #: without a redeploy. Injected (``app/main.py``) because the bot must not own that connection.
     on_session_stored: Callable[[], Any] | None = None
     pending: dict[int, _Pending] = field(default_factory=dict, repr=False)
+    #: One free-text question outstanding per chat: `(slot, row id)`. Kept beside `pending` rather than
+    #: inside it because `pending` is a login — secrets, a timeout, a delete-after-use — and a rename
+    #: question is none of those things. Nothing here is persisted: a restart forgets the question, and
+    #: the operator's next tap asks it again.
+    console_owed: dict[int, tuple[str, int | None]] = field(default_factory=dict, repr=False)
     attempts: dict[int, list[float]] = field(default_factory=dict, repr=False)
     _stop: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
 
@@ -294,11 +307,24 @@ class ControlBot:
         if not text:
             return []
 
+        if update.kind == "callback":
+            # A tap. It runs through the same router the keyboard runs through — see app/console.py for
+            # why that identity is the safety property and not a shortcut.
+            return await self._console_tap(update, text)
+
         pending = self._pending_valid(update.chat_id)
         if pending is not None and not text.startswith("/"):
             # Mid-flow, a bare reply is what a person actually does ("123456"), and
             # forcing "/code 123456" on a phone keyboard loses logins.
             return await self._bare(update, pending, text)
+
+        owed = self.console_owed.get(update.chat_id)
+        if owed is not None and not text.startswith("/"):
+            # A screen asked for one piece of text and this is it. A line that *does* start with a slash
+            # is a command, not an answer, so the question stays open: the operator stopped to check
+            # something, and dropping their half-finished rename while they were away would be worse
+            # than waiting.
+            return await self._console_answer(update, text)
 
         parts = text.split()
         command = parts[0].lstrip("/").split("@", 1)[0].casefold()
@@ -322,7 +348,12 @@ class ControlBot:
 
     # -------------------------------------------------------------- commands
     async def _help(self, update: Update, args: list[str]) -> list[Reply]:
-        return [Reply(HELP)]
+        # The command list, and under it the way in to the console. `/help` is what an operator types when
+        # they have forgotten how to drive the bot, so the screen that needs no remembering goes with it.
+        one = console.button("🏠 Open the menu", f"{console.NAV_PREFIX}main")
+        if one is None:
+            return [Reply(HELP)]
+        return [Reply(HELP, markup={"inline_keyboard": [[one]]})]
 
     async def _status(self, update: Update, args: list[str]) -> list[Reply]:
         lines = [
@@ -345,9 +376,7 @@ class ControlBot:
             lines.append("database: connected")
         if self.db is not None and getattr(self.db, "connected", False):
             queue = await self.db.queue_health() or {}
-            state = await self.db.fetchrow(
-                "select paused, coalesce(paused_reason,'') as reason, last_reconcile_at from app.service_state where id = 1"
-            )
+            state = await self.db.fetchrow(_SERVICE_STATE_SQL)
             lines.append(
                 "queue: "
                 + ", ".join(
@@ -1928,6 +1957,289 @@ class ControlBot:
             "when the worker is enabled."
         )]
 
+    # ------------------------------------------------------------------ the console
+    #
+    # Screens are `app/console.py`'s business; this section is the two things it cannot do: read the
+    # database and run a command. The keys below are the screens a button may open, and a test
+    # (tests/test_console.py) holds this tuple against `console.NAV` in both directions, so neither a
+    # screen nobody can reach nor a button that leads nowhere can survive a refactor.
+    _CONSOLE_SCREENS = ("main", "sources", "queue", "bots", "joinmsg", "help")
+
+    _CONSOLE_SOURCE_SQL = (
+        "select id, username, title, telegram_channel_id, mode, active, require_hindi_audio, "
+        "include_subbed, coalesce(declared_series, '') as declared_series, "
+        "coalesce(declared_audio, '') as declared_audio, "
+        "coalesce(declared_season, -1) as declared_season from app.source_channel "
+    )
+
+    async def _console_tap(self, update: Update, payload: str) -> list[Reply]:
+        """One tap, dispatched by the prefix `app/console.py` puts on it.
+
+        Every branch here ends in either a screen or a command — never a third kind of action. The
+        pending prompt is cleared on any tap except the one that arms the next question, because a
+        button pressed after a question was asked is the operator moving on, and a stale question left
+        open would quietly hijack their next message.
+        """
+        chat = update.chat_id
+        unreadable = [
+            Reply(
+                "the database is not reachable, so this bot can show you a screen and change nothing. "
+                "that is a deployment fault, not a button fault — /status names the reason."
+            )
+        ]
+        if payload.startswith(console.PROMPT_PREFIX):
+            if self.db is None or not getattr(self.db, "connected", False):
+                return unreadable
+            parsed = console.parse_prompt(payload)
+            if parsed is None:
+                return [Reply("that button asked for something this bot no longer knows how to ask.")]
+            slot, row_id = parsed
+            row = None
+            if row_id is not None:
+                rows = await self.db.fetch(self._CONSOLE_SOURCE_SQL + "where id = $1", row_id)
+                if not rows:
+                    return [Reply(self._console_gone(row_id))]
+                row = rows[0]
+            self.console_owed[chat] = (slot, row_id)
+            text, mark = console.waiting_screen(slot, row)
+            return [Reply(text, markup=mark)]
+
+        # Any other tap abandons a question that was left open.
+        self.console_owed.pop(chat, None)
+
+        if payload.startswith("/"):
+            # A button that carries a bare command, which is what `app/keyboards.py` has been emitting
+            # since the round before the console existed. Accepted, not upgraded: a console that broke
+            # those buttons to add a prefix of its own would be a downgrade wearing a redesign, and the
+            # prefix buys nothing here that the router does not already enforce.
+            return await self._console_run(update, payload)
+
+        if payload.startswith(console.NAV_PREFIX):
+            key = payload[len(console.NAV_PREFIX) :].strip().casefold()
+            if key not in self._CONSOLE_SCREENS:
+                return [Reply("that screen does not exist in this build. /help lists what does.")]
+            return await self._console_screen(key)
+
+        if payload.startswith(console.RUN_PREFIX):
+            return await self._console_run(update, payload[len(console.RUN_PREFIX) :])
+
+        parsed = console.parse_row(payload)
+        if parsed is None:
+            return [Reply("that button is not one this bot can read, so nothing was changed.")]
+        if self.db is None or not getattr(self.db, "connected", False):
+            return unreadable
+        row_id, verb, arg = parsed
+        rows = await self.db.fetch(self._CONSOLE_SOURCE_SQL + "where id = $1", row_id)
+        if not rows:
+            return [Reply(self._console_gone(row_id))]
+        row = rows[0]
+        if verb == "open":
+            text, mark = console.source_screen(row)
+            return [Reply(text, markup=mark)]
+        command = self._console_command(row, verb, arg)
+        if command is None:
+            return [Reply(
+                f"I could not turn that tap into a command, so nothing was written. The row is still "
+                f"`{row_id}` and its switches are unchanged."
+            )]
+        replies = await self._console_run(update, command)
+        # Re-read the row rather than describing the write: the screen the operator is shown is the
+        # database's answer, not this command's intention.
+        after = await self.db.fetch(self._CONSOLE_SOURCE_SQL + "where id = $1", row_id)
+        note = console.screen_note(command, replies[0].text if replies else None)
+        if after:
+            text, mark = console.source_screen(after[0], note=note)
+            return [*replies, Reply(text, markup=mark)]
+        return replies
+
+    async def _console_answer(self, update: Update, text: str) -> list[Reply]:
+        """The one free-text answer a screen asked for, turned back into a command.
+
+        The text is never interpreted here: it becomes the argument of a `/source` or `/joinmsg` line and
+        runs through the same refusals a typed command would hit, so the console cannot accept a value the
+        keyboard would reject.
+        """
+        slot, row_id = self.console_owed.pop(update.chat_id, ("add", None))
+        value = " ".join(str(text or "").split())
+        if not value:
+            return [Reply("an empty answer changes nothing, and I did not write one.")]
+        if slot == "joinmsg":
+            from . import joinmsg  # noqa: PLC0415  (the module owns its own key and presets)
+
+            replies = await self._console_run(update, f"/joinmsg set {value}")
+            saved = str(await self.db.config(joinmsg.CONFIG_KEY, "") or "") if self.db is not None else ""
+            screen, mark = console.joinmsg_screen(
+                current=saved,
+                presets=[{"name": preset.name} for preset in joinmsg.PRESETS],
+                note=console.screen_note(f"/joinmsg set {value}", replies[0].text if replies else None),
+            )
+            return [*replies, Reply(screen, markup=mark)]
+        if slot == "add":
+            # A row created by an answer has no screen of its own to land on, so the list is returned:
+            # naming the new channel and setting its switches is what an operator does next, and reading the
+            # list back is also how they see a refusal was honoured.
+            replies = await self._console_run(update, f"/source {value} add")
+            rows = await self.db.fetch(self._CONSOLE_SOURCE_SQL + "order by id")
+            screen, mark = console.sources_screen(
+                list(rows), note=console.screen_note(f"/source {value} add", replies[0].text if replies else None)
+            )
+            return [*replies, Reply(screen, markup=mark)]
+        rows = await self.db.fetch(self._CONSOLE_SOURCE_SQL + "where id = $1", int(row_id or 0))
+        if not rows:
+            return [Reply(self._console_gone(row_id))]
+        command = self._console_command(rows[0], slot, value)
+        if command is None:
+            return [Reply(
+                f"I cannot put `{value}` into that field, so nothing was written. The question was for "
+                f"`{slot}`, and the row is unchanged."
+            )]
+        replies = await self._console_run(update, command)
+        after = await self.db.fetch(self._CONSOLE_SOURCE_SQL + "where id = $1", int(row_id or 0))
+        if after:
+            text, mark = console.source_screen(after[0], note=console.screen_note(command))
+            return [*replies, Reply(text, markup=mark)]
+        return replies
+
+    @staticmethod
+    def _console_command(
+        row: Mapping[str, Any] | None, verb: str, arg: str | None
+    ) -> str | None:
+        """Turn a tap on a row into the exact line the operator could have typed.
+
+        `@handle` when the row has one and the number when it does not, because those are the two things
+        `_find_source_channel` answers to; a private channel with no handle has only the number, and a
+        command naming it by title would match nothing.
+        """
+        if not row:
+            return None
+        handle = str(row.get("username") or "").strip().lstrip("@")
+        ref = f"@{handle}" if handle else str(row.get("telegram_channel_id") or "")
+        if not ref or ref == "@":
+            return None
+        if verb in sourcecfg.TOGGLES:
+            target = str(arg or "").strip().casefold()
+            if target not in {"on", "off"}:
+                return None
+            return f"/source {ref} {verb} {target}"
+        if verb == "audio":
+            from .normalize import DECLARED_AUDIO  # noqa: PLC0415  (the vocabulary lives in one place)
+
+            kind = str(arg or "").strip().casefold()
+            if kind not in DECLARED_AUDIO:
+                return None
+            return f"/source {ref} audio {kind}"
+        if verb in {"series", "title", "season"}:
+            value = " ".join(str(arg or "").split())
+            return f"/source {ref} {verb} {value}" if value else None
+        return None
+
+    def _console_gone(self, row_id: Any) -> str:
+        """What a tap on a row that is not there answers with — and it writes nothing."""
+        return (
+            f"that channel is not configured any more (no row {row_id}), so nothing was changed.\n"
+            "the screen you tapped was drawn against a row that has since gone. /sources is the one to "
+            "read now — or start over with ➕ Add a channel."
+        )
+
+    async def _console_run(self, update: Update, command: str) -> list[Reply]:
+        """Run a command string the way the router runs one, from a tap.
+
+        Same method, same args, same refusals, and no second implementation of any of them: that identity is
+        the entire safety argument for having a console at all. A refreshed screen is added by the caller
+        when it is the better last thing to read.
+        """
+        parts = str(command or "").strip().split()
+        if not parts or not parts[0].startswith("/"):
+            return [Reply("that button did not carry a command, so nothing ran.")]
+        name = parts[0][1:].split("@", 1)[0].casefold()
+        method = _ROUTES.get(name)
+        if method is None:
+            return [Reply(
+                f"`{command}` is not a command this build takes any more, so nothing ran. "
+                "/help lists the ones it does."
+            )]
+        return await getattr(self, method)(update, parts[1:])
+
+    async def _console_screen(self, key: str, note: str | None = None) -> list[Reply]:
+        """Render one screen, from data read now rather than cached earlier."""
+        if key == "help":
+            text, mark = console.help_screen(HELP, note=note)
+            return [Reply(text, markup=mark)]
+        if self.db is None or not getattr(self.db, "connected", False):
+            return [Reply(
+                "the database is not reachable, so there is nothing to show yet. `/status` names the "
+                "reason, and it is usually `DATABASE_URL` pointing at the transaction pooler."
+            )]
+        if key == "sources":
+            rows = await self.db.fetch(self._CONSOLE_SOURCE_SQL + "order by id")
+            text, mark = console.sources_screen(list(rows), note=note)
+            return [Reply(text, markup=mark)]
+        if key == "main":
+            text, mark = console.main_screen(await self._console_facts())
+            return [Reply(text, markup=mark)]
+        if key == "queue":
+            state = await self.db.fetchrow(_SERVICE_STATE_SQL)
+            queue = await self.db.queue_health() or {}
+            ready = queue.get("queued", "?")
+            paused = None if state is None else bool(state.get("paused"))
+            text, mark = console.queue_screen(
+                paused=paused,
+                reason=(state or {}).get("reason") or None,
+                ready="?" if ready is None else int(ready),
+                note=note,
+            )
+            return [Reply(text, markup=mark)]
+        if key == "bots":
+            text, mark = console.bots_screen(
+                storage=await self.db.config("bots.storage_username", "") or None,
+                help_bot=await self.db.config("bots.channel_help_username", "") or None,
+                link=await self.db.config("bots.link_provider_username", "") or None,
+                note=note,
+            )
+            return [Reply(text, markup=mark)]
+        from . import joinmsg  # noqa: PLC0415  (the module owns its own vocabulary, see _joinmsg)
+
+        current = await self.db.config(joinmsg.CONFIG_KEY, "") or ""
+        text, mark = console.joinmsg_screen(
+            current=current,
+            presets=[{"name": preset.name} for preset in joinmsg.PRESETS],
+            note=note,
+        )
+        return [Reply(text, markup=mark)]
+
+    async def _console_facts(self) -> dict[str, Any]:
+        """The four numbers the main screen prints, and `?` for each one it could not read.
+
+        A dash would be a zero dressed up as a fact. Every count here is a query that can fail — a
+        container that cannot reach the database still answers the chat, which is the bug that made this
+        rule necessary in the first place.
+        """
+        facts: dict[str, Any] = {
+            "mode": self.settings.mode.value,
+            "outbound": "on" if self.settings.outbound_enabled else "off",
+        }
+        # The same two reads `/status` uses, so a number cannot disagree between the menu and the
+        # report under it. `queue_health` is the db's own tally, and a count of my own here would be a
+        # second answer to the same question.
+        try:
+            facts["sources"] = await self.db.fetchval("select count(*) from app.source_channel")
+            queue = await self.db.queue_health() or {}
+            facts["ready"] = queue.get("queued")
+            facts["blocked"] = queue.get("blocked")
+            facts["sessions"] = len(await list_sessions(self.db)) if getattr(self.db, "connected", False) else None
+        except Exception as exc:  # noqa: BLE001 - a count that fails is a `?`, never a crash in a DM
+            log.info("console counts unread: %s", str(exc)[:120])
+        for key in ("sources", "ready", "blocked", "sessions"):
+            if facts.get(key) is None:
+                facts[key] = "?"
+            elif str(facts.get(key)).isdigit():
+                facts[key] = int(facts[key])
+        state = await self.db.fetchrow(_SERVICE_STATE_SQL)
+        if state is not None:
+            facts["paused"] = bool(state.get("paused"))
+            facts["pause_reason"] = state.get("reason") or None
+        return facts
+
     async def _find_source_channel(self, handle: str, *, refuse: bool = True) -> list | str:
         """Look a source channel up by @handle or numeric Telegram id.
 
@@ -2361,8 +2673,15 @@ class ControlBot:
             await self.api.send(
                 update.chat_id, scrub(reply.text, *self._live_secrets()), markup=reply.markup
             )
-            if self.delete_sensitive and reply.delete_prompt_too and update.message_id:
-                # The spent secret goes; the reply above it stays.
+            if (
+                self.delete_sensitive
+                and reply.delete_prompt_too
+                and update.message_id
+                and update.kind != "callback"
+            ):
+                # The spent secret goes; the reply above it stays. Never for a tap: a callback's
+                # `message_id` is the message the button sits in, which here is the screen itself, so
+                # deleting it would erase the console to remove a secret that was never typed there.
                 await self.api.delete(update.chat_id, update.message_id)
         if update.kind == "callback" and update.callback_id:
             await self.api.answer_callback(update.callback_id)

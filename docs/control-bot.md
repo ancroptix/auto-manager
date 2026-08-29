@@ -251,6 +251,47 @@ promise. A `callback_data` longer than Telegram's 64 bytes drops the **button**,
 keyboard is readable, and a truncated command is a different command. `/joinmsg options` puts the three
 drafts on one row for the same reason — a choice that takes typing is a choice that gets skipped.
 
+### The menu: every one of those, tappable
+
+`app/console.py` is the screen layer, and it is a layer: the words in §3 still work, and every button runs
+the same handler the words run through. That is not a shortcut, it is the safety argument — a console with
+its own write path would be a second bot to keep correct, and the second one is always the one that lies.
+
+Open it with `🏠 Open the menu` under `/help`. Six screens:
+
+| screen | what it holds | how you reach it |
+| --- | --- | --- |
+| `main` | mode, whether sending is on, queue depth, how many channels and sessions exist | the first thing `/help` offers |
+| `sources` | one row per configured channel, each labelled 👁 watching or 💤 ignored, with the series name after it | `🎙 Sources` |
+| `queue` | ready jobs and the pause state, with only the button that changes it (Pause when running, Resume when paused) | `🔌 Queue` |
+| `bots` | which storage bot, Channel Help bot and link provider are configured, plus `/probe` and `/sessions` | `🤖 Bots` |
+| `joinmsg` | the three drafts numbered as `/joinmsg` numbers them, the wording now saved, and the way to say nothing | `📩 Join message` |
+| `help` | the command list from §3, unchanged, because a button that hides its own words is a button with no manual | `❓ Help` |
+
+Tapping a channel's name on `sources` opens that channel's own screen: the three switches, the audio
+vocabulary as direct picks — one button per spelling `normalize.DECLARED_AUDIO` accepts (`hindi`, `dual`,
+`dual_audio`, `multi`, `multi_audio`, `subbed`, `subbed_only`, `unknown`), so nobody has to remember how the
+column is spelled — plus the season and the two names. `↻ Refresh` is the last row of every screen, and
+every screen but the menu has a `◀` beside it: a screen is a snapshot, and the refresh is the only honest way
+to make it true again. Nothing on a screen is a knob the app does not read.
+
+**Typing is left for the one thing a button cannot carry: a name, a number, or your own wording.** A screen
+that needs one sends `one more thing` with the question, and the message that asks it has the exit in it —
+`✖ Stop here`, which drops the answer and changes nothing. A tap of any other button also drops it, because
+a question left open would otherwise take whatever you type next as its answer.
+
+Two more rules, both earned:
+
+- **After a write, the screen is read back, not remembered.** The refreshed screen is sent as the second
+  message and its first line is `ran: `/source @something gate off` — the exact command your tap became.
+  It is not decoration: it is the line that goes in a bug report, and the only way to tell a screen that
+  lied from a write that worked.
+- **A long name costs a button, never a fact.** `callback_data` has 64 bytes and labels have their own cap.
+  Over either, `app/keyboards.py` drops the button and the screen keeps the whole sentence in its text — no
+  truncation, because a truncated command is a different command and a truncated label is a promise about
+  something else. A row id, not a channel title, is what rides in the payload, which is why a 60-character
+  private-channel title costs you nothing but the tap.
+
 ## 4. Closing the door afterwards
 
 Once the session is stored and `APP_MODE=live` works, set `BOT_ALLOW_LOGIN=false`.
