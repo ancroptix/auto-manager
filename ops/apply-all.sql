@@ -1754,6 +1754,13 @@ on conflict (key) do nothing;  -- an operator edit always wins; these are new ke
 -- channel of 33k subscribers. The gate that guards every other caption guards this one, and the
 -- absence is reported in /status rather than being worked around silently.
 
+-- Superseded the same day, in this file's own terms: `0009_announcement_approved.sql` adds that row,
+-- because the operator approved the text in the conversation that described the flow. The paragraph
+-- above is left as written, on purpose — it records *why* the approval was not folded into this
+-- migration, which is the distinction the gate exists to keep. What still blocks a send is the
+-- sender (`publish_post` is unwired), and 0009 also repairs this row's description in place rather
+-- than editing a file a live database has already applied.
+
 -- 0009: the announcement box, approved; and the moment the rights were read.
 --
 -- Two things the operator decided on 2026-08-28, both recorded as data rather than as a comment:
@@ -1785,3 +1792,17 @@ insert into app.config (key, value, description) values
    '"🍓 {title_full} (S{season})\n\n😗 Episode {episode} Added...✨”\n\n[Click here to start and get episode]({link})\n[Click here to start and get episode]({link})"',
    'Approved 2026-08-28 from the operator''s own posts in the updates channel: strawberry heading, series and season in parentheses, the note line with the zero-padded episode, the link written twice, and no file hosted there. The link is a bot deep link (app/linkprovider), never the invite itself; the post is made by the operator''s own account as plain text with a link, not by Channel Help, and never to a channel that is not named in updates.channel.')
 on conflict (key) do nothing;  -- an operator edit here always wins, and this file never rewrites it
+
+-- The 0008 row that describes `updates.per_episode` ends with a sentence about approval, and approval
+-- is exactly what happened later the same day. A migration that already ran is never rewritten — a
+-- live database will not read that file again — so the correction is a statement here, guarded on the
+-- shipped phrase so an operator who edited the description keeps their own words.
+update app.config
+   set description =
+     'One announcement per episode as it lands (the operator''s answer when asked, 2026-08-28), which '
+     'is what the sampled posts already look like — each says "Episode 14 Added", never a range. Set '
+     'false to announce once per batch or season instead; the shape is the same and the line names the '
+     'range. The announcement box was approved the same day, below, so what holds a post back is the '
+     'sender that does not exist yet, not the wording.'
+ where key = 'updates.per_episode'
+   and description like '%nothing is sent until the announcement text is an approved caption box%';

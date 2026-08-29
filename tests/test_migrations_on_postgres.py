@@ -2483,3 +2483,17 @@ def test_a_session_reading_its_own_rights_writes_the_flag_and_the_timestamp(conn
         assert got["again"] == {"considered": 1, "written": 0}, got["again"]
     finally:
         conn.execute("delete from app.source_channel where telegram_channel_id = -1009007001")
+
+
+def test_the_per_episode_description_stops_promise_about_an_unapproved_box(conn):
+    """0008 shipped with "nothing is sent until the announcement text is an approved caption box".
+
+    That became false the same afternoon, and a `app.config` description is data an operator reads in
+    the dashboard — a stale one teaches the wrong lesson forever, because the migration that wrote it
+    will never run again. 0009 repairs it in place, guarded so an operator's own edit survives.
+    """
+    text = val(conn, "select description from app.config where key = 'updates.per_episode'")
+    assert "approved caption box" not in text, f"the stale sentence is still in the row: {text}"
+    assert "the sender that does not exist yet" in text
+    # And the row the operator cares about is still the row the code reads.
+    assert val(conn, "select value from app.config where key = 'updates.per_episode'") is True

@@ -20,6 +20,8 @@ short list of what needs your accounts.
 * Setup: [`docs/setup-supabase.md`](docs/setup-supabase.md) · [`docs/setup-render.md`](docs/setup-render.md)
 * Starting out, in order, click by click: [`docs/launch-checklist.md`](docs/launch-checklist.md)
 * What Channel Help's own guide says, and which of it we may depend on: [`docs/channel-help.md`](docs/channel-help.md)
+* Everything still outstanding — seven values, one config row, two chores, and what is *not* your list:
+  [`docs/pending-inputs.md`](docs/pending-inputs.md)
   From your phone: [`docs/control-bot.md`](docs/control-bot.md) — and the published wording
   you approved, rendered: [`docs/captions-approved.md`](docs/captions-approved.md)
 * How a destination channel is created and furnished, and how a new season is recognised:

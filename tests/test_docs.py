@@ -338,3 +338,47 @@ def test_channel_help_is_named_as_the_reason_two_job_kinds_are_blocked() -> None
     for kind in ("publish_post", "edit_post"):
         assert f"`{kind}`" in doc, f"{kind} is blocked and the note does not say so"
     assert "no code drives its menu" in doc, "and the note must not imply the bot is automated"
+
+
+def test_the_pending_inputs_page_lists_everything_the_code_can_ask_for() -> None:
+    """`docs/pending-inputs.md` is the one page that answers "what do I still owe you?".
+
+    It is generated-in-spirit, so it is checked that way: the blueprint's unfilled env rows, the
+    settings with no default, the config row that is seeded empty, and the blocked job kinds are each
+    compared against the page. A list a human maintains by memory is a list that quietly keeps
+    promising something the code stopped needing — or hiding something it still wants.
+    """
+    from app.config import Settings
+
+    doc = read("docs/pending-inputs.md")
+    blueprint = read("render.yaml")
+
+    # `sync: false` with no `value:` is how this blueprint says "the operator fills this in".
+    left_empty = set(re.findall(r"- key: (\w+)\n\s+sync: false", blueprint))
+    assert left_empty, "the blueprint stopped marking which values are left to the operator"
+    unnamed = sorted(key for key in left_empty if f"`{key}`" not in doc)
+    assert not unnamed, f"the pending-inputs page does not name: {unnamed}"
+
+    # And the two sources must agree with each other: a setting that gained a default should not keep
+    # a row on the operator's list, and a required setting must never be missing from the blueprint.
+    no_default = {name.upper() for name, field in Settings.model_fields.items() if field.default in (None, (), "")}
+    assert no_default == left_empty, (
+        f"app/config.py needs {sorted(no_default)}, render.yaml leaves empty {sorted(left_empty)}"
+    )
+
+    # Every blocked job kind is listed, with its reason — the page has to say what is not the
+    # operator's fault, or "fill this in and it works" is the message they take away.
+    from app.handlers import DEPENDENCIES
+
+    blocked = sorted(DEPENDENCIES)
+    unlisted = [kind for kind in blocked if f"`{kind}`" not in doc]
+    assert len(blocked) == 8, "the blocked list grew or shrank; the page and /status both quote it"
+    assert not unlisted, f"blocked job kinds the page does not admit to: {unlisted}"
+    assert "the writing half is not" in doc, "and the page must not let 'almost running' stand"
+
+    assert "`updates.channel`" in doc, "the one config row seeded empty has to be named"
+    assert "select count(*) from app.config" in doc
+    from conftest import config_row_count
+
+    claimed = re.search(r"must read \*\*(\d+)\*\*", doc)
+    assert claimed and int(claimed.group(1)) == config_row_count(), "the row count on the page went stale"

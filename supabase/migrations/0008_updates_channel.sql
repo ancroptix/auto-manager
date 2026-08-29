@@ -40,3 +40,10 @@ on conflict (key) do nothing;  -- an operator edit always wins; these are new ke
 -- character for character — and describing a post is not the same as being allowed to send it into a
 -- channel of 33k subscribers. The gate that guards every other caption guards this one, and the
 -- absence is reported in /status rather than being worked around silently.
+
+-- Superseded the same day, in this file's own terms: `0009_announcement_approved.sql` adds that row,
+-- because the operator approved the text in the conversation that described the flow. The paragraph
+-- above is left as written, on purpose — it records *why* the approval was not folded into this
+-- migration, which is the distinction the gate exists to keep. What still blocks a send is the
+-- sender (`publish_post` is unwired), and 0009 also repairs this row's description in place rather
+-- than editing a file a live database has already applied.
