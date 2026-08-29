@@ -105,6 +105,13 @@ async def store(
     statement: two live user sessions would mean two queue loops claiming work
     and posting the same episode twice, and the partial unique index in 0003
     makes that state impossible to write by hand either.
+
+    The write is read back before this returns, and a session that did not come
+    back raises. That is not ceremony: the first live login ended with the bot
+    saying "stored" over a row that no read could see, because "the insert ran" and
+    "the row exists" are different claims, and only the second one is worth telling
+    the operator. A read that sees nothing is a role, RLS or pooler problem — all
+    three are things a person has to go and change.
     """
     key = str(name).strip().casefold()
     if not valid_name(key):
@@ -141,7 +148,20 @@ async def store(
         note,
     )
     row = await describe_one(db, key)
-    return row or {"name": key, "stored": True}
+    if row is None:
+        raise LookupError(
+            f"the insert ran but nothing is stored under {key!r} — app.telegram_session reads back "
+            "empty, so the role behind DATABASE_URL cannot see the table (row-level security, or the "
+            "migrations were never applied to this database)"
+        )
+    stored_chars = int(row.get("length_chars") or 0)
+    if abs(stored_chars - len(session_string)) > 2:
+        raise LookupError(
+            f"{key!r} came back as {stored_chars} chars, not the {len(session_string)} that were "
+            "written — the stored session is not the one this login produced, so nothing is trusted "
+            "from it until that is explained"
+        )
+    return row
 
 
 async def describe_one(db: Any, name: str) -> dict[str, Any] | None:

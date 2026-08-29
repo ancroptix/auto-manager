@@ -97,17 +97,25 @@ On success:
 connected as @your_spare_account, stored as 'spare' (312 chars, active).
 
 The session string was never shown in this chat and cannot be read back from it.
-/sessions lists what is stored; set APP_MODE=live to let the worker use it.
+/sessions lists what is stored. the service reconnected with it, so the write jobs
+can run
 ```
 
 What happened underneath: the service connected to Telegram's MTProto API from
 inside the container, completed `auth.sendCode` → `auth.signIn`, and wrote the
 resulting `StringSession` into `app.telegram_session` — a table with row-level
 security on and zero policies, reachable only by the role the app itself uses. The
-three messages that carried your phone number, code and password are deleted
-immediately after use, the password is cleared from memory in a `finally`, and
-nothing sensitive is ever included in a reply — every outgoing line is passed
-through a scrubber that removes session-shaped text even inside an error message.
+three messages *you* typed — the phone number, the code, the password — are
+deleted from the chat as soon as each one has been used, the password is cleared
+from memory in a `finally`, and nothing sensitive is ever included in a reply:
+every outgoing line is passed through a scrubber that removes session-shaped text
+even inside an error message, and a phone number is masked before it is repeated.
+
+The bot's own replies are never deleted. An earlier version deleted them after a
+"short grace period" and the grace period was zero, so the question "reply with
+/code 123456" appeared and vanished in the same second — which reads as a broken
+bot, not a careful one. Deleting the secret means deleting the copy that holds the
+secret, and the only such copies are your messages.
 
 The connection that request runs on belongs to the attempt: it is opened before the
 code is asked for, kept alive only while your code (and 2FA password, if you use
@@ -115,8 +123,11 @@ one) is being typed, and closed when the attempt ends. An abandoned or failed lo
 therefore leaves no half-open session on the account and nothing sitting in the
 container's memory — which matters on a free Render instance that restarts on its own.
 
-Then set `APP_MODE=live` in Render. The service reconnects with the stored session
-at boot; if it comes back with `authorized: true`, that is the whole proof.
+With `APP_MODE=live` already set, nothing else has to happen: the reply above is
+the service's own reconnect attempt, and its last sentence is the result. With
+shadow mode, the session waits until the mode is switched on, and the reply says so
+instead of implying that writes are running. The service also reads the stored
+session at boot, if it restarts on its own.
 
 ## 3. Everything else you can ask it
 

@@ -47,7 +47,7 @@ def configure_logging(level: str) -> None:
     )
 
 
-def _build_control_bot(settings: Settings, db: Any) -> Any:
+def _build_control_bot(settings: Settings, db: Any, *, user_client: Any = None) -> Any:
     """Assemble the control bot. Separate so the wiring itself can be tested."""
     from .botapi import BotApi
     from .controlbot import ControlBot
@@ -61,6 +61,27 @@ def _build_control_bot(settings: Settings, db: Any) -> Any:
             api_hash=settings.telegram_api_hash.get_secret_value(),
         )
     api = BotApi(settings.reveal("telegram_bot_token") or "")
+
+    async def adopt_session() -> None:
+        """Give the freshly logged-in account to the client that performs the writes.
+
+        ``TelegramUserClient.start()`` keeps the client it built the first time, so adopting a new
+        session means putting the old one down first — that is the whole reason this is a function and
+        not a line in /login's handler. A failure here is not fatal: the session is stored, the queue
+        keeps reading, and the write jobs block with the one sentence the operator can act on.
+        """
+        if user_client is None:
+            log.info("a session was stored while live writes are off; nothing to hand it to")
+            return "APP_MODE is not live, so this session waits until the service is switched on"
+        await user_client.stop()
+        try:
+            await user_client.start()
+        except Exception as exc:  # noqa: BLE001 - the operator reads this line, so it has to be a sentence
+            log.warning("the session is stored but the writer could not use it yet (%s)", type(exc).__name__)
+            return f"the writer could not connect with it yet ({type(exc).__name__}: {str(exc)[:120]})"
+        log.info("the user client reconnected with the session the control bot just stored")
+        return "the service reconnected with it, so the write jobs can run"
+
     return ControlBot(
         api=api,
         db=db,
@@ -69,6 +90,7 @@ def _build_control_bot(settings: Settings, db: Any) -> Any:
         owner_ids=settings.owner_ids,
         allow_login=settings.bot_allow_login,
         background=lambda coro: asyncio.create_task(coro),
+        on_session_stored=adopt_session,
     )
 
 
@@ -122,7 +144,7 @@ def create_app(settings: Settings | None = None, *, start_worker: bool | None = 
             app.state.worker.start()
         if settings.bot_should_run:
             try:
-                app.state.control_bot = _build_control_bot(settings, db)
+                app.state.control_bot = _build_control_bot(settings, db, user_client=app.state.user_client)
                 app.state.control_bot_task = asyncio.create_task(app.state.control_bot.run())
             except Exception as exc:  # noqa: BLE001 - /health must survive a bad bot token
                 app.state.control_bot = None
@@ -187,7 +209,10 @@ def create_app(settings: Settings | None = None, *, start_worker: bool | None = 
     if settings.outbound_enabled:
         from .telegram_client import TelegramUserClient
 
-        app.state.user_client = TelegramUserClient(settings)
+        # ...and it is given the pool, because `resolve_session_string()` reads the stored session from
+        # it. Without a db the client can only ever use TELEGRAM_SESSION_STRING, which made a /login
+        # succeed and the writer stay blind to it — the exact mismatch the control bot now refuses to say.
+        app.state.user_client = TelegramUserClient(settings, db=app.state.db)
     app.state.worker = (
         Worker(db=app.state.db, settings=settings, telegram=app.state.user_client)
         if settings.worker_enabled

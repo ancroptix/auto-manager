@@ -17,7 +17,10 @@ The trust model, stated plainly:
   that checks one and not the other has an open door for whoever else is in there.
 * **Secrets are deleted, not just ignored.** Phone number, code and 2FA password
   live in memory for one attempt, are never written to the database, and the
-  messages carrying them are deleted from the chat afterwards.
+  operator's message carrying each one is deleted from the chat once it has been
+  used. Our own replies are never deleted: they hold the instruction being followed,
+  they are masked before they are sent, and a question that erases itself mid-flow
+  reads as a broken bot rather than a careful one.
 * **Nothing sensitive leaves.** Every reply passes through :func:`app.sessions.scrub`,
   which strips session-shaped text and any named secret, so an exception traceback
   cannot print a session into your DMs.
@@ -49,6 +52,10 @@ __all__ = ["ControlBot", "LoginCancelled", "LoginResult", "NeedsPassword", "Repl
 #: guess.
 MAX_ATTEMPTS_PER_WINDOW = 3
 ATTEMPT_WINDOW_SECONDS = 600.0
+#: How long a /login reply may wait for the writer to adopt the new session. Telegram's own connect is
+#: seconds, not minutes, and a hand-off that cannot answer is better reported as a timeout than as silence.
+_ADOPT_TIMEOUT = 20.0
+
 #: Wrong codes tolerated in one flow before it is closed outright. A fourth guess is
 #: worthless (Telegram invalidates the code long before) and costs the account.
 MAX_CODE_TRIES = 3
@@ -157,14 +164,18 @@ class LoginResult:
 class Reply:
     """One outgoing message.
 
-    ``sensitive`` marks a reply tied to a login step: it gets scrubbed *and*
-    deleted after a short grace period, because otherwise "send me the code" flows
-    leave a readable trail in a chat log on Telegram's side. ``delete_prompt_too``
-    deletes the operator's message that this reply is the answer to.
+    ``delete_prompt_too`` marks the reply that answers a secret: the operator's
+    own message — a phone number, a code, a password — is deleted once it has been
+    used, because that is the copy that must not sit in a chat log.
+
+    The reply itself is never deleted, and nothing here marks a message as
+    "sensitive, delete mine too". A bot that erases its own instructions mid-flow is
+    unreadable: the operator sees a question appear and vanish and cannot tell whether
+    to answer it, and every line we send has already been scrubbed and masked, so there
+    is nothing in it worth hiding.
     """
 
     text: str
-    sensitive: bool = False
     delete_prompt_too: bool = False
 
 
@@ -202,6 +213,9 @@ class ControlBot:
     login_ttl_seconds: float = 600.0
     delete_sensitive: bool = True
     background: Callable[[Any], None] | None = None  # fires /probe off without blocking
+    #: Called after a session is stored, so the account a login just produced reaches the writer
+    #: without a redeploy. Injected (``app/main.py``) because the bot must not own that connection.
+    on_session_stored: Callable[[], Any] | None = None
     pending: dict[int, _Pending] = field(default_factory=dict, repr=False)
     attempts: dict[int, list[float]] = field(default_factory=dict, repr=False)
     _stop: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
@@ -298,6 +312,16 @@ class ControlBot:
             lines.append("session: TELEGRAM_SESSION_STRING")
         elif self.settings.telegram_session_source in ("database", "both"):
             lines.append("session: read from app.telegram_session (/sessions to list)")
+        # Stated before anything else about the queue, because almost every "nothing happened" in this
+        # project has been this line: a container that cannot reach the database still answers the chat,
+        # so a report that lists queues would look healthy while writing to any of them is impossible.
+        if self.db is None:
+            lines.append("database: this process has no connection at all")
+        elif not getattr(self.db, "connected", False):
+            why = getattr(self.db, "last_error", None)
+            lines.append("database: not connected" + (f" ({str(why)[:120]})" if why else ""))
+        else:
+            lines.append("database: connected")
         if self.db is not None and getattr(self.db, "connected", False):
             queue = await self.db.queue_health() or {}
             state = await self.db.fetchrow(
@@ -1728,9 +1752,8 @@ class ControlBot:
         return [
             Reply(
                 f"which phone number belongs to {name}? Reply with it in international format — "
-                "digits only, starting with the country code, e.g. +919876543210. I delete the "
-                "message as soon as I have used it.",
-                sensitive=True,
+                "digits only, starting with the country code, e.g. +919876543210. I delete that "
+                "message as soon as I have used it, so keep the number to hand.",
             )
         ]
 
@@ -1779,7 +1802,7 @@ class ControlBot:
                 f"code sent to {mask_phone(phone)} for session {name!r}.\n"
                 f"Reply with /code 123456 (or just the digits). This attempt expires in "
                 f"{int(self.login_ttl_seconds // 60)} minutes.",
-                sensitive=True,
+                delete_prompt_too=True,
             )
         ]
 
@@ -1830,9 +1853,10 @@ class ControlBot:
             pending.code = None  # the code is spent; keeping it reusable is pointless and risky
             return [
                 Reply(
-                    "this account has 2FA. Reply with /password <your password> — I delete both "
-                    "messages afterwards and never store the password.",
-                    sensitive=True,
+                    "this account has 2FA. Reply with /password <your password>. Your code message is "
+                    "deleted now, and your password message as soon as it is used — I never store the "
+                    "password and never repeat it.",
+                    delete_prompt_too=True,
                 )
             ]
         except Exception as exc:  # noqa: BLE001 - a wrong code is a normal event, not a crash
@@ -1859,7 +1883,7 @@ class ControlBot:
                 Reply(
                     f"sign-in failed: {detail}\n\n{left} attempt(s) left in this flow. Reply with "
                     "the code again, or /cancel.",
-                    sensitive=True,
+                    delete_prompt_too=True,
                 )
             ]
         finally:
@@ -1886,19 +1910,41 @@ class ControlBot:
             return [
                 Reply(
                     "Telegram accepted the code but I could not store the session: "
-                    f"{scrub(str(exc), phone)[:180]}\n\nNothing is usable yet — check DATABASE_URL "
-                    "and that the migrations (app.telegram_session) are applied."
+                    f"{scrub(str(exc), phone)[:180]}\n\nNothing is usable yet, and the code is spent — "
+                    "check DATABASE_URL (session-mode pooler, port 5432) and that the migrations "
+                    "(app.telegram_session) are applied, then run /login again.",
+                    delete_prompt_too=True,
                 )
             ]
         self.pending.pop(update.chat_id, None)
         who = result.username or result.account_id or "unknown"
         state = "not active — /use " + pending.name + " to switch to it" if already_live else "active"
+        handoff = "This service has no writer to hand it to, so nothing writes until APP_MODE=live."
+        if self.on_session_stored is not None:
+            # Hand the account to the connection that writes, so a login takes effect without a redeploy —
+            # and wait for it, because the one place the operator learns whether that worked is this
+            # reply. Awaiting costs a couple of seconds on the poll loop; guessing costs a silent queue
+            # that says "stored" over a session nobody adopted.
+            try:
+                note = await asyncio.wait_for(self.on_session_stored(), timeout=_ADOPT_TIMEOUT)
+                handoff = str(note) if note else "The service took this session for its writes."
+            except asyncio.TimeoutError:
+                handoff = (
+                    f"the writer did not answer within {int(_ADOPT_TIMEOUT)}s. The session is stored and "
+                    "will be read at the next connect; /status shows what it thinks it has"
+                )
+            except Exception as exc:  # noqa: BLE001 - the storage is the success, this is the footnote
+                log.warning("the session is stored but could not be handed to the writer", exc_info=True)
+                handoff = (
+                    f"the session is stored, but this service could not start using it yet "
+                    f"({type(exc).__name__}: {str(exc)[:120]})"
+                )
         return [
             Reply(
                 f"connected as @{who}, stored as {pending.name!r} "
                 f"({stored.get('length_chars') or len(result.session_string)} chars, {state}).\n\n"
                 "The session string was never shown in this chat and cannot be read back from it. "
-                "/sessions lists what is stored; set APP_MODE=live to let the worker use it.",
+                f"/sessions lists what is stored. {handoff}.",
                 delete_prompt_too=True,
             )
         ]
@@ -1925,15 +1971,31 @@ class ControlBot:
         """Handle one update and carry out its side effects on the chat.
 
         Deletion happens here rather than in ``handle`` so that ``handle`` stays a
-        pure decision function that tests can call without a fake network.
+        pure decision function that tests can call without a fake network, and only
+        ever removes the operator's spent message — never the reply that tells them
+        what to do next.
         """
-        replies = await self.handle(update)
+        try:
+            replies = await self.handle(update)
+        except Exception as exc:  # noqa: BLE001 - a chat command that fails has to say so
+            # Silence here was misread as a bot that ignored its owner, and the one failure it hid was a
+            # database the container cannot reach. The reason is worth a message even when it is a type
+            # name; the secrets are scrubbed out of it first, like every other line we send.
+            log.exception("control command failed")
+            replies = [
+                Reply(
+                    "this command could not finish: "
+                    f"{type(exc).__name__}: {str(exc)[:200]}\n\n"
+                    "Nothing was changed. If the line above mentions the database, check DATABASE_URL "
+                    "(it has to be the session-mode pooler on port 5432 — the transaction pooler on 6543 "
+                    "refuses the prepared statements this service uses) and that the migrations ran."
+                )
+            ]
         for reply in replies:
-            message_id = await self.api.send(update.chat_id, scrub(reply.text, *self._live_secrets()))
+            await self.api.send(update.chat_id, scrub(reply.text, *self._live_secrets()))
             if self.delete_sensitive and reply.delete_prompt_too and update.message_id:
+                # The spent secret goes; the reply above it stays.
                 await self.api.delete(update.chat_id, update.message_id)
-            if self.delete_sensitive and reply.sensitive and message_id:
-                await self.api.delete(update.chat_id, message_id)
         if update.kind == "callback" and update.callback_id:
             await self.api.answer_callback(update.callback_id)
         return replies

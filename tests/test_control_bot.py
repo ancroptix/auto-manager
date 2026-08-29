@@ -1698,3 +1698,105 @@ def test_the_three_write_commands_are_reachable_and_documented() -> None:
     doc = (Path(__file__).resolve().parents[1] / "docs" / "control-bot.md").read_text(encoding="utf-8")
     for name in ("card", "sticker", "campaign"):
         assert f"`/{name}" in doc, f"docs/control-bot.md does not document /{name}"
+
+
+# --------------------------------------------------------------------- what the operator can actually read
+@pytest.mark.asyncio
+async def test_the_login_flow_never_eats_its_own_messages() -> None:
+    """Every prompt stays in the chat; only the operator's spent secrets are deleted.
+
+    The first live login deleted the "code sent" line and the 2FA question the instant it sent them,
+    which looked like a bot that had crashed. A reply of ours carries no secret — the number is masked
+    and everything is scrubbed — so there is nothing in it to hide, and a question that erases itself
+    is worse than useless mid-flow.
+    """
+    transport = FakeTransport(require_password=True)
+    control, api, db = bot(transport=transport)
+
+    await control.dispatch(update(f"/login spare {PHONE}", message_id=11))  # the number
+    await control.dispatch(update("/code 482913", message_id=12))  # the code
+    await control.dispatch(update("/password hunter2", message_id=13))  # the 2FA password
+
+    deleted = [mid for _, ids in api.deleted for mid in ids]
+    assert deleted == [11, 12, 13], "the three secrets, in order, and nothing else"
+    assert all(mid < 500 for mid in deleted), "FakeApi numbers our replies from 500 up: ours were touched"
+    texts = "\n".join(text for _, text in api.sent)
+    assert "code sent to" in texts, "the instruction that says what to type next must survive"
+    assert "2FA" in texts
+    assert PHONE not in texts and "482913" not in texts and "hunter2" not in texts
+
+
+@pytest.mark.asyncio
+async def test_a_broken_database_answers_instead_of_going_silent() -> None:
+    """A command whose query raises has to reply with the reason.
+
+    Silence is the failure that was hardest to diagnose from the outside: /sessions looked ignored,
+    and what had actually happened was a connection the container could not open.
+    """
+
+    class Unreachable:
+        async def fetch(self, sql, *args):
+            raise RuntimeError("connection refused")
+
+        fetchrow = fetch
+        execute = fetch
+
+        connected = False
+
+        async def config(self, key, default=None):
+            return default
+
+    control, api, _ = bot(db=Unreachable())
+    replies = await control.dispatch(update("/sessions", message_id=31))
+
+    assert "could not finish" in replies[0].text.lower()
+    assert "5432" in replies[0].text, "the sentence has to name the thing they can go and change"
+    assert api.sent, "the operator must see it, not just the log"
+    assert 31 not in [mid for _, ids in api.deleted for mid in ids], "nothing was spent, nothing is deleted"
+
+
+@pytest.mark.asyncio
+async def test_a_stored_session_is_handed_to_the_thing_that_writes() -> None:
+    """Otherwise a login needs a redeploy before the queue can use it, and that is not stated anywhere."""
+    adopted: list[str] = []
+
+    async def on_stored():
+        adopted.append("session")
+        return "the service reconnected with it, so the write jobs can run"
+
+    transport = FakeTransport()
+    control, api, db = bot(transport=transport, on_session_stored=on_stored)
+    await say(control, f"/login spare {PHONE}")
+    await control.dispatch(update("482913", message_id=14))
+
+    assert adopted == ["session"]
+    # The reply waits for the hand-off and repeats its sentence, because "stored" and "in use" are two
+    # different claims and the operator has to be told which one happened.
+    assert "the service reconnected with it" in api.sent[-1][1], api.sent[-1]
+
+
+@pytest.mark.asyncio
+async def test_without_a_writer_the_success_line_says_nothing_writes_yet() -> None:
+    transport = FakeTransport()
+    control, api, db = bot(transport=transport)
+    await say(control, f"/login spare {PHONE}")
+    await control.dispatch(update("482913", message_id=14))
+
+    assert "no writer to hand it to" in api.sent[-1][1], "no hook means no hand-off, and the reply must not imply one"
+
+
+@pytest.mark.asyncio
+async def test_a_failed_hand_off_does_not_undo_the_login() -> None:
+    """The stored session is the success; a writer that cannot take it yet is a footnote, not a failure."""
+
+    async def broken():
+        raise RuntimeError("session string is not authorized on this account")
+
+    transport = FakeTransport()
+    control, api, db = bot(transport=transport, on_session_stored=broken)
+    await say(control, f"/login spare {PHONE}")
+    await control.dispatch(update("482913", message_id=14))
+
+    text = api.sent[-1][1]
+    assert "stored as 'spare'" in text and "could not start using it yet" in text, text
+    assert PHONE not in text
