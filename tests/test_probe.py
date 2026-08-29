@@ -116,15 +116,22 @@ class FakeClient:
         name = type(request).__name__
         if name == "GetFullUserRequest":
             self.requests.append(request)
+            # The shape the server really answers with: a *wrapper* around the record, so anything read
+            # off this object directly (as `bot_info` once was) is silently missing rather than wrong.
             return SimpleNamespace(
-                about="Send me a file and I give back a permanent link. /batch stores a whole set.",
-                bot_info=SimpleNamespace(
-                    commands=[
-                        SimpleNamespace(command="batch", description="Store files"),
-                        SimpleNamespace(command="start", description=""),
-                    ],
-                    menu_button=SimpleNamespace(text="Open store"),
+                full_user=SimpleNamespace(
+                    id=77,
+                    about="Send me a file and I give back a permanent link. /batch stores a whole set.",
+                    bot_info=SimpleNamespace(
+                        commands=[
+                            SimpleNamespace(command="batch", description="Store files"),
+                            SimpleNamespace(command="start", description=""),
+                        ],
+                        menu_button=SimpleNamespace(text="Open store"),
+                    ),
                 ),
+                chats=[],
+                users=[SimpleNamespace(id=77, bot=True)],
             )
         raise RuntimeError(f"unexpected typed request: {name}")
 
@@ -645,22 +652,68 @@ class TestBotProfile:
         )
         assert profile["menu_button"] == "Open store"
         assert "permanent link" in profile["about"]
+        assert profile["is_bot"] is True, "the record says whether the peer is a bot at all"
 
         text = format_report(report)
         assert "commands: /batch=Store files /start" in text
         assert "menu button the user must press first: Open store" in text
         assert "profile text: Send me a file" in text
 
-    def test_a_bot_with_no_profile_says_so_instead_of_failing_the_probe(self) -> None:
-        class NoProfile(FakeClient):
-            async def __call__(self, request: Any) -> Any:
-                return SimpleNamespace(about="", bot_info=None)
+    def test_an_empty_answer_and_a_failed_read_are_two_different_sentences(self) -> None:
+        """The distinction this report exists to make.
 
-        report = run(run_probe(NoProfile(), policy=policy(), send=False))
-        profile = report["storage_bot"]["bot_profile"]
-        assert "no bot profile" in profile["unavailable"], profile
-        assert report["storage_bot"]["error"] is None, "a hint that could not be read is not a probe failure"
-        assert "profile could not be read" in format_report(report)
+        A bot that declares nothing is a fact about the bot — most clones have no BotFather command list,
+        and their menu is the whole protocol. A read that came back empty one level too high is a bug in
+        us. Same silence in Telegram's reply, two very different things to tell the operator.
+        """
+
+        class NoBlock(FakeClient):
+            async def __call__(self, request: Any) -> Any:
+                return SimpleNamespace(
+                    full_user=SimpleNamespace(id=77, about="", bot_info=None),
+                    chats=[],
+                    users=[SimpleNamespace(id=77, bot=True)],
+                )
+
+        class EmptyBlock(FakeClient):
+            async def __call__(self, request: Any) -> Any:
+                return SimpleNamespace(
+                    full_user=SimpleNamespace(
+                        id=77, about="", bot_info=SimpleNamespace(commands=[], menu_button=None)
+                    ),
+                    chats=[],
+                    users=[SimpleNamespace(id=77, bot=True)],
+                )
+
+        missing_record = run(run_probe(NoBlock(), policy=policy(), send=False))
+        declared_nothing = run(run_probe(EmptyBlock(), policy=policy(), send=False))
+
+        assert "no bot block for this peer" in missing_record["storage_bot"]["bot_profile"]["empty"]
+        assert (
+            "no commands, no menu button, no profile text" in declared_nothing["storage_bot"]["bot_profile"]["empty"]
+        )
+        for report in (missing_record, declared_nothing):
+            assert report["storage_bot"]["error"] is None, "an empty hint is not a probe failure"
+            assert "unavailable" not in report["storage_bot"]["bot_profile"]
+            assert "the bot declares nothing beyond its menu" in format_report(report)
+            assert "peer marked as a bot: yes" in format_report(report)
+
+    def test_a_flat_answer_is_read_too_because_layers_differ(self) -> None:
+        """Both shapes are the record: the unwrap is an `or`, not a cast to the newest wrapper."""
+
+        class Flat(FakeClient):
+            async def __call__(self, request: Any) -> Any:
+                return SimpleNamespace(
+                    id=77,
+                    about="I store files.",
+                    bot_info=SimpleNamespace(
+                        commands=[SimpleNamespace(command="genlink", description="")], menu_button=None
+                    ),
+                )
+
+        profile = run(run_probe(Flat(), policy=policy(), send=False))["storage_bot"]["bot_profile"]
+        assert profile["commands"] == ["/genlink"] and profile["about"] == "I store files.", profile
+        assert "empty" not in profile
 
     def test_an_unavailable_hint_names_the_real_reason(self) -> None:
         class Broken(FakeClient):

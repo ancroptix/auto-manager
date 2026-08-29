@@ -329,49 +329,70 @@ async def probe_bot(client: Any, username: str, *, policy: ProbePolicy, run: _Ru
 async def _bot_profile(client: Any, username: str, *, timeout: float) -> dict[str, Any]:
     """What Telegram knows about this bot: its commands, its menu button, its profile text.
 
-    The cheapest protocol hint there is, and the first attempt at it was aimed at the wrong API.
-    ``bots.getBotInfo`` reads like the obvious call and is not this program's to make: its fields are
-    ``verifier_settings``, ``app_settings``, ``privacy_policy_url`` — it is how the *owner* of a bot reads
-    the bot they can edit, and asked about someone else's bot the server answers
-    ``BOT_INVALID: This is not a valid bot``. Three of those in the operator's report read like three
-    broken bots, and were one wrong request of ours.
+    The cheapest protocol hint there is, and it took two wrong reads to get, which says something about how
+    quietly a read can fail. First attempt: ``bots.getBotInfo`` — the call a bot's *owner* uses on the bot
+    they edit, since its fields are ``app_settings``, ``verifier_settings`` and ``privacy_policy_url``.
+    Asked about somebody else's bot, the server answers ``BOT_INVALID: This is not a valid bot``, and in a
+    report that reads as three uncooperative bots.
 
-    ``users.getFullUser`` is the record Telegram's own clients draw a bot's command menu from, so it
-    answers for any bot, and it carries more than the commands: the profile text is where a file-store
-    bot usually explains itself ("send me a file, get a link"), and ``menu_button`` is the button a user
-    has to press before any of that happens. All three are hints, none is an instruction; nothing here
-    decides what gets sent to the bot.
+    Second attempt: right API, wrong level. ``users.getFullUser`` answers with a *wrapper* —
+    ``users.UserFull { full_user, chats, users }`` — and the profile sits one level down in the inner
+    record. Reading ``bot_info`` off the wrapper finds nothing and raises nothing, which is how three bots
+    came back as having no profile when our read had simply stopped short of it.
 
-    Like the version before it, a failure is reported as a hint that could not be read, with the reason —
-    never as a probe failure, and never as a shrug.
+    So the wrapper is taken apart here, both shapes are accepted, and an empty answer says *which* empty it
+    was: a record with no bot block at all, or a bot that declares no commands, no menu button and no text
+    (true of most clones, and worth knowing because it means the menu on screen is the whole protocol).
+    ``is_bot`` is kept because it costs nothing and is the one field that says whether the server even
+    considers this peer a bot.
     """
-    hint: dict[str, Any] = {}
     try:
         from telethon import functions, utils
 
         entity = await asyncio.wait_for(client.get_entity(username), timeout)
         request = functions.users.GetFullUserRequest(id=utils.get_input_user(entity))
-        full = await asyncio.wait_for(client(request), timeout)
-        bot_info = getattr(full, "bot_info", None)
-        commands: list[str] = []
-        for item in getattr(bot_info, "commands", None) or []:
-            description = (getattr(item, "description", "") or "").strip()
-            commands.append(f"/{item.command}" + (f"={description[:24]}" if description else ""))
-        if commands:
-            hint["commands"] = commands[:20]
-        about = " ".join(str(getattr(full, "about", "") or "").split())
-        if about:
-            hint["about"] = about[:280]
-        menu_text = str(getattr(getattr(bot_info, "menu_button", None), "text", "") or "").strip()
-        if menu_text:
-            hint["menu_button"] = menu_text[:60]
-        if not hint:
-            hint["unavailable"] = "the account can see this bot, and Telegram returned no bot profile for it"
-        return hint
+        answered = await asyncio.wait_for(client(request), timeout)
     except Exception as exc:  # noqa: BLE001 - an unavailable hint is not a probe failure
-        # The class *and* the message: "unavailable: TypeError" sent an operator and an agent hunting for
-        # a broken bot, when the sentence that mattered was about our own request.
+        # The class *and* the message: "unavailable: TypeError" sent an operator and an agent hunting for a
+        # broken bot, when the sentence that mattered was about our own request.
         return {"unavailable": f"{type(exc).__name__}: {str(exc)[:120]}"}
+
+    return _read_bot_profile(answered)
+
+
+def _read_bot_profile(answered: Any) -> dict[str, Any]:
+    """The wrapper apart, then the three hints out of the record inside it."""
+    full = getattr(answered, "full_user", None) or answered
+    peers = list(getattr(answered, "users", None) or [])
+    peer = next(
+        (item for item in peers if getattr(item, "id", None) == getattr(full, "id", None)),
+        peers[0] if peers else None,
+    )
+    bot_info = getattr(full, "bot_info", None)
+
+    hint: dict[str, Any] = {}
+    commands: list[str] = []
+    for item in getattr(bot_info, "commands", None) or []:
+        description = (getattr(item, "description", "") or "").strip()
+        commands.append(f"/{item.command}" + (f"={description[:24]}" if description else ""))
+    if commands:
+        hint["commands"] = commands[:20]
+    about = " ".join(str(getattr(full, "about", "") or "").split())
+    if about:
+        hint["about"] = about[:280]
+    menu_text = str(getattr(getattr(bot_info, "menu_button", None), "text", "") or "").strip()
+    if menu_text:
+        hint["menu_button"] = menu_text[:60]
+    if peer is not None:
+        hint["is_bot"] = bool(getattr(peer, "bot", False))
+    if not (commands or about or menu_text):
+        marked = "yes" if hint.get("is_bot") else ("no" if "is_bot" in hint else "not reported")
+        hint["empty"] = (
+            "Telegram sent no bot block for this peer at all"
+            if bot_info is None
+            else "an empty bot block: no commands, no menu button, no profile text"
+        ) + f" (peer marked as a bot: {marked})"
+    return hint
 
 
 async def probe_account(
@@ -575,17 +596,16 @@ async def _deliver(client: Any, text: str, *, policy: ProbePolicy) -> str:
 
 
 def format_report(report: dict[str, Any], *, limit: int | None = MAX_REPORT_CHARS) -> str:
-    """One paste-able message.
+    """One paste-able message, shaped for a human to copy out of Telegram into a chat.
 
-    ``limit=None`` renders it without the cap. That is what goes into ``app.audit_log``, because the
-    truncation note tells the operator the full version is there — and a row holding the truncated copy
-    would make that sentence a lie about a detail nobody checks until something has gone wrong.
-    
+    It leads with the answers that unblock the most work — what the storage bot's menu actually looks
+    like — and leaves the noise out, because the whole point of the shape is that the operator pastes it
+    back rather than screenshotting a log.
 
-    Shaped for a human to copy out of Telegram into a chat, so it leads with the
-    answers that unblock the most work — what the storage bot's menu actually
-    looks like — and leaves the noise out. The structured version stays in
-    ``app.audit_log`` in case a detail matters later.
+    ``limit=None`` renders it without the cap, and that is the version ``app.audit_log`` keeps: the
+    truncation note tells the operator the full text is in the database, which a row holding the capped
+    copy would not make true. The structured report is what the row is *for* — a detail nobody needed
+    today is still a detail somebody will need tomorrow.
     """
     account = report.get("account") or {}
     lines: list[str] = ["auto-manager · protocol probe", ""]
@@ -665,6 +685,8 @@ def format_report(report: dict[str, Any], *, limit: int | None = MAX_REPORT_CHAR
             lines.append(f"  menu button the user must press first: {profile['menu_button']}")
         if profile.get("about"):
             lines.append(f"  profile text: {profile['about']}")
+        if profile.get("empty"):
+            lines.append(f"  the bot declares nothing beyond its menu: {profile['empty']}")
         if profile.get("unavailable"):
             lines.append(f"  profile could not be read: {profile['unavailable']}")
 

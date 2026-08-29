@@ -24,6 +24,14 @@ the ones an owner edits (`app_settings`, `verifier_settings`, `privacy_policy_ur
 program talking *to* somebody else's bot is entitled to read. In a report, though, it read as three
 uncooperative bots, and that is the cost of an unavailable hint printed without its reason.
 
+Getting to the right answer took one more round, for a reason worth writing down: `users.getFullUser`
+replies with a *wrapper* (`full_user`, `chats`, `users`), and the profile is inside it. Reading `bot_info`
+off the wrapper raises nothing and returns nothing, so the report said three bots had no profile when our
+read had stopped one level short. The two sentences the report keeps apart now are the two facts that
+look alike from the outside: **this bot declares nothing** (no command list, no menu button, no profile
+text — common for a clone, and itself the answer, because it means the menu on screen is the whole
+protocol) and **we could not read the record**.
+
 ## The menu, verbatim
 
 The middle column is the bot's wording, quoted rather than tidied — including its spelling. The
