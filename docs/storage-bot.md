@@ -14,6 +14,16 @@ the more useful half.
 This document is the difference between a menu, a conversation, and a vendor's claim, kept in the repo
 because a screenshot in a chat is how a protocol ends up half-remembered.
 
+`/probe` re-reads the menu on request, and it reads it from `users.getFullUser` — the record Telegram's
+own clients draw a bot's command list from — rather than from the screenshots. It is a cross-check, not a
+source of protocol: a declared command list says `/batch` exists and what the bot says it does, and says
+nothing about what the answer looks like, which is the half the screenshots carry. The first probe asked
+the wrong counter instead — `bots.getBotInfo` — and all three bots answered `BOT_INVALID: This is not a
+valid bot`. That is a fact about the request, not about the bots: the fields that response carries are
+the ones an owner edits (`app_settings`, `verifier_settings`, `privacy_policy_url`), which is not what a
+program talking *to* somebody else's bot is entitled to read. In a report, though, it read as three
+uncooperative bots, and that is the cost of an unavailable hint printed without its reason.
+
 ## The menu, verbatim
 
 The middle column is the bot's wording, quoted rather than tidied — including its spelling. The

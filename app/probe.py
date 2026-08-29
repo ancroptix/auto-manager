@@ -316,7 +316,7 @@ async def probe_bot(client: Any, username: str, *, policy: ProbePolicy, run: _Ru
                 raise
             except Exception as exc:  # noqa: BLE001
                 pressed.append({"button": button["text"], "error": f"{type(exc).__name__}: {str(exc)[:100]}"})
-    result["command_list"] = await _bot_commands(client, username, timeout=policy.per_step_timeout)
+    result["bot_profile"] = await _bot_profile(client, username, timeout=policy.per_step_timeout)
     run.record(
         label,
         buttons=len((result.get("first") or {}).get("buttons") or []),
@@ -326,35 +326,52 @@ async def probe_bot(client: Any, username: str, *, policy: ProbePolicy, run: _Ru
     return result
 
 
-async def _bot_commands(client: Any, username: str, *, timeout: float) -> list[str]:
-    """The bot's declared command list — the cheapest protocol hint available.
+async def _bot_profile(client: Any, username: str, *, timeout: float) -> dict[str, Any]:
+    """What Telegram knows about this bot: its commands, its menu button, its profile text.
 
-    Two arguments, and both of them are version notes. ``lang_code`` is a required argument in the
-    Telethon this project installs: leaving it out raised ``TypeError`` here, three times in a row, in
-    the middle of the operator's first live probe — and because an unavailable hint is deliberately not a
-    probe failure, all that survived of the bug was one line per bot reading ``(unavailable: TypeError)``.
-    A hint nobody reads is a bug that reports itself as a shrug, so this function names what it could not
-    do, but the reason has to be findable.
+    The cheapest protocol hint there is, and the first attempt at it was aimed at the wrong API.
+    ``bots.getBotInfo`` reads like the obvious call and is not this program's to make: its fields are
+    ``verifier_settings``, ``app_settings``, ``privacy_policy_url`` — it is how the *owner* of a bot reads
+    the bot they can edit, and asked about someone else's bot the server answers
+    ``BOT_INVALID: This is not a valid bot``. Three of those in the operator's report read like three
+    broken bots, and were one wrong request of ours.
 
-    ``bot`` is the other half: the field takes a :tl:`InputUser`, not a username, so the entity is
-    resolved first and the request carries the access hash Telegram asks for.
+    ``users.getFullUser`` is the record Telegram's own clients draw a bot's command menu from, so it
+    answers for any bot, and it carries more than the commands: the profile text is where a file-store
+    bot usually explains itself ("send me a file, get a link"), and ``menu_button`` is the button a user
+    has to press before any of that happens. All three are hints, none is an instruction; nothing here
+    decides what gets sent to the bot.
+
+    Like the version before it, a failure is reported as a hint that could not be read, with the reason —
+    never as a probe failure, and never as a shrug.
     """
+    hint: dict[str, Any] = {}
     try:
         from telethon import functions, utils
 
         entity = await asyncio.wait_for(client.get_entity(username), timeout)
-        request = functions.bots.GetBotInfoRequest(lang_code="", bot=utils.get_input_user(entity))
-        result = await asyncio.wait_for(client(request), timeout)
-        commands = []
-        for item in getattr(result, "commands", None) or []:
+        request = functions.users.GetFullUserRequest(id=utils.get_input_user(entity))
+        full = await asyncio.wait_for(client(request), timeout)
+        bot_info = getattr(full, "bot_info", None)
+        commands: list[str] = []
+        for item in getattr(bot_info, "commands", None) or []:
             description = (getattr(item, "description", "") or "").strip()
             commands.append(f"/{item.command}" + (f"={description[:24]}" if description else ""))
-        return commands[:20]
+        if commands:
+            hint["commands"] = commands[:20]
+        about = " ".join(str(getattr(full, "about", "") or "").split())
+        if about:
+            hint["about"] = about[:280]
+        menu_text = str(getattr(getattr(bot_info, "menu_button", None), "text", "") or "").strip()
+        if menu_text:
+            hint["menu_button"] = menu_text[:60]
+        if not hint:
+            hint["unavailable"] = "the account can see this bot, and Telegram returned no bot profile for it"
+        return hint
     except Exception as exc:  # noqa: BLE001 - an unavailable hint is not a probe failure
-        # The class *and* the message: "unavailable: TypeError" sent an operator and an agent hunting
-        # for a broken bot, when the sentence that mattered was "missing 1 required positional
-        # argument: 'lang_code'". A hint this cheap should never cost a second probe run to diagnose.
-        return [f"(unavailable: {type(exc).__name__}: {str(exc)[:120]})"]
+        # The class *and* the message: "unavailable: TypeError" sent an operator and an agent hunting for
+        # a broken bot, when the sentence that mattered was about our own request.
+        return {"unavailable": f"{type(exc).__name__}: {str(exc)[:120]}"}
 
 
 async def probe_account(
@@ -641,8 +658,15 @@ def format_report(report: dict[str, Any], *, limit: int | None = MAX_REPORT_CHAR
         if section.get("refused_buttons"):
             named = ", ".join(str(b)[:24] for b in section["refused_buttons"][:8])
             lines.append(f"  left alone by policy ({len(section['refused_buttons'])}): {named}")
-        if section.get("command_list"):
-            lines.append("  commands: " + " ".join(str(c) for c in section["command_list"][:10]))
+        profile = section.get("bot_profile") or {}
+        if profile.get("commands"):
+            lines.append("  commands: " + " ".join(str(c) for c in profile["commands"][:10]))
+        if profile.get("menu_button"):
+            lines.append(f"  menu button the user must press first: {profile['menu_button']}")
+        if profile.get("about"):
+            lines.append(f"  profile text: {profile['about']}")
+        if profile.get("unavailable"):
+            lines.append(f"  profile could not be read: {profile['unavailable']}")
 
     lines.append("")
     lines.append(f"messages sent={report.get('messages_sent', 0)} elapsed={report.get('elapsed_seconds')}s")

@@ -10,6 +10,7 @@ ever reaches outside two bot chats and a dozen menu commands.
 from __future__ import annotations
 
 import asyncio
+import pathlib
 from types import SimpleNamespace
 from typing import Any
 
@@ -107,19 +108,23 @@ class FakeClient:
         """What a handle resolves to, shaped just enough for ``utils.get_input_user``.
 
         ``0xe669bf46`` is that helper's test for "already an InputUser", and the probe needs an
-        ``InputUser`` — not a username string — in ``bots.getBotInfo``.
+        ``InputUser`` — not a username string — in ``users.getFullUser``.
         """
         return SimpleNamespace(id=77, access_hash=99, username=username, SUBCLASS_OF_ID=0xE669BF46)
 
     async def __call__(self, request: Any) -> Any:  # any typed MTProto request
         name = type(request).__name__
-        if name == "GetBotInfoRequest":
+        if name == "GetFullUserRequest":
             self.requests.append(request)
             return SimpleNamespace(
-                commands=[
-                    SimpleNamespace(command="batch", description="Store files"),
-                    SimpleNamespace(command="start", description=""),
-                ]
+                about="Send me a file and I give back a permanent link. /batch stores a whole set.",
+                bot_info=SimpleNamespace(
+                    commands=[
+                        SimpleNamespace(command="batch", description="Store files"),
+                        SimpleNamespace(command="start", description=""),
+                    ],
+                    menu_button=SimpleNamespace(text="Open store"),
+                ),
             )
         raise RuntimeError(f"unexpected typed request: {name}")
 
@@ -340,7 +345,7 @@ class TestReport:
                         "buttons": [{"text": f"b{i}", "kind": "callback", "data": "d" * 400} for i in range(200)],
                     },
                     "pressed": [{"button": f"p{i}", "reply_chars": 1, "buttons_after": ["x"] * 50} for i in range(50)],
-                    "command_list": [f"/c{i}" for i in range(60)],
+                    "bot_profile": {"commands": [f"/c{i}" for i in range(60)]},
                 },
                 "channel_help": {"username": "c", "first": {"reply": "", "buttons": []}},
                 "account": {
@@ -370,7 +375,7 @@ class TestReport:
                         "buttons": [{"text": "My files", "kind": "callback", "data": "list:1"}],
                     },
                     "pressed": [{"button": "My files", "reply_chars": 220, "buttons_after": ["Back"]}],
-                    "command_list": ["/start", "/links"],
+                    "bot_profile": {"commands": ["/start", "/links"]},
                 },
                 "channel_help": {"username": "chelpbot", "first": {"reply": "Forward me a post.", "buttons": []}},
                 "account": {"id": 7, "username": "spare", "dialog_count": 4, "owned_channels": ["Archive"]},
@@ -611,31 +616,51 @@ class TestDeliveryKeepsEveryCharacter:
         assert "\n".join(delivered) == long_text, "split, never shortened"
 
 
-class TestCommandList:
-    """The line that ends every bot section, and the one bug that made it useless.
+class TestBotProfile:
+    """The one line of the report that is about what a bot *accepts*, and the API that can say it.
 
-    ``commands:`` is the cheapest protocol hint in the whole probe — a bot's own declared list — and the
-    first live run reported ``(unavailable: TypeError)`` three times. That was never about the bots.
+    ``commands:`` used to end every bot section as ``(unavailable: BotInvalidError: This is not a valid
+    bot)`` — which is a true fact about the wrong request: ``bots.getBotInfo`` belongs to a bot's owner,
+    not to someone talking to their bot. ``users.getFullUser`` is the one Telegram's own clients use.
     """
 
-    def test_the_command_list_request_carries_what_this_telethon_requires(self) -> None:
+    def test_the_profile_request_is_the_one_that_answers_for_someone_elses_bot(self) -> None:
         import pytest
 
         pytest.importorskip("telethon")
         client = FakeClient()
         report = run(run_probe(client, policy=policy(), send=False))
 
-        assert report["storage_bot"]["command_list"] == [
-            "/batch=Store files",
-            "/start",
-        ], "a command with no description is still a command"
         assert client.requests, "the probe asked nothing, so the report is a guess"
         request = client.requests[0]
-        assert request.lang_code == "", (
-            "lang_code is required in the installed Telethon; omitting it is a TypeError raised before "
-            "Telegram is contacted, which the report then blamed on the bot"
+        assert type(request).__name__ == "GetFullUserRequest", (
+            "bots.getBotInfo answers BOT_INVALID for any bot the account does not own, which is every "
+            "third-party bot this pipeline talks to"
         )
-        assert request.bot.id == 77, "the field is an InputUser, and a username string is not one"
+        assert request.id.id == 77, "the field is an InputUser, and a username string is not one"
+
+        profile = report["storage_bot"]["bot_profile"]
+        assert profile["commands"] == ["/batch=Store files", "/start"], (
+            "a command with no description is still a command"
+        )
+        assert profile["menu_button"] == "Open store"
+        assert "permanent link" in profile["about"]
+
+        text = format_report(report)
+        assert "commands: /batch=Store files /start" in text
+        assert "menu button the user must press first: Open store" in text
+        assert "profile text: Send me a file" in text
+
+    def test_a_bot_with_no_profile_says_so_instead_of_failing_the_probe(self) -> None:
+        class NoProfile(FakeClient):
+            async def __call__(self, request: Any) -> Any:
+                return SimpleNamespace(about="", bot_info=None)
+
+        report = run(run_probe(NoProfile(), policy=policy(), send=False))
+        profile = report["storage_bot"]["bot_profile"]
+        assert "no bot profile" in profile["unavailable"], profile
+        assert report["storage_bot"]["error"] is None, "a hint that could not be read is not a probe failure"
+        assert "profile could not be read" in format_report(report)
 
     def test_an_unavailable_hint_names_the_real_reason(self) -> None:
         class Broken(FakeClient):
@@ -643,8 +668,24 @@ class TestCommandList:
                 raise TypeError("Cannot find any entity corresponding to no-such-bot")
 
         report = run(run_probe(Broken(), policy=policy(), send=False))
-        note = report["storage_bot"]["command_list"][0]
-        assert note.startswith("(unavailable: TypeError:") and "no-such-bot" in note, note
+        reason = report["storage_bot"]["bot_profile"]["unavailable"]
+        assert reason.startswith("TypeError:") and "no-such-bot" in reason, reason
+
+
+def test_nothing_builds_the_owner_only_bot_info_request():
+    """``bots.getBotInfo`` is a bot owner's call; this program talks to other people's bots.
+
+    Pinned because the wrong request is not loud: it produced ``BOT_INVALID`` three times in the
+    operator's report and read as three uncooperative bots. Any future code that reaches for the same
+    class is asking the same question of the wrong API.
+    """
+    root = pathlib.Path(__file__).resolve().parent.parent
+    offenders = [
+        path.name
+        for path in sorted((root / "app").rglob("*.py"))
+        if "GetBotInfoRequest" in path.read_text(encoding="utf-8")
+    ]
+    assert not offenders, f"these files use the owner-only bot info request: {offenders}"
 
 
 class TestRefusedButtons:

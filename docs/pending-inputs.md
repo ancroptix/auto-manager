@@ -110,6 +110,27 @@ the job that needs it, so `/status` names the missing thing rather than a stack 
    two — which is also the moment to look at whether `announcement.style` renders the box the way you
    want it.
 
+## 4c. Four switches on your own clone's `/settings` screen
+
+`app/storagebot.still_unknown()` keeps the list of what the vendor's pages and the bot's own menu cannot
+answer, and these four are the part of it that only a live clone can tell us. They are not probes' work:
+`/probe` reads menus, and these are settings, which the bot will only show the account that owns it.
+Open `@anime_hindifilesbot`, send `/settings`, and read off:
+
+1. **Public Mode or Private Mode.** Public means any user can mint links from this clone; the answer
+   decides whether a private source channel may ever be named in a link, because an open clone reading a
+   private channel is a private channel anyone can hand out links from.
+2. **No Forward / content protection.** If it is on, it contradicts the vendor's own advice to keep a
+   copy of the file, and it would block the first step of our flow, which is a forward out of the source.
+3. **The auto-delete timer.** What it takes away is the copy delivered to a user, not the stored message.
+   This is recorded because our posts may never reference a message id inside the bot chat, and this is
+   the reason why.
+4. **The moderator list.** `/special_link` and `/universal_link` are gated by it, and it is ours to
+   fill; nobody has read it yet, so we do not know whether the pipeline account can use those verbs.
+
+Each one is a sentence you can paste here — a switch name and what it is set to. Nothing in the code
+guesses them, and `app.storagebot` refuses to pretend otherwise.
+
 ## 5. Four things that started as decisions and are now partly build work (from §18)
 
 - **Season → sticker mapping.** Auto-detected on the first season that goes out; you pick once if the
