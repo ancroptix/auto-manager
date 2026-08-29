@@ -159,6 +159,20 @@ session at boot, if it restarts on its own.
 Every one of these is a thin wrapper over something the HTTP control surface
 already exposes; the bot adds no authority of its own.
 
+### A long answer is split, never cut
+
+Telegram's limit is 4096 characters per message, and a probe report or a blocked-jobs list
+can pass it. `BotApi.send` then splits the text at line boundaries and sends the parts in
+order, returning the id of the first — so the login flow, which deletes its own prompt,
+still deletes the message it asked about. A published *post* is the opposite case:
+`app/sender.py` refuses to send an over-long caption rather than publish half of one, which
+is why the same number means "split" in a private chat and "stop" in a channel.
+
+The probe report keeps its own smaller budget (`MAX_REPORT_CHARS`, deliberately under the
+transport's limit) so the normal case is one paste-able message; what is *audited* into
+`app.audit_log` is the uncapped render, because the truncation note tells the operator the
+full version is in the database and that sentence has to be true.
+
 ### What `/inplace` answers before you ask it twice
 
 The preview line it prints is not decoration — it is the same plan the publisher

@@ -2105,14 +2105,22 @@ class ControlBot:
 
 
 def format_report_text(report: Any) -> str:
-    """Render a probe report, tolerating either return shape.
+    """Render a probe report as the one message the operator was supposed to get.
 
-    ``probe_once`` hands back a dict; ``app.probe.format_report`` wants the full
-    report object. Accepting both keeps the control bot from crashing on the very
-    command an operator uses to find out why things are not working.
+    ``app.probe.format_report`` *is* the renderer for the dict ``probe_once`` returns, and ``probe``
+    already stores its output under the ``report`` key of that dict. So: take the text that was written
+    for a human, and only fall back to formatting it here when there is none.
+
+    The version this replaces walked the dict and printed every value, which is how the first live
+    ``/probe`` reached its operator as ``account: {'id': 8992934034, 'username': 'Turvei', 'restricted'…``
+    — the answers were in that message, in repr form, each field cut at 300 characters, with the human
+    summary last where the transport's 4096 limit ate it mid-sentence. A dict is not a report.
     """
     from .probe import format_report
 
     if isinstance(report, dict):
-        return "\n".join(f"{key}: {str(value)[:300]}" for key, value in report.items())
-    return format_report(report)
+        written = report.get("report")
+        if isinstance(written, str) and written:
+            return written
+        return format_report(report)
+    return str(report)

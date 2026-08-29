@@ -529,3 +529,64 @@ class TestConfiguredBotHandles:
 
         assert report["storage_bot"]["username"] == policy().storage_bot.lstrip("@")
         assert "steps" in report
+
+
+class TestDeliveryKeepsEveryCharacter:
+    """The report is the one message nobody may receive half of.
+
+    ``MAX_REPORT_CHARS`` exists so the whole thing fits in a single Telegram message, and the cap in
+    ``format_report`` is what enforces it — which means the cap and the cut used to be the same bug
+    wearing two hats: whatever the cap dropped was also what the operator never saw, and the note
+    pointing at ``app.audit_log`` promised a copy that was not there.
+    """
+
+    def test_the_report_budget_fits_under_the_message_limit_it_is_sent_through(self) -> None:
+        from app.sender import MAX_MESSAGE_CHARS
+
+        assert MAX_REPORT_CHARS < MAX_MESSAGE_CHARS, (
+            "the cap is what keeps the report in one send; if it grows past Telegram's limit the "
+            "transport has to split, and then a cut message and a capped message are the same loss"
+        )
+
+    def test_the_audited_copy_is_the_uncapped_one_the_note_promises(self) -> None:
+        from app.probe import run_probe
+
+        rows: list[tuple[str, tuple]] = []
+
+        class AuditDb:
+            connected = True
+
+            async def execute(self, sql: str, *params: Any) -> None:
+                rows.append((sql, params))
+
+            async def fetch(self, sql: str, *params: Any) -> list[Any]:
+                return []
+
+            async def fetchrow(self, sql: str, *params: Any) -> None:
+                return None
+
+            async def fetchval(self, sql: str, *params: Any) -> None:
+                return None
+
+        client = FakeClient()
+        client.authorized = True
+        report = run(run_probe(client, policy=policy(), db=AuditDb(), send=False))
+        inserts = [row for row in rows if "audit_log" in row[0]]
+        assert inserts, "a probe report that is not audited is a probe nobody can check afterwards"
+        detail = inserts[0][1][1]
+        assert detail["summary"] == report["report"], (
+            "the message and the row have to be the same rendering or 'the full version is in the "
+            "database' is a sentence about a different document"
+        )
+
+    def test_a_delivery_too_long_for_one_message_is_sent_in_parts(self) -> None:
+        from app.probe import _deliver
+
+        client = FakeClient()
+        long_text = "\n".join(f"row {i} " + "z" * 80 for i in range(120))
+        assert len(long_text) > 4096
+        note = run(_deliver(client, long_text, policy=policy()))
+        assert note.startswith("sent to owner id=") and "parts" in note, note
+        delivered = [text for peer, text in ((str(p), t) for p, t in zip(client.peers, client.texts)) if peer == "999"]
+        assert all(len(part) <= 4096 for part in delivered)
+        assert "\n".join(delivered) == long_text, "split, never shortened"

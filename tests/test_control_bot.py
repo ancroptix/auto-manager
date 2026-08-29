@@ -1865,3 +1865,83 @@ async def test_the_probe_refusal_teaches_the_safe_order_instead_of_naming_a_mode
     assert "needs an open user session" in text2, text2
     assert "WORKER_ENABLED" not in text2, "no advice about the queue when the queue is not the problem"
     assert "/status" in text2, "it must still point at the one thing that can answer which half moved"
+
+
+# ------------------------------------------------------- the probe report, as the operator reads it
+def test_a_probe_report_is_the_message_the_probe_wrote_for_a_human() -> None:
+    """Repr dumps are not a report, and this is the one reply the operator pastes back.
+
+    The first live ``/probe`` answered with ``account: {'id': …, 'username': 'Turvei', 'restricted'…`` —
+    every field cut at 300 characters, with the human summary last, where the transport then ate it.
+    Both halves of that are pinned here: use the rendered text, and if there is none, *render* it.
+    """
+    from app.controlbot import format_report_text
+
+    human = "auto-manager · protocol probe\n\nstorage bot: @anime_hindifilesbot\n  says: press Start"
+    assert format_report_text({"account": {"id": 1}, "steps": [{"step": "account"}], "report": human}) == human
+
+    rendered = format_report_text({"account": {"id": 1, "username": "Turvei"}, "storage_bot": {}, "channel_help": {}})
+    assert "auto-manager · protocol probe" in rendered
+    assert "{'" not in rendered and "dialog_count" not in rendered, "no dictionary in a human's chat"
+    assert format_report_text(None) == "None", "a report that is not a dict is still answered, not crashed"
+
+
+@pytest.mark.asyncio
+async def test_the_report_sent_to_the_operator_is_readable_from_first_line_to_last(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """What ``/probe`` puts in the chat: the report, whole, no machine keys in front of it."""
+    from app import telegram_client
+
+    human = "auto-manager · protocol probe\n\naccount: @Turvei id=8992934034\n  dialogs=46 channels I own=5"
+
+    async def fake_probe_once(settings, db=None, *, send=True):  # noqa: ANN001, ARG001
+        assert send is False, "the bot writes the report into this chat; the probe must not also message the owner"
+        return {"account": {"id": 8992934034, "username": "Turvei"}, "report": human, "messages_sent": 3}
+
+    monkeypatch.setattr(telegram_client, "probe_once", fake_probe_once)
+    control, api, _db = bot()
+    await control._probe_task(OWNER)  # noqa: SLF001
+
+    assert [text for _chat, text in api.sent] == [human], api.sent
+    joined = api.texts
+    assert "messages_sent" in joined or "dialogs=46" in joined
+    assert "'username':" not in joined and "reply_chars" not in joined, "the repr path is back"
+
+
+@pytest.mark.asyncio
+async def test_a_reply_over_telegrams_limit_arrives_in_pieces_instead_of_cut_short(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """"Half a message, silently" is the failure mode of every long answer this bot writes.
+
+    ``/status``, a probe report, a blocked-jobs list — all of them can outgrow 4096 characters, and the
+    transport used to slice. Splitting is safe in a private chat (it is not a published post, where
+    ``sender.MAX_MESSAGE_CHARS`` refuses instead and should); losing the tail is not.
+    """
+    from app.botapi import BotApi as _BotApi, split_for_chat
+
+    body = "\n".join(f"line {i} " + "x" * 60 for i in range(120))
+    assert len(body) > 4096
+    assert "\n".join(split_for_chat(body)) == body, "split on lines, lose nothing"
+    assert len("".join(split_for_chat("y" * 10_001))) == 10_001, "even one absurd line survives whole"
+
+    api = _BotApi(TOKEN)
+    calls: list[dict[str, Any]] = []
+
+    async def fake_call(method: str, **kwargs: Any) -> dict[str, Any]:
+        calls.append({"method": method, **kwargs})
+        return {"result": {"message_id": len(calls)}}
+
+    monkeypatch.setattr(api, "_call", fake_call)
+
+    first = await api.send(OWNER, body)
+    assert first == 1, "the id of the first part is the handle a caller deletes by"
+    assert [call["method"] for call in calls] == ["sendMessage"] * 3, calls
+    assert all(len(call["text"]) <= 4096 for call in calls)
+    assert "\n".join(call["text"] for call in calls) == body
+
+    calls.clear()
+    assert await api.send(OWNER, "") is None and calls == [], "an empty reply is no reply at all"
+    await api.send(OWNER, "one line")
+    assert len(calls) == 1 and calls[0]["text"] == "one line", "short answers are untouched by this"

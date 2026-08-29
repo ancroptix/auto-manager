@@ -25,7 +25,7 @@ from typing import Any
 
 import httpx
 
-__all__ = ["BotApi", "BotTokenError", "Update", "parse_update", "redact"]
+__all__ = ["BotApi", "BotTokenError", "Update", "parse_update", "redact", "split_for_chat"]
 
 _TOKEN_SHAPE = re.compile(r"^(\d{4,12}):([A-Za-z0-9_-]{20,})$")
 _UPDATE_URL = re.compile(r"/bot\d+:[A-Za-z0-9_-]+")
@@ -33,6 +33,47 @@ _UPDATE_URL = re.compile(r"/bot\d+:[A-Za-z0-9_-]+")
 
 class BotTokenError(ValueError):
     """The token is missing or malformed. Never carries the token itself."""
+
+
+def split_for_chat(text: str, *, limit: int = 4096) -> list[str]:
+    """Telegram-sized pieces of one long message, cut on line breaks.
+
+    The control bot answers with things the operator has to read in full — a probe report, a queue
+    blocking list — and the transport used to hand Telegram ``text[:4096]``, which means the tail of an
+    answer simply did not arrive and nothing said so. Refusing an over-long text is the right rule for a
+    *published* post (see ``sender.MAX_MESSAGE_CHARS``: half a caption in a channel is worse than no
+    post), and the wrong one for a private chat, so here the message is split instead. Cuts land on
+    newlines whenever a newline fits; only a single line longer than the limit is split mid-line, and
+    then it is split exactly, so a character is never dropped.
+
+    Empty input is no message at all, not one empty send: Telegram rejects an empty ``sendMessage`` and
+    the caller learns more from getting nothing back than from a 400 about our own bookkeeping.
+    """
+    body = text or ""
+    if not body:
+        return []
+    if len(body) <= limit:
+        return [body]
+    units: list[str] = []
+    for line in body.split("\n"):
+        while len(line) > limit:
+            units.append(line[:limit])
+            line = line[limit:]
+        units.append(line)
+    parts: list[str] = []
+    current: list[str] = []
+    size = 0
+    for unit in units:
+        extra = len(unit) + (1 if current else 0)
+        if current and size + extra > limit:
+            parts.append("\n".join(current))
+            current, size = [], 0
+            extra = len(unit)
+        current.append(unit)
+        size += extra
+    if current:
+        parts.append("\n".join(current))
+    return parts
 
 
 def redact(text: str | None) -> str:
@@ -175,20 +216,26 @@ class BotApi:
         reply_to: int | None = None,
         parse_mode: str | None = None,
     ) -> int | None:
-        """Send text. That is the whole sending surface, by design.
+        """Send text, in as many messages as Telegram's limit needs.
 
-        4096 is Telegram's limit; the reply-to id is returned so a caller can
-        delete its own message afterwards (the login flow does exactly that).
+        The reply-to id of the *first* part is what comes back, so a caller that deletes its own prompt
+        (the login flow) still deletes the message it asked about. Those prompts are a line or two long
+        and never split; an answer that does split is a report nobody is deleting.
         """
-        data = await self._call(
-            "sendMessage",
-            chat_id=chat_id,
-            text=text[:4096],
-            disable_web_page_preview=True,
-            reply_to_message_id=reply_to,
-            parse_mode=parse_mode,
-        )
-        return (data.get("result") or {}).get("message_id")
+        first: int | None = None
+        for part in split_for_chat(text):
+            data = await self._call(
+                "sendMessage",
+                chat_id=chat_id,
+                text=part,
+                disable_web_page_preview=True,
+                reply_to_message_id=reply_to if first is None else None,
+                parse_mode=parse_mode,
+            )
+            message_id = (data.get("result") or {}).get("message_id")
+            if first is None:
+                first = message_id
+        return first
 
     async def delete(self, chat_id: int, *message_ids: int | None) -> int:
         """Best-effort deletion. Returns how many it removed.

@@ -31,6 +31,7 @@ from typing import Any, Sequence
 
 from . import rights as channel_rights
 from .linkprovider import NOT_FOR_PROBE as LINK_MINTING_COMMANDS
+from .botapi import split_for_chat
 from .linkprovider import parse_reply as _parse_link_reply
 from .linkprovider import summary as _link_provider_summary
 from .storagebot import FORBIDDEN as FORBIDDEN_COMMANDS
@@ -490,7 +491,16 @@ async def run_probe(
                 "insert into app.audit_log (actor_user_id, action, entity_type, detail) "
                 "values ($1, 'probe.report', 'service_state', $2::jsonb)",
                 report["account"].get("id"),
-                {"summary": text[:1500], "elapsed": report["elapsed_seconds"], "sent": run.sent},
+                # The uncapped render: ``format_report`` cuts the *message* at MAX_REPORT_CHARS and
+                # tells the operator the whole thing is in this row, which is only true if the whole
+                # thing is in this row. A pointer to a shorter copy is how a report stops being
+                # falsifiable — and 1500 characters used to be all it kept, for a run whose entire
+                # purpose is recording what the two bots said.
+                {
+                    "summary": format_report(report, limit=None),
+                    "elapsed": report["elapsed_seconds"],
+                    "sent": run.sent,
+                },
             )
         except Exception as exc:  # noqa: BLE001
             log.debug("probe report not audited: %s", exc)
@@ -507,14 +517,25 @@ async def _deliver(client: Any, text: str, *, policy: ProbePolicy) -> str:
     if policy.owner_user_id is None:
         return "not sent: TELEGRAM_MAIN_ADMIN_USER_ID is unset"
     try:
-        await asyncio.wait_for(client.send_message(policy.owner_user_id, text[:4096]), policy.per_step_timeout)
-        return f"sent to owner id={policy.owner_user_id}"
+        # One send per part, and every part: the report is the thing the operator has to read in full,
+        # and ``text[:4096]`` here used to mean the last channel's answer simply never arrived.
+        parts = split_for_chat(text)
+        for part in parts:
+            await asyncio.wait_for(client.send_message(policy.owner_user_id, part), policy.per_step_timeout)
+        return f"sent to owner id={policy.owner_user_id}" + (
+            f" in {len(parts)} parts" if len(parts) > 1 else ""
+        )
     except Exception as exc:  # noqa: BLE001
         return f"failed: {type(exc).__name__}: {str(exc)[:120]}"
 
 
-def format_report(report: dict[str, Any]) -> str:
+def format_report(report: dict[str, Any], *, limit: int | None = MAX_REPORT_CHARS) -> str:
     """One paste-able message.
+
+    ``limit=None`` renders it without the cap. That is what goes into ``app.audit_log``, because the
+    truncation note tells the operator the full version is there — and a row holding the truncated copy
+    would make that sentence a lie about a detail nobody checks until something has gone wrong.
+    
 
     Shaped for a human to copy out of Telegram into a chat, so it leads with the
     answers that unblock the most work — what the storage bot's menu actually
@@ -596,9 +617,9 @@ def format_report(report: dict[str, Any]) -> str:
     lines.append(f"messages sent={report.get('messages_sent', 0)} elapsed={report.get('elapsed_seconds')}s")
     lines.append("Paste this whole message back to the agent.")
     text = "\n".join(lines)
-    if len(text) > MAX_REPORT_CHARS:
-        note = "\n…truncated; the full version is in app.audit_log"
-        # Cut by the note's real length: "leave 40 chars" overshoots the moment
-        # the sentence changes, and an over-long report fails to send at 4096.
-        text = text[: MAX_REPORT_CHARS - len(note)] + note
-    return text
+    if limit is None or len(text) <= limit:
+        return text
+    note = "\n…truncated; the full version is in app.audit_log"
+    # Cut by the note's real length: "leave 40 chars" overshoots the moment
+    # the sentence changes, and an over-long report fails to send at 4096.
+    return text[: limit - len(note)] + note
