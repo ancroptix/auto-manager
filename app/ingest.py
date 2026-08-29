@@ -31,6 +31,7 @@ from . import normalize, seasons
 from .keys import (
     normalize_title,
     screening_key,
+    sticker_key,
 )
 from .stages import JobKind, JobStage
 
@@ -465,7 +466,14 @@ async def _queue_transition_stickers(
     )
     queued = []
     for step in steps:
-        dedup = f"season-sticker:{boundary.evidence.get('current_season') or stream['current_season']}:{step.kind}:{step.season}"
+        # The job is identified by the season *row*, not by a season number. Numbers are what the
+        # operator reads and what `step.as_payload` carries; they are also the same small integers in
+        # every series, and `enqueue` drops a key it has already seen — so two series entering their
+        # own season 2 used to produce one divider between them, the second vanishing without a trace.
+        # The kind stays in the key because the closing half and the opening half are two posts; and
+        # the row this key names is the season being entered even for the closing step, which is what
+        # makes a re-run of the same boundary a no-op instead of a second farewell.
+        dedup = f"{sticker_key(season_id)}:{step.kind}"
         job = await db.enqueue(
             JobKind.SEASON_STICKER.value,
             dedup,

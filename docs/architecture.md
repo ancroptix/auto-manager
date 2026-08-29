@@ -158,14 +158,20 @@ stage**, and a `reconciliation` job is enqueued. So it resumes at
 
 ## Known limits of this phase
 
-* No Telegram I/O yet: the scanner, archive copies, storage-bot menus, Channel
-  Help publishing, `createChannel`/`editPhoto`/`editAdmin` on a destination, and
-  sticker posting are unwired. Everything that *decides* what they should do is
-  implemented and tested — `ingest.record_message` already takes the exact payload
-  a scanner will hand it, `setup_plan()` already carries the exact title, photo, bio
-  and permission set the creation path must apply — so the missing piece is
-  transport, not behaviour. Nothing in this repository has ever renamed a real
-  channel, and no doc here should be read as saying it has.
+* **The missing half is inbound, not outbound.** Sending, editing, forwarding,
+  sticker posting, the archive copy, the storage-bot handoff, the announcement and
+  the join-request campaign are all writers with real Telegram I/O — the eight kinds
+  `build_writers()` returns — and `outbound_enabled` is what decides whether any of
+  them presses send. That is why a shadow run replies "unwired" rather than "done":
+  in that mode there is deliberately nothing to send with, and the same sentence is
+  read by `tests/test_linkprovider.py` as proof that approval is not capability.
+  What genuinely does not exist is the loop that watches a source channel: the
+  `ingest_media` handler waits on the `source_channel_id` and `message_id` only a
+  scanner can name, and `ingest.record_message` already takes exactly the payload it
+  would hand over. Channel creation is the other gap — `setup_plan()` carries the
+  exact title, photo, bio and permission set, but no executor runs it, nothing calls
+  `createChannel`/`editPhoto`/`editAdmin`. Nothing in this repository has ever renamed
+  a real channel, and no doc here should be read as saying it has.
 * Season completeness is a *decision*, not a workflow: `season_coverage()` and
   `should_post_season_batch()` are built and tested, with no production caller, because
   the publish layer that would act on them is unwired. Declaring a length with `/declare`

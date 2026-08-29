@@ -12,6 +12,8 @@ easy case, produces a wrong public claim that cannot be quietly withdrawn.
 
 from __future__ import annotations
 
+import pytest
+
 from app import seasons
 from app.normalize import parse_episode
 from app.seasons import Verdict, classify, publish_hold, transition_stickers
@@ -251,3 +253,49 @@ def test_a_channels_declared_season_starts_the_series_without_opening_a_boundary
     # no effect on the ordinary channel, which is the whole point of adding it.
     plain = seasons.classify(episode=1, current_season=1)
     assert plain.season == 1 and plain.verdict is seasons.Verdict.FIRST
+
+# ------------------------------------------------------------------- the queueing, not just the plan
+class _EnqueueThatCollapses:
+    """The one job-table behaviour the sticker queue leans on: a key already used is dropped.
+
+    ``Database.enqueue`` documents it as "return None if that dedup_key already exists" — which is why
+    a key made of small, repeated integers is a silent way to lose a post.
+    """
+
+    def __init__(self) -> None:
+        self.keys: list[str] = []
+
+    async def enqueue(self, kind: str, dedup_key: str, **_kwargs: object) -> dict[str, int] | None:
+        if dedup_key in self.keys:
+            return None
+        self.keys.append(dedup_key)
+        return {"id": len(self.keys)}
+
+
+@pytest.mark.asyncio
+async def test_two_series_entering_their_second_season_each_get_their_own_divider() -> None:
+    """A dedup key has to name a row. Both were built from season numbers, so one was swallowed."""
+    from app import ingest
+
+    boundary = classify(episode=1, labelled_season=2, current_season=1, highest=12, populated=[1])
+    stream = {"current_season": 1, "episodes_in_current": 12}
+    db = _EnqueueThatCollapses()
+
+    for season_row in (11, 21):  # two different series, both entering their own season 2
+        report: dict[str, object] = {}
+        await ingest._queue_transition_stickers(  # noqa: SLF001
+            db, boundary, season_id=season_row, stream=stream, report=report
+        )
+        assert [entry["job"] for entry in report["stickers"]] == [True, True], (
+            "a divider that vanished into a duplicate key still looks fine in the report"
+        )
+
+    assert len(db.keys) == 4, db.keys
+    assert len(set(db.keys)) == 4, "two series at the same boundary number are four posts, not two"
+
+    # …and the same boundary again must still be nothing: idempotency is the other half of the key.
+    before = list(db.keys)
+    await ingest._queue_transition_stickers(  # noqa: SLF001
+        db, boundary, season_id=11, stream=stream, report={"stickers": []}
+    )
+    assert db.keys == before, "a re-scan must not post a second farewell for the same season"
