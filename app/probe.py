@@ -38,11 +38,27 @@ from .storagebot import FORBIDDEN as FORBIDDEN_COMMANDS
 
 log = logging.getLogger("auto_manager.probe")
 
-__all__ = ["ProbeBudget", "ProbePolicy", "ProbeViolation", "format_report", "run_probe", "MAX_REPORT_CHARS", "SAFE_COMMANDS"]
+__all__ = [
+    "MAX_BUTTONS_SHOWN",
+    "MAX_COMMANDS_SHOWN",
+    "MAX_REPORT_CHARS",
+    "ProbeBudget",
+    "ProbePolicy",
+    "ProbeViolation",
+    "SAFE_COMMANDS",
+    "format_report",
+    "run_probe",
+]
 
 #: Telegram's message limit. The report has to fit in one message: a report split
 #: over four messages is a report nobody pastes in full.
 MAX_REPORT_CHARS = 3800
+
+#: How much of each answer to print. A menu is skimmed for its shape, so ten buttons is plenty; a bot's
+#: declared command list is the one line this whole probe exists to read, and cutting it at ten without
+#: saying so is how a 14-command clone got reported as a 10-command one.
+MAX_BUTTONS_SHOWN = 10
+MAX_COMMANDS_SHOWN = 16
 
 #: Commands the storage bot offers that this program may never send, whatever else changes: its
 #: moderation tools act on people, which is not this pipeline's job. See ``app/storagebot.py``.
@@ -373,10 +389,10 @@ def _read_bot_profile(answered: Any) -> dict[str, Any]:
     hint: dict[str, Any] = {}
     commands: list[str] = []
     for item in getattr(bot_info, "commands", None) or []:
-        description = (getattr(item, "description", "") or "").strip()
-        commands.append(f"/{item.command}" + (f"={description[:24]}" if description else ""))
+        description = _brief(getattr(item, "description", ""), 34)
+        commands.append(f"/{item.command}" + (f"={description}" if description else ""))
     if commands:
-        hint["commands"] = commands[:20]
+        hint["commands"] = commands[:40]
     about = " ".join(str(getattr(full, "about", "") or "").split())
     if about:
         hint["about"] = about[:280]
@@ -595,6 +611,22 @@ async def _deliver(client: Any, text: str, *, policy: ProbePolicy) -> str:
         return f"failed: {type(exc).__name__}: {str(exc)[:120]}"
 
 
+def _brief(text: Any, limit: int) -> str:
+    """Shorten a bot's own wording to whole words, because a mid-word cut reads as the bot's fault.
+
+    The operator's report carried `/ban=Ban a user (moderators o` — a fact about our formatting that looks
+    like a fact about the bot. Cutting at the last space the limit allows keeps the phrase readable; no
+    ellipsis is added, because in a line this dense a trailing mark costs more than it explains.
+    """
+    words = " ".join(str(text or "").split())
+    if len(words) <= limit:
+        return words
+    cut = words[:limit]
+    if " " in cut:
+        cut = cut[: cut.rfind(" ")]
+    return cut
+
+
 def format_report(report: dict[str, Any], *, limit: int | None = MAX_REPORT_CHARS) -> str:
     """One paste-able message, shaped for a human to copy out of Telegram into a chat.
 
@@ -656,7 +688,7 @@ def format_report(report: dict[str, Any], *, limit: int | None = MAX_REPORT_CHAR
         if buttons:
             kinds = sorted({str(b.get("kind")) for b in buttons})
             lines.append(f"  buttons ({len(buttons)}; kinds: {', '.join(kinds)}):")
-            for button in buttons[:10]:
+            for button in buttons[:MAX_BUTTONS_SHOWN]:
                 note = f" [{button['kind']}]"
                 if button.get("data"):
                     note += f" data={str(button['data'])[:26]}"
@@ -679,8 +711,14 @@ def format_report(report: dict[str, Any], *, limit: int | None = MAX_REPORT_CHAR
             named = ", ".join(str(b)[:24] for b in section["refused_buttons"][:8])
             lines.append(f"  left alone by policy ({len(section['refused_buttons'])}): {named}")
         profile = section.get("bot_profile") or {}
-        if profile.get("commands"):
-            lines.append("  commands: " + " ".join(str(c) for c in profile["commands"][:10]))
+        declared = profile.get("commands") or []
+        if declared:
+            shown = " ".join(str(c) for c in declared[:MAX_COMMANDS_SHOWN])
+            hidden = len(declared) - MAX_COMMANDS_SHOWN
+            lines.append(
+                f"  commands ({len(declared)}): {shown}"
+                + (f" \u2026and {hidden} more, all of them in app.audit_log" if hidden > 0 else "")
+            )
         if profile.get("menu_button"):
             lines.append(f"  menu button the user must press first: {profile['menu_button']}")
         if profile.get("about"):

@@ -1661,10 +1661,27 @@ class ControlBot:
             numeric,
         )
         if not rows:
+            # The refusal has to leave the operator somewhere to go. This is the one command whose subject
+            # is a row this bot will not make, and "created in the dashboard table app.source_channel" is
+            # a sentence nobody can act on from a phone — which is how it read when the operator tried
+            # `/source -1002575861262 …` on 2026-08-29 and got it back. So the steps are here, with the
+            # one required field named, and the reason for the refusal said once.
+            wanted = numeric if numeric is not None else "the channel number, minus sign and all"
             return (
-                f"`{handle}` is not a configured source channel, so there is nothing to declare "
-                "about it.\nThe row itself is created in the dashboard table app.source_channel — "
-                "I can read and update it, not create it."
+                f"`{handle}` is not a configured source channel, so there is nothing to declare about it.\n"
+                "I read and update that table, but I do not create rows in it: adding a channel is what "
+                "starts the service watching it, and that is your decision to make, never a side effect of "
+                "a command I answer.\n\n"
+                "To add it, in the Supabase dashboard: Table editor → app.source_channel → Insert row.\n"
+                f"telegram_channel_id: {wanted} — the only field this table needs.\n"
+                "username: @the_handle, or leave it empty if the channel has no @name.\n"
+                "title: what you call it. This is what /status prints.\n"
+                "mode: leave it on full. active: leave it on.\n"
+                "require_hindi_audio: leave it on. It is the check that a file has Hindi audio before it is "
+                "posted, and it stays on until you tell me otherwise for this channel.\n"
+                "series_id and destination_id: leave them empty here — /source records the series, /card "
+                "the destination, and both check the numbers for you.\n\n"
+                "Save, then send me the same /source command again and it will take the declaration."
             )
         return list(rows)
 

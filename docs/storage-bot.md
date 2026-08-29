@@ -132,21 +132,55 @@ asked and reports `link_from_another_bot` instead of pretending.
   independently. Our private sources are the case that binds us — the clone stays a member with the
   rights it has, because that is what the links read through.
 
+## What the bot declares about itself, and what its owner was asked
+
+Two sources of fact live in this file, and they are not the same kind of thing. The table above is
+*menu text* — the operator's screenshots of what the bot prints. The paragraph below is what Telegram
+itself reports, read by `/probe` on 2026-08-29 from the pipeline account, as the bot's own declared
+command list:
+
+`/start` "Check i am alive" · `/genlink` "To store a single message" · `/batch` "To store mutiple
+message…" · `/custom_batch` "To store multiple random…" · `/special_link` "store multiple messages" ·
+`/universal_link` "stores multiple messages" · `/shortener` "To shorten any shareable…" · `/settings`
+"Customize Your settings" · `/broadcast` "Broadcast a messages to…" · `/ban` "Ban a user (moderators
+only…)".
+
+Every verb `app.storagebot` maps a purpose onto is in that list, with the bot's own spelling and its own
+typos intact — `mutiple`, `Broadcast a messages`. That is the confirmation the table needed: a screenshot
+can show a menu that was edited the week it was taken, and Telegram's declared list is what the bot tells
+every account it talks to. It does not add a single fact about *what comes back* from any of them, which
+is why the blocked job kind stays blocked.
+
+Four switches on that bot's `/settings` screen are also answered now, by the operator, on 2026-08-29, and
+they are recorded here because they are configuration — they can change without anything in this repo
+changing, and a stale answer is worse than a question:
+
+* Public Mode, not Private: any Telegram user can mint a link from this clone. What that costs is written
+  in the open-questions list below.
+* The auto-delete timer is **5 minutes**. It removes the copy delivered to whoever opened the link; the
+  stored message stays. This is the fact behind the rule that no post of ours may reference a message id
+  inside the bot chat.
+* The moderator list holds the owner's **main account only**. The pipeline account is not on it, so the
+  two verbs marked "moderators only" (`/special_link`, `/universal_link`) are not today this service's to
+  use. Adding it is one entry on that screen, and the open question is whether that is all the bot checks.
+* Forwarding: answered in one word, and that word could be read two ways. It stays a question, in the
+  list below, until it is written out.
+
 ## What it does not settle
 
 The questions below are why `storage_upload` stays a blocked job instead of a confident guess.
-Most of them are what one authenticated run can answer; three are a switch on the owner's
-`/settings` screen rather than a mystery, which is why they are cheap to settle and still worth
-naming. `tests/test_storagebot.py` checks that this list and `app.storagebot.still_unknown()` stay the
+Most of them are what one authenticated run can answer. Three used to be a switch on the owner's
+`/settings` screen, and those switches were read on 2026-08-29 (above) — what is left is the question
+each answer opens, which is a different thing and is written as one. `tests/test_storagebot.py` checks that this list and `app.storagebot.still_unknown()` stay the
 same length — a doc that says nine while the code lists eight is the kind of lie that only ever
 helps nobody:
 
 1. whether a batch link can be appended to later, or whether /special_link's "edit" means re-issuing the range and then editing the destination post that carries the new link
 2. whether a link is a *reference* to the post in the source channel or a copy the bot made for itself: the vendor advertises "no db channel required", which points at a reference, and a reference is only as durable as the message it points at — this is the question that decides how much our zero-deletion rule is protecting other people's links
-3. which rights our account actually has on our own clone: the moderator list that /special_link and /universal_link are gated by is ours to fill, and nobody has read it yet
-4. whether the clone is in Public Mode ("any telegram user can generate shareable & shorten links using clone") or Private Mode, since a clone that can read a private channel and is open to strangers is a private channel anyone can hand out links from
-5. whether "No Forward" or content protection is on, which would contradict the bot's own advice to save files and would have to be checked against our first step, which is a forward out of the source channel
-6. what the deletion timer really covers — the operator can set it, and what it takes away is the delivered copy, not the stored message — which is why no post of ours may ever reference a message id inside the bot chat
+3. whether adding the pipeline account to the clone's moderator list is what /special_link and /universal_link actually check for. The list itself is read: it holds the owner's main account alone, so those two verbs are not this service's to use today — and whether the bot looks at the list per request or only when a link is minted is a live-run question
+4. whether every source this service is ever pointed at is a public channel. The mode is answered (Public, 2026-08-29), and what follows from it is not: a link minted from a *private* source on an open clone is a private channel anyone can read, so a private source means changing the mode first, and nobody has asked for one yet
+5. whether "No Forward" or content protection is on. One word arrived on 2026-08-29 and it could be read either way; this is the switch our first step runs on — a forward out of the source channel — so it stays open until it is written out in a sentence
+6. what the five-minute timer does to a link someone clicks late. What the copy goes and the stored message stays is answered, along with the value (5 minutes, 2026-08-29); unanswered is whether a link opened after five minutes still serves the stored message — which is the reason no post of ours may reference a message id inside the bot chat
 7. whether a link can be revoked, and what a revoked link does to a post that already carries it
 8. rate limits per account, since the free tier cannot afford a retry storm. One half of the link's future is answered already: the operator's word (2026-08-29) is that a link does not expire, and that the deletion notice covers only the copy delivered to a user and not the stored message — so what a published post still risks is a rate limit, and a regenerated invite behind the card while every old post goes on pointing at the old one
 

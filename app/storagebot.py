@@ -306,11 +306,15 @@ def still_unknown() -> tuple[str, ...]:
     Returning them as data keeps the stub's message honest and checkable: it is not "we have not
     gotten to it", it is "these specific facts are missing, and here they are".
 
-    Four questions this list used to carry are answered and were removed: what `/batch` asks for
-    next (`BATCH_FLOW`), whether its answer is text or a button (both, and the text carries the
-    link), what "moderators only" means (our clone's own moderator list), and what "your clones"
-    means (up to three per Telegram account, made by @Md_CloneManagerBot). What is left is either
-    behaviour only a live run can see, or a switch on the operator's `/settings` screen.
+    Questions get answered and leave a smaller one behind, so this list is rewritten rather than
+    shortened. What the operator's `/settings` read of 2026-08-29 settled: the clone is in Public
+    Mode, its auto-delete timer is five minutes, and its moderator list holds the owner's main
+    account alone — which is a fact about a *permission*, and what it opens is the question of
+    whether the pipeline account being off that list is why the two moderator verbs would refuse.
+    Earlier answers still stand in the doc: what `/batch` asks for next (`BATCH_FLOW`), whether its
+    reply is text or a button (both, and the text carries the link), what "moderators only" means
+    (this clone's own list), and what "your clones" means (up to three per Telegram account, made
+    with @Md_CloneManagerBot). What is left is behaviour only a live run can see.
     """
     return (
         "whether a batch link can be appended to later, or whether /special_link's \"edit\" means "
@@ -319,17 +323,22 @@ def still_unknown() -> tuple[str, ...]:
         "itself: the vendor advertises \"no db channel required\", which points at a reference, "
         "and a reference is only as durable as the message it points at. This is the question that "
         "decides how much our zero-deletion rule is protecting *other people's* links",
-        "which rights our account actually has on our own clone — the moderator list that "
-        "/special_link and /universal_link are gated by is ours to fill, and nobody has read it yet",
-        "whether the clone is in Public Mode (\"any telegram user can generate shareable & shorten "
-        "links using clone\") or Private Mode, since a clone that can read a private channel and is "
-        "open to strangers is a private channel anyone can hand out links from",
-        "whether \"No Forward\" or content protection is on, which would contradict the bot's own "
-        "advice to save files, and would have to be checked against our first step, which is a "
-        "forward out of the source channel",
-        "what the deletion timer really covers — the operator can set it, and what it takes away is "
-        "the delivered copy, not the stored message — which is why no post of ours may ever "
-        "reference a message id inside the bot chat",
+        "whether adding the pipeline account to the clone's moderator list is what /special_link "
+        "and /universal_link check for: the list was read on 2026-08-29 and it holds the owner's main "
+        "account only, so today those two verbs belong to an account this service does not use, and "
+        "whether the bot re-reads the list per request or at link-mint time is a live-run question",
+        "whether every source this service will ever be pointed at is a public channel: the clone was "
+        "set to Public Mode (\"any telegram user can generate shareable & shorten links using clone\"), "
+        "which is settled, and what follows from it is not — a link minted from a *private* source on an "
+        "open clone is a private channel anyone can read, so a private source needs the mode changed "
+        "first, and nobody has asked for one yet",
+        "whether \"No Forward\" or content protection is on. The operator's one word on 2026-08-29 "
+        "could be read either way, and this is the switch our first step runs on — a forward out of the "
+        "source channel — so it stays open until it is answered in a sentence, not a word",
+        "what the five-minute timer does to a link someone clicks late: the delivered copy goes, the "
+        "stored message stays (that much was answered on 2026-08-29, along with the value), and what is "
+        "not known is whether a link opened after five minutes still serves the stored message — which "
+        "is the reason no post of ours may reference a message id inside the bot chat",
         "whether a link can be revoked, and what a revoked link does to a post that already carries it",
         "rate limits per account, since the free tier cannot afford a retry storm. One half of the "
         "link's future is answered already: the operator's word (2026-08-29) is that a link does not "

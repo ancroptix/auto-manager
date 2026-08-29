@@ -1945,3 +1945,24 @@ async def test_a_reply_over_telegrams_limit_arrives_in_pieces_instead_of_cut_sho
     assert await api.send(OWNER, "") is None and calls == [], "an empty reply is no reply at all"
     await api.send(OWNER, "one line")
     assert len(calls) == 1 and calls[0]["text"] == "one line", "short answers are untouched by this"
+
+
+@pytest.mark.asyncio
+async def test_a_source_channel_that_does_not_exist_yet_says_where_to_create_it() -> None:
+    """The refusal the operator actually hit, and what it owed them.
+
+    `/source -1002575861262 series …` was answered with "the row itself is created in the dashboard table
+    app.source_channel — I can read and update it, not create it". True, and useless to someone working on
+    a phone: the refusal to create the row is a decision this program keeps, so the *steps* have to come
+    with it, including which field the table actually requires.
+    """
+    control, _api, db = bot()
+    (text,) = await say(control, "/source -1002575861262 series Bleach")
+
+    assert "-1002575861262" in text, "the id they typed, echoed back so the number is checkable"
+    assert "Table editor" in text and "app.source_channel" in text, "the path, not just the table name"
+    assert "telegram_channel_id" in text, "the one required column, by name"
+    assert "Insert row" in text
+    assert "I do not create rows" in text, "and the reason stays said: watching a channel is their call"
+    assert "/probe" not in text and "grant" not in text.lower(), "no invented capability in a refusal"
+    assert db.queued == [], "a refusal queues nothing"

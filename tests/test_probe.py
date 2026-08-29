@@ -655,7 +655,7 @@ class TestBotProfile:
         assert profile["is_bot"] is True, "the record says whether the peer is a bot at all"
 
         text = format_report(report)
-        assert "commands: /batch=Store files /start" in text
+        assert "commands (2): /batch=Store files /start" in text
         assert "menu button the user must press first: Open store" in text
         assert "profile text: Send me a file" in text
 
@@ -784,3 +784,49 @@ class TestRefusedButtons:
         clicks = [entry for entry in section["pressed"] if "skipped" not in entry]
         assert len(clicks) == 1, "one click, as budgeted - and a url note is not a click"
         assert section["refused_buttons"] == ["ᴅᴄᴀᴏᴛᴄᴇ ᴀᴡᴇ"], "the scan ran to the end of the menu"
+
+
+class TestWhatTheReportCounts:
+    """A line the operator quotes back has to count itself, and cut itself at words.
+
+    Both of these came from the live report: it said `commands:` with ten verbs and no total, so a
+    14-command clone read as a 10-command one, and it cut a description mid-word — `/ban=Ban a user
+    (moderators o` — which looks like the bot's own text and is ours.
+    """
+
+    def test_a_long_command_list_says_how_long_it_is(self) -> None:
+        class Talkative(FakeClient):
+            async def __call__(self, request: Any) -> Any:
+                return SimpleNamespace(
+                    full_user=SimpleNamespace(
+                        id=77,
+                        about="",
+                        bot_info=SimpleNamespace(
+                            commands=[
+                                SimpleNamespace(command=f"c{i}", description="Stores files from a channel")
+                                for i in range(20)
+                            ],
+                            menu_button=None,
+                        ),
+                    ),
+                    chats=[],
+                    users=[SimpleNamespace(id=77, bot=True)],
+                )
+
+        report = run(run_probe(Talkative(), policy=policy(), send=False))
+        text = format_report(report)
+        assert "commands (20):" in text, "the count is the fact the truncation hides"
+        assert "and 4 more, all of them in app.audit_log" in text, text
+        stored = report["storage_bot"]["bot_profile"]["commands"]
+        assert len(stored) == 20, "the record keeps every verb; only the message is shortened"
+
+    def test_words_are_cut_at_words(self) -> None:
+        from app.probe import _brief
+
+        original = "Ban a user (moderators only, per clone)"
+        cut = _brief(original, 34)
+        assert cut and original.startswith(cut) and len(cut) <= 34
+        assert original[len(cut) :][:1] in (" ", ""), f"cut mid-word: {cut!r}"
+        assert _brief("short", 34) == "short"
+        assert _brief("  spaced   out  text ", 200) == "spaced out text"
+        assert _brief(None, 10) == ""

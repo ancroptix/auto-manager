@@ -95,8 +95,9 @@ reason (85 files scanned clean as of this writing — the count is what the scri
 These are not code work. Each one is a fact only you have, and each is refused in the same words by
 the job that needs it, so `/status` names the missing thing rather than a stack trace:
 
-1. **One session, live.** `/login` with the account that owns the channels. Nothing writes until
-   `APP_MODE=live` and a session is stored, and the first run of every job kind is a plan.
+1. **One session, live.** Done on 2026-08-29: the account is logged in and its session is stored, and
+   the probe has since run against it four times. `BOT_ALLOW_LOGIN=false` is the loose end, and it is a
+   switch on your side, not a row here — leave the login door shut now that you are through it.
 2. **The private master archive.** A row in `app.archive_channel` with that channel's numeric id (and
    `is_primary = true`). This program will not choose where the only spare copy of an episode lives.
 3. **`/card <destination> <message id>`**, once per destination channel — the post that gets forwarded
@@ -110,26 +111,33 @@ the job that needs it, so `/status` names the missing thing rather than a stack 
    two — which is also the moment to look at whether `announcement.style` renders the box the way you
    want it.
 
-## 4c. Four switches on your own clone's `/settings` screen
+## 4c. Your clone's `/settings` screen: three answers in, two things left
 
-`app/storagebot.still_unknown()` keeps the list of what the vendor's pages and the bot's own menu cannot
-answer, and these four are the part of it that only a live clone can tell us. They are not probes' work:
-`/probe` reads menus, and these are settings, which the bot will only show the account that owns it.
-Open `@anime_hindifilesbot`, send `/settings`, and read off:
+These are not code work and `/probe` cannot fetch them: they are switches on the clone, which the bot
+shows only to the account that owns it. Read on 2026-08-29, and recorded in `docs/storage-bot.md` so the
+protocol file holds both the verbs and the settings behind them:
 
-1. **Public Mode or Private Mode.** Public means any user can mint links from this clone; the answer
-   decides whether a private source channel may ever be named in a link, because an open clone reading a
-   private channel is a private channel anyone can hand out links from.
-2. **No Forward / content protection.** If it is on, it contradicts the vendor's own advice to keep a
-   copy of the file, and it would block the first step of our flow, which is a forward out of the source.
-3. **The auto-delete timer.** What it takes away is the copy delivered to a user, not the stored message.
-   This is recorded because our posts may never reference a message id inside the bot chat, and this is
-   the reason why.
-4. **The moderator list.** `/special_link` and `/universal_link` are gated by it, and it is ours to
-   fill; nobody has read it yet, so we do not know whether the pipeline account can use those verbs.
+1. **Public Mode**, not Private — answered, and it is not a comfortable answer: any Telegram user can mint
+   a link from this clone. Nothing breaks while every source is a public channel. A *private* source on
+   an open clone is a private channel anyone can read, so if you ever want one, the mode changes first.
+2. **Auto-delete timer: 5 minutes** — answered. It takes the copy delivered to whoever opens the link; the
+   stored message stays. This is why no post of ours may reference a message id inside the bot chat, and
+   it is a rule in the code, not advice.
+3. **Moderators: your main account only** — answered, and it costs us two verbs. `/special_link` and
+   `/universal_link` are gated on that list, and the pipeline account is not on it.
 
-Each one is a sentence you can paste here — a switch name and what it is set to. Nothing in the code
-guesses them, and `app.storagebot` refuses to pretend otherwise.
+Left for you, in either order:
+
+* **One sentence, not one word, about forwarding.** "No Forward" (content protection) decides whether our
+  first step — forwarding a file out of the source channel — works at all. Your reply of 2026-08-29 could
+  be read either way, and this is the one switch where guessing is expensive, so it stays open until you
+  write it out: which of the two is it, on or off?
+* **Whether to add `@Turvei` to that moderator list.** One entry on the screen. It would put the
+  add-a-quality-later link and the survives-a-dropped-clone link within reach of the account that actually
+  runs the pipeline. It is your call because it hands that account power over your clone, and nothing here
+  will assume you gave it: `app/storagebot.py` marks those two verbs as moderator-gated in `MODERATOR_ONLY`,
+  and that is a flag rather than a lock — the design says so out loud — so what changes when you add the
+  account is what a live run can prove, not what a doc may promise.
 
 ## 5. Four things that started as decisions and are now partly build work (from §18)
 
