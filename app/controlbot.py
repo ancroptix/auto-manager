@@ -1759,6 +1759,12 @@ class ControlBot:
             code_hash = await self.transport.send_code(phone)
         except Exception as exc:  # noqa: BLE001 - the reason is useful, the raw text is not
             self.pending.pop(update.chat_id, None)
+            # Close the half-finished attempt on the way out. `MTProtoLogin` does this itself now,
+            # and so does the transport here, because a login client that stays connected in a
+            # free-tier container is a connection nobody will ever use or close.
+            discard = getattr(self.transport, "discard", None)
+            if callable(discard):
+                await discard(phone)
             return [
                 Reply(
                     f"could not send a code: {scrub(str(exc), phone)[:220]}\n\n"

@@ -49,13 +49,21 @@ class MTProtoLogin:
     async def send_code(self, phone: str) -> str:
         """Ask Telegram for a login code. Returns the ``phone_code_hash``.
 
-        ``force=False`` matters: forcing invalidates a code the user may already be
-        reading, which turns one retried command into a locked account.
+        Two things this has to get right, and both were learned the hard way on the first live
+        attempt — the operator's own /login, which is what this module exists for. Telethon's
+        ``send_code_request`` takes only ``phone`` in 1.44: the old ``force`` argument is gone, and
+        passing it raises ``TypeError``
+        before a request is ever made — and the request needs a *connected* client, because
+        ``TelegramClient(...)`` on its own answers "Cannot send requests while disconnected".
+
+        A failed attempt closes its own connection. Leaving one open in a free-tier container means
+        both a leaked socket and, worse, a half-finished auth that the next attempt would reuse.
         """
         client = await self._client()
         try:
-            sent = await client.send_code_request(phone, force=False)
+            sent = await client.send_code_request(phone)
         except Exception as exc:  # noqa: BLE001 - the message is useful, the class is not
+            await self._drop(client)
             raise RuntimeError(self._explain(exc)) from None
         self._clients[phone] = client
         return getattr(sent, "phone_code_hash", None) or ""
@@ -74,7 +82,12 @@ class MTProtoLogin:
         except Exception as exc:  # noqa: BLE001
             name = type(exc).__name__
             if "SessionPasswordNeeded" in name:
+                # Keep the connection: the password belongs to this same auth attempt, and a new
+                # client would start the exchange over — which costs a second code.
                 raise NeedsPassword("2FA required") from None
+            # A wrong or expired code is spent; the client is not reusable for this attempt, so it
+            # is closed here rather than left for /cancel to find.
+            await self.discard(phone)
             raise RuntimeError(self._explain(exc)) from None
 
         me = await client.get_me()
@@ -102,11 +115,25 @@ class MTProtoLogin:
             except Exception:  # noqa: BLE001 - nothing to learn from a failed disconnect
                 pass
 
+    async def _drop(self, client: Any) -> None:
+        """Close one connection without letting the close itself become the error."""
+        try:
+            await client.disconnect()
+        except Exception:  # noqa: BLE001 - nothing to learn from a failed disconnect
+            pass
+
     async def _client(self) -> Any:
+        """A connected, throwaway client: this module authenticates and nothing else.
+
+        ``connect()`` is part of building it, not an extra step at each call site. Both the code
+        request and the sign-in need a live connection, and ``sign_in`` is reached without a prior
+        ``send_code`` whenever the process restarted between the two commands — so a client that is
+        merely *constructed* would fail one login in three, in a way that looks like Telegram's fault.
+        """
         from telethon import TelegramClient
         from telethon.sessions import StringSession
 
-        return TelegramClient(
+        client = TelegramClient(
             StringSession(),
             self.api_id,
             self.api_hash,
@@ -118,6 +145,8 @@ class MTProtoLogin:
             connection_retries=1,
             auto_reconnect=False,
         )
+        await client.connect()
+        return client
 
     @staticmethod
     def _explain(exc: Exception) -> str:
@@ -138,6 +167,8 @@ class MTProtoLogin:
             "FloodWaitError": "Telegram is rate-limiting this action",
             "ApiIdInvalidError": "the API id/hash pair is not valid for this account",
             "AuthKeyUnregisteredError": "the session was terminated; log in again",
+            "ConnectionError": "the service could not reach Telegram's servers",
+            "OSError": "the service could not open a connection to Telegram's servers",
         }
         text = hints.get(name, f"login step failed ({name})")
         if seconds:

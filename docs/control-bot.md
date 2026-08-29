@@ -109,6 +109,12 @@ immediately after use, the password is cleared from memory in a `finally`, and
 nothing sensitive is ever included in a reply — every outgoing line is passed
 through a scrubber that removes session-shaped text even inside an error message.
 
+The connection that request runs on belongs to the attempt: it is opened before the
+code is asked for, kept alive only while your code (and 2FA password, if you use
+one) is being typed, and closed when the attempt ends. An abandoned or failed login
+therefore leaves no half-open session on the account and nothing sitting in the
+container's memory — which matters on a free Render instance that restarts on its own.
+
 Then set `APP_MODE=live` in Render. The service reconnects with the stored session
 at boot; if it comes back with `authorized: true`, that is the whole proof.
 
@@ -206,3 +212,9 @@ rely on it as a revocation step.
 * `DATABASE_URL` missing or migrations not applied → the login completes at
   Telegram and then says plainly that it could not store the session. It never
   pretends to have succeeded.
+* A code request that Telegram answers with a rate-limit (`FloodWaitError`) → the
+  reply carries the number of seconds Telegram itself named, and nothing is retried
+  before then. Pushing through that wait is how an account gets restricted further.
+* A write Telegram refuses — a channel this session cannot post in, a peer it has
+  never met — → the job is parked as blocked with that sentence, and `/status` shows
+  it. The queue does not call a silent channel a success.

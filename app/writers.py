@@ -57,6 +57,17 @@ class NeedsInput(FeatureNotImplemented):
     """
 
 
+class WriteBlocked(FeatureNotImplemented):
+    """A write that was supposed to happen, and was not.
+
+    It exists so that a failed send cannot be recorded as a succeeded job: ``_stop`` used to *return*
+    ``{"blocked": True, ...}``, the worker marked the job done, /status went green and the channel stayed
+    silent — the exact shape of failure this project is not allowed to have. Raising the shape
+    ``app/worker.py`` already parks puts the sentence in the blocked column instead. A flood is not this:
+    a flood knows when it ends and arrives as :class:`app.sender.RetryLater`.
+    """
+
+
 #: The two link kinds this pipeline publishes, in the words ``app.storage_link.kind`` stores.
 KIND_SINGLE = "single"
 KIND_BATCH = "batch"
@@ -122,6 +133,12 @@ class Writers:
         A @handle would read nicer in the report, and it is not available for a private channel —
         the id is the one spelling that works for both, and Telegram resolves it from the session's
         own dialog list (which ``/probe`` reads, so an id we have never seen is a ``NeedsInput``).
+
+        The caller has to name the column *this* row uses: a query that renames the channel id to
+        ``source_channel_id`` (the source-side reads do, because the id is joined in) has no
+        ``telegram_channel_id`` to find, and the default would silently hand back an empty peer.
+        ``app/sender.py`` now refuses a write with no peer named, which is what turns that typo into a
+        blocked job with a sentence instead of a forward from nowhere.
         """
         value = row.get(column)
         return str(value) if value not in (None, "") else ""
@@ -140,17 +157,17 @@ class Writers:
     def _stop(result: sender.Result, *, what: str) -> dict[str, Any]:
         """The one place a write that did not happen turns into something the queue can show.
 
-        A *plan* raises, it does not return: a job that "succeeded" while only describing itself would
-        let the ladder walk forward on nothing — the variant would be marked archived, the episode
-        would move to published, and the operator would read a green /status over an empty channel.
-        Blocking is the honest state, and the plan's own sentence is the block's reason, so shadow
-        mode still shows exactly what a live run would send.
+        Neither a plan nor a failure returns: a job that "succeeded" while only describing itself (or
+        while being refused) would let the ladder walk forward on nothing — the variant would be marked
+        archived, the episode would move to published, and the operator would read a green /status over
+        an empty channel. Both raise, and the write's own sentence is the block's reason, so shadow mode
+        still shows exactly what a live run would send and a refused live write says what was refused.
         """
         if result.retry_after:
             raise sender.RetryLater(result.detail, retry_after=result.retry_after)
         if result.action == "planned":
             raise PlanOnly(f"shadow plan, nothing sent: {what}. {result.detail}")
-        return {"blocked": True, "why": result.detail}
+        raise WriteBlocked(f"{what}: {result.detail}")
 
     # -- 1. archive_media ------------------------------------------------------------------------
 
@@ -169,7 +186,7 @@ class Writers:
         variant = await self.db.fetchrow(
             """
             select v.id, v.episode_id, v.quality, v.file_name, v.archive_message_id,
-                   c.message_id as source_message_id, c.source_channel_id,
+                   c.message_id as source_message_id,
                    s.telegram_channel_id as source_channel_id
               from app.media_variant v
               join app.source_candidate c on c.id = v.source_candidate_id
@@ -266,7 +283,7 @@ class Writers:
                 "archive step has to have run for at least one variant first"
             )
 
-        source = self._peer(rows[0])
+        source = self._peer(rows[0], "source_channel_id")
         first, last = int(rows[0]["message_id"]), int(rows[-1]["message_id"])
         writer = self._writer([source, bot], max_writes=4)
 

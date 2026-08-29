@@ -2518,6 +2518,12 @@ class RecordingClient:
         self.calls: list[tuple] = []
         self._replies = list(replies)
 
+    async def get_entity(self, peer):
+        # A live write resolves its peer through the session first (see sender.Sender._target), so the
+        # double answers with the peer it was given and records the lookup.
+        self.calls.append(("entity", str(peer)))
+        return peer
+
     async def send_message(self, peer, text, **kwargs):
         self.calls.append(("send", str(peer), text, kwargs))
         return SimpleNamespace(id=900 + len(self.calls), text=text, out=True, date=None)
@@ -2686,6 +2692,14 @@ def test_the_ladder_writes_the_rows_the_readers_expect(conn, seed, episode):
             assert link[4] == "active"
             assert val(conn, "select status from app.media_variant where id = %s", (rows["variant_id"],)) == "linked"
             assert val(conn, "select count(*) from app.job") >= 1, "the next rung must be queued, not assumed"
+
+            # Both copies are made *from the Telegram channel id*, never from the source_channel row's own
+            # id: those are different numbers, and a forward addressed by the row id names a user that does
+            # not exist. Telethon is also handed the integer form, which is the only form it resolves — the
+            # string "-100999" reads to it as a username to look up.
+            forwards = [c for c in client.calls if c[0] == "forward"]
+            assert [f[3]["from_peer"] for f in forwards] == [-100999, -100999], forwards
+            assert ("entity", "-100999") in [c for c in client.calls if c[0] == "entity"], client.calls
 
             published = await handlers[JobKind.PUBLISH_POST.value](
                 {"payload": {"episode_id": episode, "destination_id": seed["destination_id"]}}, None

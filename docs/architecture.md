@@ -13,9 +13,11 @@ app/
   handlers.py          the registry: reconciliation, ingest_media, thumbnail_screen, plus the eight
                        writers below; DEPENDENCIES says what each kind still waits on
   sender.py            the ONE write path: plan/live, peer allowlist, write budget, audit row,
-                       flood waits turned into a re-queue (no handler sleeps on Telegram's clock)
+                       flood waits turned into a re-queue (no handler sleeps on Telegram's clock),
+                       and a peer cast to the form Telethon resolves before anything is sent
   writers.py           archive, storage handoff, the two link checks, publish, edit, season sticker,
-                       join-request campaign — each refuses what only a human can supply
+                       join-request campaign — each refuses what only a human can supply, and a write
+                       that did not happen parks its job instead of passing it
   normalize.py         filename/caption parsing + the Hindi-eligibility decision
   ingest.py            one message -> candidate, episode and variant rows
   manifest.py          display order, create-vs-edit, season coverage

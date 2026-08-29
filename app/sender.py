@@ -39,6 +39,7 @@ log = logging.getLogger("auto_manager.sender")
 
 __all__ = [
     "FORBIDDEN_METHODS",
+    "resolve_peer",
     "RetryLater",
     "MAX_MESSAGE_CHARS",
     "Result",
@@ -161,6 +162,25 @@ class WritePolicy:
             raise WriteBudget(f"this run may send {self.max_writes} message(s); it has used them")
 
 
+def resolve_peer(peer: Any) -> Any:
+    """Cast a peer to the spelling Telethon resolves.
+
+    Telethon turns the *integer* ``-1001234567890`` into a ``PeerChannel``, and treats the *string*
+    ``"-1001234567890"`` as a username to look up — which fails with "Cannot find any entity
+    corresponding to …". This project reads channel ids out of jsonb config rows and command arguments,
+    where they arrive as text, so the cast happens here, once, at the boundary: a writer can hand a
+    string or an int and both mean the same channel.
+    """
+    if peer is None:
+        return ""
+    text = str(peer).strip()
+    if text.startswith("-") and text[1:].isdigit():
+        return int(text)
+    if text.isdigit():
+        return int(text)
+    return text
+
+
 def _numeric(peer: Any) -> str:
     try:
         return str(int(str(peer).lstrip("@")))
@@ -242,6 +262,8 @@ class Sender:
             )
         if not self.policy.live:
             # The plan is the answer, not an apology: it is what the operator reads before a live day.
+            # A plan names the peer as it was written and resolves nothing — shadow mode must not be
+            # able to fail because a connection is missing, and the two spellings read the same anyway.
             self.journal.append({"action": action, "peer": str(peer), "ok": True, "detail": "planned", "chars": len(text or "")})
             return Result(
                 ok=True,
@@ -250,6 +272,28 @@ class Sender:
                 chars=len(text or ""),
             )
         return None
+
+    async def _target(self, peer: Any) -> tuple[Any, str | None]:
+        """The entity Telethon should be handed, or the reason this session cannot reach it.
+
+        Two jobs, both learned from the way this deployment fails rather than from the docs: cast the
+        id to the one form Telethon resolves (see :func:`resolve_peer`), and resolve it through the
+        session's own entity lookup. The second is what turns "we have never met this channel" into a
+        sentence about the channel instead of a Telethon ValueError deep inside a send — and it is a
+        read, so it costs no write budget and never happens in shadow mode.
+        """
+        target = resolve_peer(peer)
+        if not target:
+            return target, "no peer was named"
+        if not self.policy.live:
+            return target, None
+        try:
+            entity = await self.client.get_entity(target)
+        except Exception as exc:  # noqa: BLE001  (a peer that will not resolve is a blocked job)
+            mapped = _map_error(exc)
+            detail = mapped[1] if mapped else f"{type(exc).__name__}: {str(exc)[:160]}"
+            return target, f"this session cannot see {peer} ({detail})"
+        return entity, None
 
     async def _call(self, action: str, peer: Any, coro: Awaitable[Any], *, text: str, buttons: int = 0) -> Result:
         try:
@@ -351,8 +395,15 @@ class Sender:
             kwargs["reply_to"] = reply_to
         if rows:
             kwargs["buttons"] = rows
+        target, problem = await self._target(peer)
+        if problem is not None:
+            return self._refuse("sent", peer, text, problem)
         return await self._call(
-            "sent", peer, self.client.send_message(peer, text, **kwargs), text=text, buttons=sum(len(r) for r in rows)
+            "sent",
+            peer,
+            self.client.send_message(target, text, **kwargs),
+            text=text,
+            buttons=sum(len(r) for r in rows),
         )
 
     async def edit_text(self, peer: Any, message_id: int, text: str) -> Result:
@@ -368,8 +419,11 @@ class Sender:
         kwargs: dict[str, Any] = {}
         if self.policy.parse_mode:
             kwargs["parse_mode"] = self.policy.parse_mode
+        target, problem = await self._target(peer)
+        if problem is not None:
+            return self._refuse("edited", peer, text, problem)
         return await self._call(
-            "edited", peer, self.client.edit_message(peer, int(message_id), text, **kwargs), text=text
+            "edited", peer, self.client.edit_message(target, int(message_id), text, **kwargs), text=text
         )
 
     async def forward(
@@ -395,10 +449,16 @@ class Sender:
         kwargs: dict[str, Any] = {"from_peer": from_peer}
         if not keep_author:
             kwargs["drop_author"] = True
+        source, source_problem = await self._target(from_peer)
+        destination, destination_problem = await self._target(to_peer)
+        problem = source_problem or destination_problem
+        if problem is not None:
+            return self._refuse("forwarded", to_peer, f"forward {len(ids)} message(s)", problem)
+        kwargs["from_peer"] = source
         return await self._call(
             "forwarded",
             to_peer,
-            self.client.forward_messages(to_peer, ids, **kwargs),
+            self.client.forward_messages(destination, ids, **kwargs),
             text=f"forward {ids}",
         )
 
@@ -418,11 +478,14 @@ class Sender:
         sentence belongs to which bot is `app.storagebot` / `app.linkprovider`'s business, not the
         transport's.
         """
+        target, problem = await self._target(peer)
+        if problem is not None:
+            return Result(ok=False, action="blocked", detail=problem), []
         deadline = time.monotonic() + max(0.0, wait_seconds)
         seen: list[dict[str, Any]] = []
         while True:
             try:
-                async for message in self.client.iter_messages(peer, limit=limit):
+                async for message in self.client.iter_messages(target, limit=limit):
                     seen.append(
                         {
                             "id": int(getattr(message, "id", 0) or 0),
@@ -451,14 +514,17 @@ class Sender:
         last month can still be answered today.
         """
         refused = self._gate("read_requests", peer, "")
+        target, problem = await self._target(peer)
         if refused is not None:
             return refused, []
+        if problem is not None:
+            return Result(ok=False, action="blocked", detail=problem), []
         try:
             from telethon import functions, types  # noqa: PLC0415
 
             found = await self.client(
                 functions.messages.GetChatInviteImportersRequest(
-                    peer=await self.client.get_input_entity(peer),
+                    peer=await self.client.get_input_entity(target),
                     offset_date=None,
                     offset_user=types.InputUserEmpty(),
                     limit=int(limit),
