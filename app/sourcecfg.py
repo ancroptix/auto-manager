@@ -234,8 +234,8 @@ def _channel_id_of(typed: Any, entity: Mapping[str, Any] | None) -> tuple[int | 
     if channel_id is None:
         return None, (
             f"`{typed}` is not a channel I can address. Either its @handle (`@my_channel`) or the number "
-            "Telegram gives it (`-100xxxxxxxxxx`, minus sign and all) — that is the form /status prints "
-            "and the form a t.me link uses."
+            "Telegram gives it (`-100xxxxxxxxxx`, minus sign and all). A private channel's number is in "
+            "any link to a post inside it: `t.me/c/2575861262/5` is channel `-1002575861262`."
         )
     return channel_id, None
 

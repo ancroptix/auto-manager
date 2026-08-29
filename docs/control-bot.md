@@ -22,6 +22,13 @@ That asymmetry is the design, not a gap: the *user session* the bot obtains is w
 does pipeline work, and the bot is only the switchboard. A Bot API token can send
 messages it is given; it has no power over your channels.
 
+Where a choice is genuinely yours, the reply arrives with buttons under it — and **a button is a command
+the bot typed for you**, nothing more. Every `callback_data` in `app/keyboards.py` is a `/command` string
+that goes through the same owner check, the same private-chat check and the same router as the words, so
+tapping `gate → off` is `… gate off` with the typing done. That is what keeps the friendly half of this
+bot from being the wide half: there is no action reachable by a thumb that is not reachable from the
+keyboard, and no button carries a link the operator could be sent to.
+
 There is one more thing it will not do: **`/shutdown` is HTTP-only**
 (`POST /control/shutdown`). A kill switch that can be pressed from a chat window is
 one lost phone away from being pressed by someone else, so the emergency stop stays
@@ -144,7 +151,7 @@ session at boot, if it restarts on its own.
 | `/resume` | claims again on the next poll |
 | `/reconcile` | reclaims expired leases and queues a reconciliation pass |
 | `/probe` | discovery against the storage bot and Channel Help: it opens both from the logged-in account and reads their menus back, and it posts nothing in your channels. But it *does* send, so it refuses to run in shadow mode. To probe without launching the pipeline: `APP_MODE=live` **and** `WORKER_ENABLED=false` in Render, save, `/probe`, then put `WORKER_ENABLED` back — with the worker off no job is claimed, so nothing reaches your channels while the questions are asked. The report is written to this chat, never to a channel |
-| `/source <@handle\|channel id> [series <name>] [audio <kind>] [season <n>]` | what a *files-only* source channel carries, stated once for the whole channel instead of guessed per file. With no arguments it shows what is declared **and what is switched**; `clear` stops assuming. It never re-decides a file that was already decided — parked ones are re-read on the next scan |
+| `/source <@handle\|channel id> [series <name>] [audio <kind>] [season <n>] [title <text>]` | what a *files-only* source channel carries, stated once for the whole channel instead of guessed per file. `title` renames the row itself — what this bot calls it back to you, and, when no series is declared, one of the two signals `app/ingest.py` may read a series name out of (one signal is not two: it never founds a channel on its own). A channel added by number arrives with none, which is why the word exists here at all. With no arguments it shows what is declared **and what is switched**; `clear` stops assuming. It never re-decides a file that was already decided — parked ones are re-read on the next scan |
 | `/source <@handle\|channel id> add [series <name>] [title <text>]` | start watching that channel: the row in `app.source_channel` is written here, with its defaults printed back. Its own verb on purpose — a row is the decision to read a channel, so no other command makes one, and a lookup that finds nothing says `add` instead of naming a table |
 | `/source <channel> gate\|subs\|watch on\|off` | the three switches whose columns production code reads: `gate` is `require_hindi_audio`, `subs` is `include_subbed`, `watch` is `mode` (`on` is `full`, `off` is `ignore`). One column per command, and the same words switch it back |
 | `/archive [<@handle\|channel id> add [title <name>]]` | which private channel holds the master copy: bare `/archive` reads the list, `add` writes the missing row the archive job blocks on. The first row added is `is_primary`, because two primaries would make `app/writers.py` pick between them |
@@ -235,6 +242,14 @@ than by intent:
 
 The dashboard still works, and is still the only way to set a column with no switch. What changed is that
 it stopped being the first step.
+
+And the switches come as buttons now, under the message that explains them: `gate → off`, `subs → on`,
+`watch → off`, one per `sourcecfg.TOGGLES` entry, each carrying the exact `on`/`off` command it stands
+for. A label names the state the press *writes*, never the state it found, because a button that renames
+itself under the thumb is a button whose second press does the opposite of what the first appeared to
+promise. A `callback_data` longer than Telegram's 64 bytes drops the **button**, not the message: no
+keyboard is readable, and a truncated command is a different command. `/joinmsg options` puts the three
+drafts on one row for the same reason — a choice that takes typing is a choice that gets skipped.
 
 ## 4. Closing the door afterwards
 

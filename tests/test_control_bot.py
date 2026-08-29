@@ -44,6 +44,9 @@ class FakeApi:
     deleted: list[tuple[int, tuple[int, ...]]] = field(default_factory=list)
     callbacks: list[tuple[str, str]] = field(default_factory=list)
     updates: list[dict[str, Any]] = field(default_factory=list)
+    #: What each send carried as `reply_markup`, in order: a test for a button is a test that the
+    #: button exists *and* that it says the command the operator would otherwise have typed.
+    markups: list[Any] = field(default_factory=list)
     _offset: int = 0
     poll_error: Exception | None = None
 
@@ -58,8 +61,11 @@ class FakeApi:
             self._offset = max(self._offset, int(raw["update_id"]))
         return [parse_update(raw) for raw in pending]
 
-    async def send(self, chat_id: int, text: str, *, reply_to=None, parse_mode=None) -> int:
+    async def send(
+        self, chat_id: int, text: str, *, reply_to=None, parse_mode=None, markup=None
+    ) -> int:
         self.sent.append((chat_id, text))
+        self.markups.append(markup)
         return 500 + len(self.sent)
 
     async def delete(self, chat_id: int, *message_ids: int | None) -> int:
@@ -2186,3 +2192,147 @@ async def test_a_handle_is_never_written_as_a_row_with_a_guessed_number() -> Non
     (archive,) = await say(control, '/archive @bleach_master add title "Master"')
     assert "cannot write an archive row" in archive
     assert db.archive_channels == []
+
+
+# --------------------------------------------------------------------------- buttons
+# A button is a command typed for the operator. These three tests are the whole claim: the payload a
+# tap sends is the payload the router already serves, the write is the same write, and a stranger
+# pressing the same button gets exactly what a stranger typing it gets — nothing.
+
+
+def _press(api, data: str):
+    """The raw `callback_query` Telegram would send when the operator taps that button."""
+    return {
+        "update_id": 900 + len(api.sent),
+        "callback_query": {
+            "id": "cb-1",
+            "from": {"id": OWNER},
+            "message": {"message_id": 12, "chat": {"id": OWNER}},
+            "data": data,
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_tapping_a_switch_button_writes_what_typing_the_words_writes() -> None:
+    """The equivalence the module's docstring promises, checked on the row rather than on the label."""
+    from app import keyboards
+
+    typed_db = FakeDb()
+    typed_db.source_channels[0]["require_hindi_audio"] = True
+    typed, _api, _db = bot(db=typed_db)
+    await say(typed, "/source @anime_uploads4u gate off")
+
+    pressed_db = FakeDb()
+    pressed_db.source_channels[0]["require_hindi_audio"] = True
+    pressed, api, _db = bot(db=pressed_db)
+    payload = keyboards.source_switches("@anime_uploads4u", pressed_db.source_channels[0])
+    gate = next(one for one in payload["inline_keyboard"][0] if "gate" in one["text"])
+    replies = await pressed.handle(parse_update(_press(api, gate["callback_data"])))
+
+    assert gate["callback_data"] == "/source @anime_uploads4u gate off"
+    assert pressed_db.source_channels[0]["require_hindi_audio"] is False
+    assert typed_db.source_channels[0] == pressed_db.source_channels[0], "the same row state, either way"
+    assert "switched" in replies[0].text and replies[0].markup, "and the fresh buttons come with it"
+
+
+@pytest.mark.asyncio
+async def test_the_summary_under_a_source_reply_offers_the_three_switches() -> None:
+    """`/source <channel>` used to be a wall of text about flags. Now the flags are the reply."""
+    control, api, _db = bot()
+    (reply,) = await control.handle(update("/source @anime_uploads4u"))
+    rows = reply.markup["inline_keyboard"]
+    assert [row[0]["text"].split(" ")[0] for row in rows] == ["gate", "subs", "watch"]
+    assert all(row[0]["callback_data"].startswith("/source @anime_uploads4u ") for row in rows)
+
+    # The keyboard only means anything if it reaches the transport — a `Reply.markup` that the send loop
+    # drops is a test that passes and a bot with no buttons.
+    await control.dispatch(parse_update(_press(api, rows[1][0]["callback_data"])))
+    sent = [one for one in api.markups if one]
+    assert sent, "dispatch passed a keyboard to the transport"
+    assert [row[0]["text"].split(" ")[0] for row in sent[-1]["inline_keyboard"]] == [
+        "gate",
+        "subs",
+        "watch",
+    ], "and the screen after the press offers the switches again"
+
+
+@pytest.mark.asyncio
+async def test_a_stranger_cannot_press_a_button_that_was_shown_to_the_owner() -> None:
+    from app import keyboards
+
+    control, api, db = bot()
+    payload = keyboards.source_switches("@anime_uploads4u", db.source_channels[0])
+    data = payload["inline_keyboard"][0][0]["callback_data"]
+    raw = {
+        "update_id": 901,
+        "callback_query": {
+            "id": "cb-x",
+            "from": {"id": STRANGER},
+            "message": {"message_id": 12, "chat": {"id": STRANGER}},
+            "data": data,
+        },
+    }
+    parsed = parse_update(raw)
+    assert parsed is not None
+
+    assert await control.handle(parsed) == [], "the same gate, whichever way the text arrived"
+    assert "require_hindi_audio" not in db.source_channels[0] or db.source_channels[0][
+        "require_hindi_audio"
+    ] is not False, "and the flag never moved"
+    assert db.writes == []
+
+
+@pytest.mark.asyncio
+async def test_the_keyboard_travels_as_an_object_on_the_first_part_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """What the transport may put in the body, learned from the shape of the call.
+
+    `_call` posts JSON. Telegram accepts a JSON-*string* keyboard only in a form-encoded body, so the
+    tempting `json.dumps(markup)` here answers with a 400 about a wrong inline keyboard — a button that
+    works in every test and fails on the wire. And a keyboard repeated on all three parts of a split
+    report would be the same tap offered three times under two thirds of a message.
+    """
+    from app.botapi import BotApi as _BotApi
+
+    api = _BotApi(TOKEN)
+    calls: list[dict[str, Any]] = []
+
+    async def fake_call(method: str, **kwargs: Any) -> dict[str, Any]:
+        calls.append({"method": method, **kwargs})
+        return {"result": {"message_id": len(calls)}}
+
+    monkeypatch.setattr(api, "_call", fake_call)
+    keyboard = {"inline_keyboard": [[{"text": "gate → off", "callback_data": "/source @c gate off"}]]}
+
+    await api.send(OWNER, "the screen\\n" + ("y" * 5000), markup=keyboard)
+    assert [call["method"] for call in calls] == ["sendMessage"] * 2
+    assert calls[0]["reply_markup"] == keyboard and isinstance(calls[0]["reply_markup"], dict)
+    assert not isinstance(calls[0]["reply_markup"], str), "not JSON-encoded: this body is already JSON"
+    assert "reply_markup" not in calls[1], "one keyboard per screen, on the part the operator reads"
+
+    calls.clear()
+    await api.send(OWNER, "no buttons here")
+    assert "reply_markup" not in calls[0], "a plain reply must not carry an empty keyboard"
+
+
+@pytest.mark.asyncio
+async def test_a_channel_added_by_number_can_be_named_afterwards() -> None:
+    """`add` is the only command that writes a row, and a row is the only place a title can live.
+
+    Without `title` the operator's one unnamed channel had to go back to the dashboard to fix a label —
+    the exact trip this half of the bot exists to end — and `/status` would print `-1002575861262` where
+    a name goes.
+    """
+    db = FakeDb()
+    control, _api, _db = bot(db=db)
+    (text,) = await say(control, "/source @anime_uploads4u title Bleach in Hindi")
+
+    assert db.source_channels[0]["title"] == "Bleach in Hindi"
+    assert "declarations updated" in text, "a write says it wrote"
+    (shown,) = await say(control, "/source @anime_uploads4u")
+    assert "Bleach in Hindi" in shown, "and the row is called that from now on"
+
+    (missing,) = await say(control, "/source @anime_uploads4u title")
+    assert "`title` needs a value" in missing and db.source_channels[0]["title"] == "Bleach in Hindi"

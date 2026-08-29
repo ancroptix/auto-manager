@@ -830,3 +830,62 @@ class TestWhatTheReportCounts:
         assert _brief("short", 34) == "short"
         assert _brief("  spaced   out  text ", 200) == "spaced out text"
         assert _brief(None, 10) == ""
+
+
+def test_a_channel_seen_by_number_is_not_also_reported_as_invisible() -> None:
+    """Two lines of one report used to contradict each other, and the operator believed the wrong one.
+
+    `/source -1002575861262 add` writes a row with no @handle — a private channel has none to copy. The
+    rights read matched it by the marked number and wrote `we_are_admin`; the "not visible" line above it
+    matched on @handle only, so it named the same channel as missing. The report therefore said, in two
+    consecutive sentences, that it had just read a channel it could not see. The operator read that as a
+    wrong id and went to check a number that was right.
+    """
+    from app.probe import _Run, format_report, probe_account
+
+    class Dialog:
+        def __init__(self, entity: Any) -> None:
+            self.entity = entity
+
+    class Private:
+        id = 2575861262
+        title = "Bleach raw uploads"
+        username = None
+        creator = False
+        left = False
+        participants_count = 5
+        broadcast = True
+        admin_rights = None
+
+    class OnlyPrivate(FakeClient):
+        def iter_dialogs(self):
+            async def gen():
+                yield Dialog(Private())
+
+            return gen()
+
+    expected = [{"id": 7, "username": None, "telegram_channel_id": -1002575861262, "we_are_admin": None}]
+    account = run(probe_account(OnlyPrivate(), policy=policy(), run=_Run(), expected=expected))
+
+    assert account["missing_channels"] == [], "it was seen — by number, which is the only key it has"
+    assert [entry["source_channel_id"] for entry in account["rights"]["updates"]] == [7]
+    assert account["rights"]["unseen"] == []
+    # `record`'s own counts are what the line prints, so the fake report carries them the way a run does.
+    text = format_report(
+        {
+            "account": {**account, "id": 555, "username": "u"},
+            "rights_recorded": {"considered": 1, "written": 1},
+            "storage_bot": {},
+            "channel_help": {},
+        }
+    )
+    assert "NOT visible" not in text, text
+    assert "rights read for 1 configured channel(s), 1 changed" in text
+
+    # The other half of the same rule: a row that really cannot be seen is still named, once.
+    missing = run(
+        probe_account(
+            OnlyPrivate(), policy=policy(), run=_Run(), expected=[{"id": 8, "username": None, "telegram_channel_id": -100999}]
+        )
+    )
+    assert [entry["want"] for entry in missing["missing_channels"]] == ["-100999"]

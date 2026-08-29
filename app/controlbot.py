@@ -38,7 +38,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from . import sourcecfg
+from . import keyboards, sourcecfg
 from .botapi import BotApi, Update
 from .sessions import forget as forget_session
 from .sessions import list_sessions, mask_phone, scrub, store as store_session, valid_name
@@ -88,7 +88,8 @@ login (needs BOT_ALLOW_LOGIN=1)
 /cancel                            drop the pending attempt
 
 After /login or /pause you can also just reply with what I asked for, without a
-command.
+command. Where a choice is yours, the reply arrives with buttons under it — a tap is
+the same command, typed for you, and it changes exactly what the label says.
 
 This bot answers you and nobody else. It cannot read, post or delete anything in
 your channels — the user session it logs in does the pipeline work."""
@@ -191,6 +192,12 @@ class Reply:
 
     text: str
     delete_prompt_too: bool = False
+    #: An inline keyboard, built by `app/keyboards.py` — and every button in it is a command string this
+    #: same bot would accept typed. That identity is the safety property, not a convenience: the owner
+    #: check, the private-chat check and the router all run on the text, so a tap can never reach an
+    #: action the words could not. None means "no buttons", which is what every reply that has no
+    #: `app/config.py`-style choice to offer sends.
+    markup: dict[str, Any] | None = None
 
 
 @dataclass
@@ -522,7 +529,9 @@ class ControlBot:
         if action in {"show", "options"}:
             current = await self.db.config(joinmsg.CONFIG_KEY, "") if self.db is not None else ""
             if action == "options":
-                return [Reply(joinmsg.options_text(current))]
+                # Three drafts, and now three buttons: the wording is the operator's choice either way,
+                # and a tap on a phone is the difference between picking a message and not bothering.
+                return [Reply(joinmsg.options_text(current), markup=keyboards.joinmsg_choices())]
             note = joinmsg.status_note(current)
             body = " ".join(str(current or "").split())
             if not body:
@@ -796,11 +805,11 @@ class ControlBot:
                     )]
                 index += 2
                 continue
-            if key not in keys:
+            if key not in keys and key != "title":
                 return [
                     Reply(
-                        f"I only take {', '.join(keys)}, {' / '.join(sourcecfg.TOGGLES)} or clear after "
-                        f"the channel — not `{tokens[index]}`.\n{self._SOURCE_USAGE}"
+                        f"I only take {', '.join(keys)}, title, {' / '.join(sourcecfg.TOGGLES)} or clear "
+                        f"after the channel — not `{tokens[index]}`.\n{self._SOURCE_USAGE}"
                     )
                 ]
             pieces: list[str] = []
@@ -832,6 +841,18 @@ class ControlBot:
         if problems:
             return [Reply(problems)]
 
+        # `title` is not a declaration and does not live in a `declared_*` column: it is the row's own
+        # name, the one `/status` prints. It is offered after `add` because `add` refuses to write a
+        # second row for a channel that has one — and a channel added by number arrives with no title at
+        # all, so without this verb the only way to name it would be the dashboard this command exists
+        # to keep people out of.
+        titled = wanted.pop("title", None)
+        if titled is not None:
+            await self.db.execute(
+                "update app.source_channel set title = $2, updated_at = now() where id = $1",
+                int(channel["id"]),
+                str(titled).strip()[:120] or None,
+            )
         if wanted:
             columns = [name for name in keys if name in wanted]
             sets = ", ".join(f"declared_{name} = ${position + 2}" for position, name in enumerate(columns))
@@ -845,14 +866,21 @@ class ControlBot:
         for toggle, state in flips.values():
             await sourcecfg.set_flag(self.db, int(channel["id"]), toggle, state)
             flipped.append(f"  {toggle.name}: {toggle.on_text if state else toggle.off_text}")
-        summary = self._source_summary(channel, wanted)
+        # The title is folded back in only for the reply, so the header can say what was updated: it
+        # reads as an unchanged screen otherwise, and "nothing happened" is the wrong thing to conclude
+        # from a command that did write.
+        summary = self._source_summary(channel, dict(wanted, title=titled) if titled else wanted)
         if flipped:
             summary += "\n\nswitched:\n" + "\n".join(flipped) + "\n"
             summary += (
                 "each one wrote a single column of that row, and the same words switch it back. the "
                 "file messages themselves were not touched, so nothing that already went out changes."
             )
-        return [Reply(summary)]
+        # The buttons carry the words, so this line and a tap are the same command by construction.
+        # `channel` is the row as it read *before* the write, and that is deliberate: the labels say
+        # where each switch would go from what the operator was just shown, and the fresh state arrives
+        # with the next reply.
+        return [Reply(summary, markup=keyboards.source_switches(handle, channel))]
 
     async def _source_add(self, handle: str, rest: list[str]) -> list[Reply]:
         """Create the source-channel row the operator used to be sent to a dashboard for.
@@ -895,7 +923,8 @@ class ControlBot:
                 "adding it twice would only put two sources in front of the same files.\n\n"
                 f"{sourcecfg.flags_line(row)}\n\n"
                 f"to change any of that: /source {handle} <name> on|off, or /source {handle} "
-                "series <name> to declare what it carries."
+                "series <name> to declare what it carries. the switches are under this message too.",
+                markup=keyboards.source_switches(handle, row),
             )]
 
         entity, problem = await self._resolve_channel_entity(handle)
@@ -922,7 +951,9 @@ class ControlBot:
         return [Reply(
             f"watching it (row {new_id}).\n\n{sourcecfg.render_plan(plan)}\n\n"
             "next, if you want the rest of the pipeline: /source "
-            f"{handle} series <name> audio <kind>, and /status shows the queue it lands in."
+            f"{handle} series <name> audio <kind>, and /status shows the queue it lands in.\n"
+            "or tap a switch below — a tap is the same command, typed for you.",
+            markup=keyboards.source_switches(handle, plan),
         )]
 
     async def _resolve_channel_entity(self, handle: str) -> tuple[dict | None, str | None]:
@@ -951,6 +982,7 @@ class ControlBot:
             return None, checked
         return checked, None
 
+    # `title` is parsed with these words but is not one of them: it writes `title`, not `declared_title`.
     _SOURCE_KEYS = ("series", "audio", "season")
     _SOURCE_USAGE = (
         "usage: /source <@handle or channel id> [series <name>] [audio <kind>] [season <n>]\n"
@@ -960,6 +992,9 @@ class ControlBot:
         "  /source @anime_uploads4u season 2      (a numbering default, never a season claim)\n"
         "  /source @anime_uploads4u               (show what is declared and what is switched)\n"
         "  /source @anime_uploads4u gate off      (switches: gate, subs, watch — each on or off)\n"
+        "  /source @anime_uploads4u title Bleach HQ   (what this bot calls the row, and one series\n"
+        "                                        "
+        "signal when no series is declared)\n"
         "  /source @anime_uploads4u clear         (stop assuming anything)\n\n"
         "audio is one of: hindi, dual, multi, subbed, subbed_only, unknown.\n"
         "the switches write the three columns this program reads: gate is require_hindi_audio, "
@@ -1861,7 +1896,9 @@ class ControlBot:
                 f"I cannot write an archive row for `{handle}` yet: {problem}\n"
                 "the channel number is the only thing that addresses a *private* channel, and a "
                 "@handle that Telegram will not resolve leaves me guessing. send the -100xxxxxxxxxx "
-                "number instead — /status prints it for a channel the session can see."
+                "number instead. For a private channel that number is the `c/<digits>` part of any of its "
+                "message links (`t.me/c/2575861262/5` is channel -1002575861262), which is how "
+                "Telegram marks it everywhere else too."
             )]
         plan = sourcecfg.plan_archive(handle, entity=entity, title=title, primary=not rows)
         if isinstance(plan, str):
@@ -1886,7 +1923,7 @@ class ControlBot:
             )]
         return [Reply(
             f"archive row {new_id} written.\n\n{sourcecfg.render_archive_plan(plan)}\n\n"
-            "the archive job reads this row on its next run; /status will stop naming it as missing. "
+            "the archive job reads this row on its next run. "
             "Nothing was copied or deleted by writing it — the first copy is a job, and jobs only run "
             "when the worker is enabled."
         )]
@@ -1942,6 +1979,10 @@ class ControlBot:
             if not text:
                 return "an empty series name would put us back to guessing from the channel title."
             wanted["series"] = text
+        if "title" in wanted and wanted["title"] is not None:
+            # Normalised here and truncated where it is written, because the same column is filled from
+            # `add` too, and one of those two places deciding the rule is how they drift.
+            wanted["title"] = str(wanted["title"]).strip()
         if "audio" in wanted and wanted["audio"] is not None:
             try:
                 declared_audio_kind(str(wanted["audio"]))
@@ -2317,7 +2358,9 @@ class ControlBot:
                 )
             ]
         for reply in replies:
-            await self.api.send(update.chat_id, scrub(reply.text, *self._live_secrets()))
+            await self.api.send(
+                update.chat_id, scrub(reply.text, *self._live_secrets()), markup=reply.markup
+            )
             if self.delete_sensitive and reply.delete_prompt_too and update.message_id:
                 # The spent secret goes; the reply above it stays.
                 await self.api.delete(update.chat_id, update.message_id)

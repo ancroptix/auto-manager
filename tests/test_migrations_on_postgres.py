@@ -1733,7 +1733,7 @@ def test_control_bot_login_writes_one_usable_row(conn) -> None:
         async def get_me(self):
             return {"id": 1, "username": "ctrl"}
 
-        async def send(self, chat_id, text, *, reply_to=None, parse_mode=None):
+        async def send(self, chat_id, text, *, reply_to=None, parse_mode=None, markup=None):
             self.sent.append(text)
             return 5
 
@@ -2193,7 +2193,7 @@ def test_in_place_captioning_changes_the_caption_not_the_gate_and_the_plan_is_th
     db = Database(_ingest_settings())
 
     class Api:
-        async def send(self, chat_id, text, *, reply_to=None, parse_mode=None):
+        async def send(self, chat_id, text, *, reply_to=None, parse_mode=None, markup=None):
             return 1
 
         async def delete(self, chat_id, *message_ids):

@@ -469,15 +469,17 @@ async def probe_account(
 
     out["dialog_count"] = len(dialogs)
     out["owned_channels"] = [d["title"] for d in dialogs if d["mine"]][:12]
-    out["missing_channels"] = [
-        {"want": row.get("username") or row.get("telegram_channel_id")}
-        for row in expected
-        if str(row.get("username") or "").lstrip("@").casefold() not in by_username
-    ][:12]
     out["top_dialogs"] = [d for d in dialogs[:10]]
     # Rights are read here rather than in a second pass because the dialog walk is the expensive
     # part, and a second walk would be a second chance for the answer to differ from the first.
-    out["rights"] = channel_rights.plan(dialogs, expected)
+    planned = channel_rights.plan(dialogs, expected)
+    out["rights"] = planned
+    # One matching rule, used for both lines. `missing_channels` used to compare @handles against the
+    # dialogs on its own, while `plan` above matches by handle *or* by the marked channel number — so a
+    # row with no @handle, which is every channel added by number with `/source … add` and every private
+    # channel, appeared in the report as "configured but NOT visible" underneath the very line saying
+    # its rights had just been read. The operator read that as a wrong id. It was a wrong sentence.
+    out["missing_channels"] = [{"want": name} for name in list(planned.get("unseen") or [])][:12]
     run.record("account", dialog_count=len(dialogs), owned=len(out["owned_channels"]))
     return out
 

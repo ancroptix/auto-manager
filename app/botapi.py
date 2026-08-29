@@ -1,8 +1,9 @@
 """A minimal Telegram Bot API client, over plain HTTPS.
 
-Why not Telethon for this part: the bot needs sendMessage/getUpdates/deleteMessage
-and nothing else, and a Bot-API token is not a user session. Using MTProto here
-would mean booting a full client (and every method it exposes) for three calls —
+Why not Telethon for this part: the bot needs sendMessage/getUpdates/deleteMessage/
+answerCallbackQuery and nothing else, and a Bot-API token is not a user session. Using
+MTProto here would mean booting a full client (and every method it exposes) for four
+calls —
 `app/probe.py` shows how carefully a raw client has to be fenced.
 
 Three properties are baked in:
@@ -12,8 +13,11 @@ Three properties are baked in:
   through :func:`redact`;
 * long polling with a bounded timeout, so a wedged connection cannot stall the
   service's startup;
-* no `sendFile`-style helper exists at all. A control bot that can only send text
-  cannot be tricked into leaking a file from the server it runs on.
+* no `sendFile`-style helper exists at all. A control bot that can send text and an
+  inline keyboard of its own commands cannot be tricked into leaking a file from the
+  server it runs on — and the keyboard is capped that way on purpose: every button
+  carries a command string this same bot accepts typed, so it opens no new action
+  (`app/keyboards.py` builds them, and its tests say so).
 """
 
 from __future__ import annotations
@@ -215,23 +219,35 @@ class BotApi:
         *,
         reply_to: int | None = None,
         parse_mode: str | None = None,
+        markup: dict[str, Any] | None = None,
     ) -> int | None:
         """Send text, in as many messages as Telegram's limit needs.
 
         The reply-to id of the *first* part is what comes back, so a caller that deletes its own prompt
         (the login flow) still deletes the message it asked about. Those prompts are a line or two long
         and never split; an answer that does split is a report nobody is deleting.
+
+        ``markup`` is an inline keyboard, and it goes on the first part only. A button block repeated on
+        every piece of a split report would be the same tap offered three times with no third of a
+        message to act on, and the caller that builds a keyboard builds it for the screen the operator
+        reads first.
         """
         first: int | None = None
         for part in split_for_chat(text):
-            data = await self._call(
-                "sendMessage",
-                chat_id=chat_id,
-                text=part,
-                disable_web_page_preview=True,
-                reply_to_message_id=reply_to if first is None else None,
-                parse_mode=parse_mode,
-            )
+            payload: dict[str, Any] = {
+                "chat_id": chat_id,
+                "text": part,
+                "disable_web_page_preview": True,
+                "reply_to_message_id": reply_to if first is None else None,
+                "parse_mode": parse_mode,
+            }
+            if markup and first is None:
+                # The object, not a JSON string. `_call` posts `json=`, and Telegram accepts a
+                # JSON-serialized keyboard only in a *form-encoded* body: in a JSON body a string there
+                # is a 400 about a wrong inline keyboard, so the string form is the one shape that
+                # cannot work here.
+                payload["reply_markup"] = markup
+            data = await self._call("sendMessage", **payload)
             message_id = (data.get("result") or {}).get("message_id")
             if first is None:
                 first = message_id
