@@ -210,15 +210,24 @@ and the probe becomes a confirmation rather than a requirement.
 
 ## Then, and only then
 
-1. `APP_MODE=live` in Render, save.
-2. UptimeRobot (free) → a 5-minute HTTP monitor on
+1. `APP_MODE=live` **and** `WORKER_ENABLED=false` in Render, saved together. Deliberately
+   both: `APP_MODE=live` is what permits any Telegram send at all, and the worker is what
+   claims jobs and posts them. Flipping the mode alone opens the send path *and* starts
+   the queue in the same restart, which is how "let me just check the bots" turns into
+   announcements going out. With the worker off, nothing is claimed.
+2. `/probe` in the control bot chat, and read what it reports. That is the authenticated
+   run the storage bot's command protocol and the season-sticker mapping have been waiting
+   on (`docs/architecture.md` names them as the two unknowns).
+3. `WORKER_ENABLED=true` in Render, save. The queue starts claiming, and the first run of
+   every job kind is still a plan until you say otherwise.
+4. UptimeRobot (free) → a 5-minute HTTP monitor on
    `https://<your-render-service>.onrender.com/health`. Render's free tier sleeps after
    15 idle minutes; the worker is a background loop with no traffic of its own, so
    without a pinger it sleeps mid-job. Note the arithmetic: pinging 24/7 burns ~744 of
    your 750 instance-hours a month, which is the whole free allowance. That is a choice
    you made when you picked the free tier, and it is worth knowing the ceiling is that
    close.
-3. Tell me the two user IDs and paste the probe report, and I will finish the handlers.
+5. Tell me what the report said, and paste the two user IDs, and I will finish the handlers.
 
 ## What is deliberately *not* here
 

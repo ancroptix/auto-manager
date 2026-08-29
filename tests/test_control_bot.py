@@ -1834,3 +1834,34 @@ async def test_a_login_that_cannot_be_stored_is_not_reported_as_a_bad_code() -> 
     assert control.pending == {}, "the flow closes: there is nothing left to retry here"
     assert db.stored == []
     assert 44 in [mid for _, ids in api.deleted for mid in ids], "the spent code still goes"
+
+
+@pytest.mark.asyncio
+async def test_the_probe_refusal_teaches_the_safe_order_instead_of_naming_a_mode() -> None:
+    """"Set APP_MODE=live" alone is a trap, because going live also starts the queue.
+
+    The operator wants to check the two bots *before* trusting this service with their channels, and the
+    probe is the only way to do that. So the refusal has to carry the half that makes the answer safe —
+    the worker switch — rather than send them to flip a mode and watch announcements start.
+    """
+    shadow, _, _ = bot()
+    (text,) = await say(shadow, "/probe")
+    assert "needs a live user session" in text, "the pinned wording: it is the session that is missing"
+    assert "APP_MODE=live" in text and "WORKER_ENABLED=false" in text, text
+    assert "nothing can reach your channels" in text, "the sentence that says why the second half matters"
+    assert "does send" in text or "It opens the two bots" in text, "the probe is not a free read"
+
+    # The other sentence is for a deployment whose session source moved after boot: live, keys
+    # present, nothing left to send from. Settings refuse to start that way, so it can only arrive by
+    # the environment changing underneath a running service -- which is exactly when a bare "set
+    # APP_MODE=live" would send the operator in circles.
+    moved, _, _ = bot()
+    from app.config import AppMode
+
+    moved.settings.mode = AppMode.LIVE
+    moved.settings.telegram_session_source = "env"
+    moved.settings.telegram_session_string = None
+    (text2,) = await say(moved, "/probe")
+    assert "needs an open user session" in text2, text2
+    assert "WORKER_ENABLED" not in text2, "no advice about the queue when the queue is not the problem"
+    assert "/status" in text2, "it must still point at the one thing that can answer which half moved"

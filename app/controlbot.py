@@ -434,12 +434,7 @@ class ControlBot:
 
     async def _probe(self, update: Update, args: list[str]) -> list[Reply]:
         if not self.settings.outbound_enabled:
-            return [
-                Reply(
-                    "the probe needs a live user session (APP_MODE=live plus a session string "
-                    "or a stored session). /status shows which is missing."
-                )
-            ]
+            return [Reply(self._probe_gate_reply())]
         if self.background is None:
             return [Reply("probe is not wired in this build")]
         self.background(self._probe_task(update.chat_id))
@@ -449,6 +444,37 @@ class ControlBot:
                 "when it finishes (usually under two minutes)."
             )
         ]
+
+    def _probe_gate_reply(self) -> str:
+        """Name the one thing standing between the operator and a probe, and what a probe costs.
+
+        The probe is the check they want to run *before* trusting the service with their channels, and it
+        is the one read that cannot happen in shadow mode: it sends ``/start`` to the storage bot and to
+        Channel Help from the logged-in account, and app/probe.py owns that policy alone. Saying only
+        "go live" would push them to flip the mode, and flipping the mode starts the queue -- so the
+        refusal carries the half that makes the flip safe. Everything else about a missing session is
+        already refused at boot (``app/config.py``), so the second sentence is the rare one and stays short:
+        a live session whose source moved after boot is reported by name, not diagnosed further.
+        """
+        if self.settings.mode.value != "live":
+            return (
+                "the probe needs a live user session, and only the mode is in the way: this service is "
+                "running in shadow mode, where nothing is sent to Telegram at all.\n\n"
+                "A probe does send. It opens the two bots from the logged-in account and reads their "
+                "menus back, which is why it waits for live mode -- and live mode also starts the job "
+                "queue. So change both halves together in Render:\n"
+                "APP_MODE=live\n"
+                "WORKER_ENABLED=false\n\n"
+                "save, wait for the restart, then send /probe. With the worker off no job is claimed, so "
+                "nothing can reach your channels while the questions are being asked. When the report is "
+                "in your hands, set WORKER_ENABLED back to true.\n\n"
+                "/status shows what the service can see right now."
+            )
+        return (
+            "the probe needs an open user session and cannot get one from this deployment: it sends from "
+            "the logged-in account, so the auth information and a session to use both have to be in place. "
+            "/status names which one is missing, and nothing was sent to the bots."
+        )
 
     async def _probe_task(self, chat_id: int) -> None:
         from .telegram_client import probe_once
