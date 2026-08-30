@@ -104,6 +104,10 @@ the job that needs it, so `/status` names the missing thing rather than a stack 
 3. **`/card <destination> <message id>`**, once per destination channel — the post that gets forwarded
    to the link bot so the announcement carries its shareable link. No card, no announcement; the
    invite link never goes out on its own.
+
+   The destination *row* is no longer yours to insert by hand: `/discover` (or the menu's
+   `🔎 Find channels`) files a channel your own account administers as the destination of the series its
+   name names. The message number is still yours, because only you know which post to forward.
 4. **`/sticker <series> <season> from <channel> <message id>`**, per season, if you want a sticker to
    open it. Nothing here decides which sticker means "season 2".
 5. **`publish.route`.** Leave it at `chelp_block` and every destination post is prepared for Channel

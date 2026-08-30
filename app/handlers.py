@@ -27,6 +27,7 @@ from typing import Any, Awaitable, Callable, Mapping
 
 from . import ingest, storagebot, thumbnails
 from .db import Database
+from . import discover
 from .keys import archive_key
 from .stages import JobKind, JobStage
 from .writers import FeatureNotImplemented, NeedsInput, build_writers
@@ -141,7 +142,36 @@ async def reconciliation(job: dict[str, Any], ctx: Context) -> dict[str, Any]:
     )
     health = await ctx.db.queue_health() or {}
     log.info("reconciliation: reclaimed %s stale lease(s), queue=%s", reclaimed, health)
-    return {"reclaimed_locks": reclaimed, "queue": {k: int(v or 0) for k, v in health.items()}}
+    result: dict[str, Any] = {
+        "reclaimed_locks": reclaimed,
+        "queue": {k: int(v or 0) for k, v in health.items()},
+    }
+    # The role sweep, and the reason it hangs off *this* job: reconciliation already runs at boot and
+    # periodically after it, it is the one job whose whole meaning is "look at the world again", and a new
+    # job kind would need a queue enum value for a check that costs one dialog walk. `discover.auto` is
+    # off by default, so nothing here happens until the operator says it may.
+    try:
+        if bool(await ctx.db.config(discover.AUTO_KEY, False)) and ctx.telegram is not None:
+            from .probe import collect_dialogs  # noqa: PLC0415  (the walk lives with the probe that owns it)
+
+            entries = await collect_dialogs(ctx.telegram)
+            swept = await discover.sweep(ctx.db, entries, auto=True)
+            flipped = [one for one in swept["flips"] if one.get("applied")]
+            result["discover"] = {
+                "read": len(entries),
+                "switched": len(flipped),
+                "rights_written": int((swept.get("rights") or {}).get("written") or 0),
+            }
+            for one in flipped:
+                log.info(
+                    "reconciliation: %s stopped being read as a source — %s",
+                    one.get("title") or one.get("row_id"),
+                    one.get("why"),
+                )
+    except Exception as exc:  # noqa: BLE001 - a sweep that fails must not fail the reconciliation
+        log.warning("reconciliation: channel roles could not be re-read (%s)", str(exc)[:160])
+        result["discover"] = {"error": f"{type(exc).__name__}: {str(exc)[:160]}"}
+    return result
 
 
 async def ingest_media(job: dict[str, Any], ctx: Context) -> dict[str, Any]:

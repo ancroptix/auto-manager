@@ -71,6 +71,7 @@ __all__ = [
     "render",
     "row_payload",
     "source_screen",
+    "discover_screen",
     "sources_screen",
     "TABLES",
     "row_ref",
@@ -82,7 +83,7 @@ __all__ = [
 #: fails if the two lists ever disagree in either direction, because a screen nobody can reach is dead code
 #: and a button that leads nowhere is a 404 in a chat window.
 NAV: frozenset[str] = frozenset(
-    {"main", "sources", "destinations", "queue", "bots", "sessions", "joinmsg", "help"}
+    {"main", "sources", "destinations", "discover", "queue", "bots", "sessions", "joinmsg", "help"}
 )
 
 #: Which table a row of the console lives in, as the one letter that rides in a payload. `app.destination`
@@ -473,6 +474,7 @@ def main_screen(facts: Mapping[str, Any]) -> tuple[str, dict[str, Any] | None]:
     rows = [
         [button("📊 Status", payload_for("/status")), button("❓ Help", f"{NAV_PREFIX}help")],
         [button("🎙 Sources", f"{NAV_PREFIX}sources"), button("📤 Destinations", f"{NAV_PREFIX}destinations")],
+        [button("🔎 Find channels", f"{NAV_PREFIX}discover")],
         [button("🔌 Queue", f"{NAV_PREFIX}queue"), button("🤖 Bots", f"{NAV_PREFIX}bots")],
         [button("📩 Join message", f"{NAV_PREFIX}joinmsg"), button("👤 Sessions", f"{NAV_PREFIX}sessions")],
         *_tail("main", None),
@@ -494,6 +496,53 @@ def _cap_note(truncated: bool) -> str | None:
         f"showing the first {LIST_LIMIT}, and the list is capped there on purpose: a screen split in two "
         "puts its buttons on the top half only. Name the one you want to change and it opens on its own."
     )
+
+
+def discover_screen(
+    lines: Sequence[str],
+    findings: Sequence[Mapping[str, Any]],
+    *,
+    auto: bool,
+    note: str | None = None,
+) -> tuple[str, dict | None]:
+    """What the spare account can see, one button per channel worth a row.
+
+    The findings are the proposals `app/discover.py` decided and ``lines`` is its own report of them: this
+    screen adds no verdict of its own, only a tap for each channel that can be added and the two decisions
+    that are not per-row — take the whole page, or let the bot keep watching for a role change. ``auto`` is
+    printed as the report said it, never as this screen would like it to be.
+
+    A row whose name is too long for a button keeps its line and gains the command underneath it. The
+    button is dropped rather than the name sliced, because a label cut mid-word describes a different channel
+    than the one it opens.
+    """
+    buttons: list[list[dict[str, str] | None]] = []
+    body = list(lines)
+    for finding in findings:
+        if finding.get("use") not in ("source", "destination"):
+            continue
+        who = (
+            str(finding.get("title") or "").strip()
+            or (f"@{finding['username']}" if finding.get("username") else "")
+            or str(finding.get("channel"))
+        )
+        verb = "📥" if finding["use"] == "source" else "📤"
+        made = button(f"{verb} {who}", payload_for(f"/discover add {finding['index']}"))
+        if made is None:
+            body.append(f"  too long for a button — type it: /discover add {finding['index']}")
+            continue
+        buttons.append([made])
+    if buttons:
+        buttons.append([button("✅ Add everything on this page", payload_for("/discover add all"))])
+    switch = (
+        button("🧿 Stop switching on its own", payload_for("/discover auto off"))
+        if auto
+        else button("✨ Let it switch on its own", payload_for("/discover auto on"))
+    )
+    if switch is not None:
+        buttons.append([switch])
+    buttons.extend(_tail("discover"))
+    return render("discover", "what this account can see", body, buttons, note=note)
 
 
 def sources_screen(

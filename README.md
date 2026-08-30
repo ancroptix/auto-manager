@@ -58,7 +58,7 @@ Owner private Telegram chat  (control commands, review queues, approvals)
 | Config: fail-closed live mode, masked secrets, pooler detection | built, tested |
 | Deployment: `render.yaml` Blueprint, UptimeRobot `/health`, Dockerfile deliberately absent | built, tested |
 | Credential guard (`scripts/check_secrets.py`) + CI (`ops/ci.yml`) | built, tested |
-| Control bot: `/status` `/pause` `/probe` `/login` `/sessions` `/declare` (owner-only, [docs](docs/control-bot.md)) | built; tested against a fake transport, so Telegram-side behaviour is unverified from this network |
+| Control bot: `/status` `/pause` `/probe` `/login` `/sessions` `/declare` `/source` `/destination` `/discover` (owner-only, [docs](docs/control-bot.md)) | built; tested against a fake transport, so Telegram-side behaviour is unverified from this network |
 | Local login helper (`scripts/login.py`) | kept as the offline fallback; the bot is the default path |
 | Source scanning and metadata parsing (series, season, episode, language, quality) | built (`normalize.py`, `ingest.py`); the live listener that feeds it needs a session |
 | Season boundaries: declared vs inferred, sticker ordering, publish hold | built (`seasons.py`, [docs](docs/seasons-and-channels.md)) |
@@ -68,6 +68,7 @@ Owner private Telegram chat  (control commands, review queues, approvals)
 | Updates channel: card post → forward to `@Link_providerobot` → one shareable link → announcement ([docs](docs/updates-channel.md)) | flow and both post shapes recorded and tested; one global target channel, a per-episode rhythm, and a private channel named by id are settings (`updates.channel`, `updates.per_episode`, both read by `/status`); the announcement box is approved as `templates.announcement_post`; the probe may read that bot but never mint a link; the send itself is the unwired write layer |
 | Channel Help's documented behaviour — flow, buttons, plans, the 48-hour deletion limit ([docs](docs/channel-help.md)) | transcribed from the official guide on 2026-08-28 with sources, and separated from what this account has observed |
 | Our own rights in a channel, detected instead of typed (`app/rights.py`, run by `/probe`) | built and tested against fakes; the dialog walk is the only evidence it accepts, and a channel it cannot see stays unread and is named |
+| Discovery: the spare account's channels sorted by role — read-only becomes a source, a channel we post in becomes that series' destination (`/discover`, `app/discover.py`) | built and tested against fakes; it creates no channel, invents no series name, refuses to strand a series' only source, and switches on its own only when `discover.auto` is on |
 | Archive copy, the storage bot's *write layer*, Channel Help adapter | **not built** — the menu and the `/batch` conversation are both recorded (two forwards in, one permanent `?start=` link out); what is missing is the code that performs them, plus what only a live run can settle — whether a link is a reference to the source post or a copy. See [docs](docs/storage-bot.md) |
 | Season sticker *posting*, join-request campaigns | **not built** — the pack's document ids and the request template are still open; the boundary logic above is not |
 

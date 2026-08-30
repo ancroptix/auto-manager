@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from app import console, controlbot, joinmsg, keyboards, normalize, sourcecfg
+from app import console, discover, controlbot, joinmsg, keyboards, normalize, sourcecfg
 
 SOURCE = Path(inspect.getsourcefile(console)).read_text(encoding="utf-8")
 _HELP_COMMANDS = re.findall(r"(?m)^/([a-z_]+)", controlbot.HELP)
@@ -82,6 +82,23 @@ SESSION_ROWS = [
 ]
 
 
+#: One account's dialog list, in the shape `app/probe.collect_dialogs` returns, and the proposals
+#: `app/discover.classify` makes from it. Kept as a module fixture because the screen test and the
+#: "every screen has a refresh" test have to agree on the same four channels: a member shelf, a destination
+#: we name, a channel we run that names nothing, and a chat that must not appear at all.
+DIALOGS = [
+    {"title": "anime_uploads4u", "username": "anime_uploads4u", "id": 1112223334, "mine": False,
+     "left": False, "channel": True, "rights": None, "members": 30000},
+    {"title": "Bleach Anime in Hindi", "username": None, "id": 2575861262, "mine": True,
+     "left": False, "channel": True, "rights": {"post_messages": True}, "members": 12},
+    {"title": "Some friends chat", "username": None, "id": 555, "mine": False,
+     "left": False, "channel": False, "rights": None, "members": 4},
+    {"title": "Naruto HQ", "username": "naruto_hq", "id": 888, "mine": False,
+     "left": False, "channel": True, "rights": {"post_messages": True}, "members": 9},
+]
+PLAN = discover.classify(DIALOGS, sources=[], destinations=[])
+
+
 def build_screen(key: str) -> tuple[str, dict | None]:
     """One screen, by the key a `n:` payload carries — so a screen added to `NAV` has to be built here too."""
     builders = {
@@ -90,6 +107,11 @@ def build_screen(key: str) -> tuple[str, dict | None]:
         "queue": lambda: console.queue_screen(paused=False, ready=0),
         "bots": lambda: console.bots_screen(),
         "destinations": lambda: console.destinations_screen(DEST_ROWS),
+        "discover": lambda: console.discover_screen(
+            ["1 dialogs read: 1 worth a decision, 0 already configured"],
+            PLAN["findings"],
+            auto=False,
+        ),
         "sessions": lambda: console.sessions_screen(SESSION_ROWS),
         "joinmsg": lambda: console.joinmsg_screen(current="", presets=[]),
         "help": lambda: console.help_screen(controlbot.HELP),
@@ -114,6 +136,14 @@ def all_screens() -> dict[str, tuple[str, dict | None]]:
             current="welcome {name}", presets=[{"name": p.name} for p in joinmsg.PRESETS]
         ),
         "destinations": console.destinations_screen(DEST_ROWS),
+        "discover": console.discover_screen(
+            discover.report(PLAN, auto=True).splitlines(), PLAN["findings"], auto=True
+        ),
+        "discover-empty": console.discover_screen(
+            discover.report({"findings": [], "configured": [], "read": 0}, auto=False).splitlines(),
+            [],
+            auto=False,
+        ),
         "empty-destinations": console.destinations_screen([]),
         "destination": console.destination_screen(DEST_ROWS[0]),
         "destination-sparse": console.destination_screen({"id": 22, "series": "Bleach"}),
@@ -334,6 +364,45 @@ def test_every_screen_can_be_re_read_and_left() -> None:
     _text, payload = console.source_screen(ROWS[0])
     last = payload["inline_keyboard"][-1]
     assert [one["text"] for one in last] == ["↻ Refresh", "◀ Back"], last
+
+
+def test_the_discovery_screen_offers_only_the_rows_that_can_be_written() -> None:
+    """A button per addable channel, no button for the one that needs a name first.
+
+    The admin channel whose title is not a destination name is printed with its reason and left without a
+    tap: the row cannot be written until a series is named, and a button that leads to a refusal is the
+    decoration this project refuses. The member shelf and the named destination both get one, and the
+    numbers they carry are the findings' own indexes, which is the only address a not-yet-existing row has.
+    """
+    text, payload = console.discover_screen(
+        discover.report(PLAN, auto=False).splitlines(), PLAN["findings"], auto=False
+    )
+    rows = payload["inline_keyboard"]
+    labels = [one["text"] for row in rows for one in row]
+    assert any(one.startswith("📥 anime_uploads4u") for one in labels), labels
+    assert any(one.startswith("📤 Bleach Anime in Hindi") for one in labels), labels
+    assert not any("Naruto HQ" in one for one in labels), "a row with no verdict gets no button"
+    assert "Naruto HQ" in text, "but it does get a line and the reason"
+    assert [one["callback_data"] for row in rows[:2] for one in row] == [
+        "x:/discover add 1",
+        "x:/discover add 2",
+    ], rows[:2]
+    assert "✅ Add everything on this page" in labels and "✨ Let it switch on its own" in labels
+    assert "auto is off" in text, "and the screen says so in the report's words, not the button's"
+
+
+def test_a_discovery_row_too_long_for_a_button_says_what_to_type() -> None:
+    """The label is dropped, never sliced — and the tap that cannot exist is printed as a line.
+
+    `discover_screen` gets the same rule every other screen has, plus one thing the others do not need:
+    a finding with no button would otherwise be invisible advice, so the command it would have run is
+    written out where the operator can read it.
+    """
+    wide = {"index": 7, "use": "source", "channel": -1001, "title": "A" * 70, "role": "member"}
+    text, payload = console.discover_screen(["7 dialogs read"], [wide], auto=False)
+    assert "type it: /discover add 7" in text
+    assert not any("A" * 70 in one["text"] for row in payload["inline_keyboard"] for one in row)
+    assert not any("A" * 32 in one["callback_data"] for row in payload["inline_keyboard"] for one in row)
 
 
 def test_the_audio_picks_are_the_vocabulary_itself() -> None:
@@ -649,7 +718,12 @@ def test_no_reply_promise_a_command_the_router_does_not_serve() -> None:
     foreign = {str(one).strip("/").split()[0].casefold() for one in storagebot.MENU_NAMES}
     http = {"health", "ready", "docs", "openapi.json", "control", "api", "shutdown"}
     offenders: list[str] = []
-    for module in (console, controlbot):
+    # `discover.py` and `sourcecfg.py` are in the walk too, because both refuse a request in prose that
+    # names a command (`/source <channel> series <name>`, `/declare`, `/probe`), and a refusal is only as
+    # good as the word it ends with.
+    from app import discover, sourcecfg as _sourcecfg
+
+    for module in (console, controlbot, discover, _sourcecfg):
         source = Path(module.__file__).read_text(encoding="utf-8")
         tree = ast.parse(source)
         # A docstring, and the literal pieces of an f-string, are not what gets printed on their own: the

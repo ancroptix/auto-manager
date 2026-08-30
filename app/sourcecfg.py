@@ -37,8 +37,11 @@ __all__ = [
     "TOGGLES",
     "Toggle",
     "flags_line",
+    "DESTINATION_MODE",
     "insert_archive",
     "insert_channel",
+    "insert_destination",
+    "plan_new_destination",
     "plan_archive",
     "parse_toggle",
     "plan_new",
@@ -53,6 +56,12 @@ __all__ = [
 #: deliberately absent: no code compares against it, so offering it would be offering a decoration.
 MODE_WATCHING = "full"
 MODE_IGNORED = "ignore"
+
+
+#: A destination found by discovery starts on the link route: its channel already exists, and whether the
+#: files in it should be captioned in place instead is `/inplace`'s decision, not a guess this module can
+#: make on the operator's behalf.
+DESTINATION_MODE = "link_post"
 
 
 @dataclass(frozen=True)
@@ -309,6 +318,69 @@ def render_plan(plan: Mapping[str, Any]) -> str:
         )
     lines.append("  nothing was deleted, and no file has been touched by writing this row.")
     return "\n".join(lines)
+
+
+def plan_new_destination(
+    series: Mapping[str, Any] | None,
+    typed: Any,
+    *,
+    entity: Mapping[str, Any] | None = None,
+    title: str | None = None,
+) -> dict[str, Any] | str:
+    """A destination row for a channel that already exists, or a message saying why there cannot be one.
+
+    ``series`` is the row from ``app.series`` — its id and title, read by the caller. Nothing here looks a
+    series up or creates one: `series_id` is not null on this table, and inventing a series to satisfy a
+    constraint is the exact silent guess the whole discovery feature exists to refuse.
+    """
+    if series is None or series.get("id") is None:
+        return (
+            "no series row matches that name, so there is nothing to point the channel at. A series is "
+            "founded by the first file filed for it, or declared with /declare — and until one exists, "
+            "this channel has no series to be the destination of."
+        )
+    channel_id, problem = _channel_id_of(str(typed or ""), entity)
+    if problem:
+        return problem
+    stored_title = None
+    if entity is not None and entity.get("title"):
+        stored_title = str(entity["title"]).strip()[:120] or None
+    elif title:
+        stored_title = str(title).strip()[:120] or None
+    return {
+        "series_id": int(series["id"]),
+        "series_title": str(series.get("title") or ""),
+        "telegram_channel_id": channel_id,
+        "title": stored_title,
+        "publish_mode": DESTINATION_MODE,
+        "verified": entity is not None,
+    }
+
+
+async def insert_destination(db: Any, plan: Mapping[str, Any]) -> int | None:
+    """Write the destination row. One per channel number, and never a second for the same series.
+
+    ``on conflict (telegram_channel_id) do nothing`` matches how the source row is inserted, for the same
+    reason: the unique index is the only thing that can see two of these at once. The series check is a
+    *read* by the caller rather than a constraint here, because the pipeline joins a destination to a
+    series by ``series_id`` and a second row for one series is a decision the operator should see being
+    refused rather than a row that quietly changes which of two channels a season publishes into.
+    """
+    return await db.fetchval(
+        """
+        insert into app.destination (
+            series_id, telegram_channel_id, title, publish_mode, created_at, updated_at
+        ) values (
+            $1, $2, $3, $4, now(), now()
+        )
+        on conflict (telegram_channel_id) do nothing
+        returning id
+        """,
+        plan["series_id"],
+        plan["telegram_channel_id"],
+        plan["title"],
+        plan["publish_mode"],
+    )
 
 
 async def insert_channel(db: Any, plan: Mapping[str, Any]) -> int | None:

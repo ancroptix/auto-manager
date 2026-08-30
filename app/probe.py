@@ -39,6 +39,8 @@ from .storagebot import FORBIDDEN as FORBIDDEN_COMMANDS
 log = logging.getLogger("auto_manager.probe")
 
 __all__ = [
+    "collect_dialogs",
+    "DIALOG_LIMIT",
     "MAX_BUTTONS_SHOWN",
     "MAX_COMMANDS_SHOWN",
     "MAX_REPORT_CHARS",
@@ -411,8 +413,49 @@ def _read_bot_profile(answered: Any) -> dict[str, Any]:
     return hint
 
 
+#: The dialog walk, on its own, because two callers need exactly this and not the probe's menu questions.
+#: `app/discover.py` reads the same entries to decide what a channel *is*, and a second walk built from a
+#: second set of field choices is how a probe and a discovery screen start disagreeing about one channel.
+DIALOG_LIMIT = 150
+
+
+async def collect_dialogs(client: Any, *, timeout: float = 75.0, limit: int = DIALOG_LIMIT) -> list[dict[str, Any]]:
+    """One pass over the account's dialog list, in the shape :func:`app.rights.plan` reads.
+
+    Every key is always present, ``None`` included: "we are a member" and "we never looked" have to stay
+    two different facts, and omitting the rights key for a member once made them the same one.
+    """
+    entries: list[dict[str, Any]] = []
+    async for dialog in _drain(client.iter_dialogs(), timeout):
+        entity = getattr(dialog, "entity", None)
+        if entity is None:
+            continue
+        entries.append(
+            {
+                "title": (getattr(entity, "title", None) or getattr(entity, "first_name", None) or "")[:60],
+                "username": getattr(entity, "username", None),
+                # The id is what makes a private channel matchable: with no @handle to compare, the
+                # marked numeric id is the only key the dashboard row and the entity share.
+                "id": getattr(entity, "id", None),
+                "mine": bool(getattr(entity, "creator", False)),
+                "left": bool(getattr(entity, "left", False)),
+                "members": getattr(entity, "participants_count", None),
+                "channel": getattr(entity, "broadcast", None) is not None,
+                "rights": channel_rights.rights_of(entity),
+            }
+        )
+        if len(entries) >= limit:
+            break
+    return entries
+
+
 async def probe_account(
-    client: Any, *, policy: ProbePolicy, run: _Run, expected: Sequence[dict[str, Any]] = ()
+    client: Any,
+    *,
+    policy: ProbePolicy,
+    run: _Run,
+    expected: Sequence[dict[str, Any]] = (),
+    probe_limit: int = DIALOG_LIMIT,
 ) -> dict[str, Any]:
     """What the spare account can see and do right now.
 
@@ -436,35 +479,18 @@ async def probe_account(
         run.record("account", **out)
         return out
 
-    dialogs: list[dict[str, Any]] = []
-    by_username: dict[str, dict[str, Any]] = {}
+    # One walk, one field list, one cap: `collect_dialogs` is shared with `app/discover.py` so that a
+    # probe's answer and a discovery screen cannot disagree about the same channel. The cap lives there for
+    # the same reason — a probe that walked 400 dialogs to report 150 of them is a slow answer to a cheap
+    # question, and 150 is more than any account of ours has channels in.
     try:
-        async for dialog in _drain(client.iter_dialogs(), policy.per_step_timeout * 3):
-            entity = getattr(dialog, "entity", None)
-            if entity is None:
-                continue
-            entry: dict[str, Any] = {
-                "title": (getattr(entity, "title", None) or getattr(entity, "first_name", None) or "")[:60],
-                "username": getattr(entity, "username", None),
-                # The id is what makes a private channel matchable: with no @handle to compare, the
-                # marked numeric id is the only key the dashboard row and the entity share.
-                "id": getattr(entity, "id", None),
-                "mine": bool(getattr(entity, "creator", False)),
-                "left": bool(getattr(entity, "left", False)),
-                "members": getattr(entity, "participants_count", None),
-                "channel": getattr(entity, "broadcast", None) is not None,
-                # Always present, `None` included: "we are a member" and "we never looked" have to
-                # stay two different facts, and omitting the key for a member made them the same one.
-                "rights": channel_rights.rights_of(entity),
-            }
-            dialogs.append(entry)
-            if entry["username"]:
-                by_username[str(entry["username"]).casefold()] = entry
-            if len(dialogs) >= 150:
-                break
+        dialogs: list[dict[str, Any]] = await collect_dialogs(
+            client, timeout=policy.per_step_timeout * 3, limit=probe_limit
+        )
     except ProbeViolation:
         raise
     except Exception as exc:  # noqa: BLE001
+        dialogs = []
         out["dialogs_error"] = f"{type(exc).__name__}: {str(exc)[:120]}"
 
     out["dialog_count"] = len(dialogs)

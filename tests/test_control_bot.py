@@ -22,6 +22,7 @@ from typing import Any
 
 import pytest
 
+from app import discover
 from app.botapi import BotApi, BotTokenError, parse_update, redact
 from app.config import Settings
 from app.controlbot import MAX_CODE_TRIES, ControlBot, LoginResult, LoginUnstored, NeedsPassword, Reply
@@ -176,6 +177,11 @@ class FakeDb:
             needle = str(args[0] or "")
             hits = [row for row in self.series if needle and needle in row["normalized_title"]]
             return hits or ([] if needle else [dict(row) for row in self.series])
+        if "from app.destination order by id" in sql:
+            # `app/discover.py`'s sweep: the whole list, no alias, because it is matching channels rather
+            # than addressing one. Without this arm the sweep would see "no destinations" and offer rows for
+            # channels that are already destinations.
+            return [dict(row) for row in self.destinations]
         if "from app.destination d" in sql:  # /card and /campaign name a channel three ways
             if "where d.id = $1" in sql:
                 # The console resolves a tap's row id, and `/destination` re-reads the row after a write, so
@@ -269,6 +275,23 @@ class FakeDb:
             row = {"id": 950 + len(self.archive_channels)}
             row.update(dict(zip(names, args)))
             self.archive_channels.append(row)
+            self.writes.append((sql, args))
+            return row["id"]
+        if "insert into app.destination" in sql:
+            # Discovery filing a channel we administer as a series' destination. Same shape as the source
+            # insert: the column list from the statement, zipped onto the arguments.
+            names = [
+                name.strip()
+                for name in re.search(r"insert into app\.destination \((.*?)\)", sql, re.S)
+                .group(1)
+                .split(",")
+                if name.strip() and "_at" not in name
+            ]
+            row = {"id": 920 + len(self.destinations), "series": next(
+                (one["title"] for one in self.series if one["id"] == (args[0] if args else None)), None
+            )}
+            row.update(dict(zip(names, args)))
+            self.destinations.append(row)
             self.writes.append((sql, args))
             return row["id"]
         if "insert into app.source_channel" in sql:
@@ -2802,6 +2825,280 @@ async def test_the_sessions_screen_offers_only_the_two_verbs_that_exist() -> Non
     assert labels == ["▶ Use spare", "🧹 Forget spare"], labels
     (forgot,) = await say(control, "/forget nosuch")
     assert "nothing stored under" in forgot
+
+
+# ---------------------------------------------------------------- what the account can see, filed by a tap
+#
+# `/discover` is the one command in this bot that writes a row nobody typed. Everything it may write, it
+# writes through `app/sourcecfg.py`, and these tests are mostly about the parts where it must not: a channel
+# it cannot name a series for, a series that does not exist yet, and a switch that would leave a season
+# reading nothing. The dialog walk is replaced with a list, because a test that needed a logged-in account
+# could never be run by anyone reviewing this file.
+
+
+def discovery_dialogs() -> list[dict]:
+    """One account: a chat, a shelf we only read, a destination we named, and a source we already file."""
+    return [
+        {
+            "title": "friends chat",
+            "username": None,
+            "id": 555,
+            "mine": False,
+            "left": False,
+            "channel": False,
+            "members": 4,
+            "rights": None,
+        },
+        {
+            "title": "shelf of files",
+            "username": "file_shelf",
+            "id": 444555,
+            "mine": False,
+            "left": False,
+            "channel": True,
+            "members": 30000,
+            "rights": None,
+        },
+        {
+            "title": "Dekin no mogura Anime in Hindi",
+            "username": None,
+            "id": 2575861262,
+            "mine": True,
+            "left": False,
+            "channel": True,
+            "members": 12,
+            "rights": {"post_messages": True, "edit_messages": True},
+        },
+        {
+            "title": "anime_uploads4u",
+            "username": "anime_uploads4u",
+            "id": 1112223334,
+            "mine": False,
+            "left": False,
+            "channel": True,
+            "members": 9,
+            "rights": None,
+        },
+    ]
+
+
+def discovery_bot(*, auto: bool = False, dialogs=None):
+    """A bot whose Telegram read is this list, and whose auto switch starts where the test says.
+
+    `_discover_dialogs` is replaced rather than the client beneath it, so the walk's own failure modes stay
+    tested by their own test below instead of being hidden behind a fake connection.
+    """
+    control, api, db = bot()
+    walk = discovery_dialogs() if dialogs is None else dialogs
+
+    async def fake_walk():
+        return list(walk)
+
+    control._discover_dialogs = fake_walk  # type: ignore[method-assign]
+    if auto:
+        db.config_rows[discover.AUTO_KEY] = True
+    return control, api, db, walk
+
+
+@pytest.mark.asyncio
+async def test_discovery_lists_what_it_found_and_what_it_refused_to_decide() -> None:
+    """Four dialogs in, two findings out — and the other two are named, not dropped.
+
+    A list that only showed the addable rows would read as "these two are nothing to you", which is the
+    opposite of the truth for a channel that is already configured and only true for a chat of four people.
+    """
+    control, _api, _db, _walk = discovery_bot()
+    (reply,) = await control.handle(update("/discover", chat=OWNER))
+    text = reply.text
+    assert "4 dialogs read: 2 worth a decision, 1 already configured" in text, text
+    assert "skipped, on purpose: 1 not channels" in text
+    assert "shelf of files — member, source" in text, text
+    assert "Dekin no mogura Anime in Hindi — owner, destination" in text, text
+    assert "source row 3" in text, "the already-configured one is named with the row it already has"
+    assert "auto is off" in text
+    assert "📥 shelf of files" in str(reply.markup), "the tap carries the emoji, not the sentence"
+
+
+@pytest.mark.asyncio
+async def test_tapping_the_menu_opens_the_same_discovery_screen_the_command_prints() -> None:
+    """Typed and tapped paths run one command, so they cannot show two different facts.
+
+    Two bots with the same fixture, because `/discover` keeps no state between calls: a difference between the
+    two replies could only come from the path the update took. Compared as the whole pair — text and
+    keyboard — since a screen that matched its typed twin in prose but not in buttons is half a feature.
+    """
+    typed_control, _a, _b, _w = discovery_bot()
+    tap_control, _c, _d, _e = discovery_bot()
+    (typed,) = await typed_control.handle(update("/discover", chat=OWNER))
+    (tapped,) = await tap_control.handle(parse_update(_press(FakeApi(), "n:discover")))
+    assert tapped.text == typed.text and tapped.markup == typed.markup, (tapped.text, typed.text)
+    rows = typed.markup["inline_keyboard"]
+    labels = [one["text"] for row in rows for one in row]
+    assert "✅ Add everything on this page" in labels and "✨ Let it switch on its own" in labels
+    assert [one["callback_data"] for row in rows[:3] for one in row] == [
+        "x:/discover add 2",
+        "x:/discover add 3",
+        "x:/discover add all",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_tap_files_the_member_channel_as_a_source_through_the_command_writer() -> None:
+    control, api, db, _walk = discovery_bot()
+    await control.dispatch(parse_update(_press(api, "x:/discover add 2")))
+    added = db.source_channels[-1]
+    assert added["telegram_channel_id"] == -100444555 and added["mode"] == "full"
+    assert "watching: on (mode full)" in api.sent[-1][1]
+    assert any("insert into app.source_channel" in sql for sql, _ in db.writes)
+
+
+@pytest.mark.asyncio
+async def test_a_tap_files_the_channel_we_run_as_that_series_destination() -> None:
+    """The row `writers.py` has been blocking on, written by pointing at a channel that already exists.
+
+    Nothing is created in Telegram and nothing is posted: `series_id`, the channel number, the title and the
+    link-post mode are all this write touches, which is exactly what the publisher joins on.
+    """
+    control, api, db, _walk = discovery_bot()
+    await control.dispatch(parse_update(_press(api, "x:/discover add 3")))
+    added = db.destinations[-1]
+    assert added["telegram_channel_id"] == -1002575861262
+    assert added["publish_mode"] == "link_post" and added["series_id"] == 7
+    assert "Nothing was created in Telegram" in api.sent[-1][1]
+
+
+@pytest.mark.asyncio
+async def test_a_destination_is_refused_when_no_series_row_exists_to_point_at() -> None:
+    """Not "created anyway with a placeholder", because a series name on a destination is permanent.
+
+    The fake knows one series; renaming the channel to a title with no matching row is the whole test.
+    """
+    walk = discovery_dialogs()
+    walk[2]["title"] = "Bleach Anime in Hindi"
+    control, api, db, _w = discovery_bot(dialogs=walk)
+    before = len(db.destinations)
+    await control.dispatch(parse_update(_press(api, "x:/discover add 3")))
+    assert "no series called" in api.sent[-1][1], api.sent[-1][1]
+    assert len(db.destinations) == before, "and the row was not half-written"
+
+
+@pytest.mark.asyncio
+async def test_auto_mode_is_written_to_the_key_the_worker_reads() -> None:
+    """One tap moves the switch, and the screen that comes back says it is on in the report's own words.
+
+    The key is the one `app/handlers.py` reads on every reconciliation — asserted by name, because a config
+    key the bot writes and the worker does not read would be a toggle that only changes a row.
+    """
+    control, api, db, _walk = discovery_bot()
+    await control.dispatch(parse_update(_press(api, "x:/discover auto on")))
+    assert "auto is on" in api.sent[-1][1], api.sent[-1][1]
+    sql, args = db.writes[-1]
+    assert "insert into app.config" in sql and args[0] == discover.AUTO_KEY and args[1] == "true"
+
+
+@pytest.mark.asyncio
+async def test_a_word_that_is_neither_on_nor_off_writes_nothing() -> None:
+    control, _api, db, _walk = discovery_bot()
+    before = len(db.writes)
+    (text,) = await say(control, "/discover auto maybe")
+    assert "needs on or off" in text and len(db.writes) == before
+
+
+@pytest.mark.asyncio
+async def test_discovery_says_what_is_missing_instead_of_showing_an_empty_list() -> None:
+    """No session is a fact about the deployment, and the reply names the two commands that can fix it.
+
+    This is the path every fresh install hits first: an empty screen would read as "you own no channels",
+    which is a different sentence and a wrong one.
+    """
+    control, api, db = bot()
+    await control.dispatch(parse_update(_press(api, "n:discover")))
+    text = api.sent[-1][1]
+    assert "could not be read from this account" in text, text
+    assert "/sessions" in text and "/status" in text
+    assert db.writes == [], "and a failed read writes no row"
+
+
+@pytest.mark.asyncio
+async def test_a_role_change_switches_a_source_only_when_the_series_keeps_one_to_read() -> None:
+    """The flip, in both directions, from the same screen.
+
+    Two watched channels read `Naruto`, so stopping at the one the operator can now post in strands nothing
+    and the switch is applied — with `sourcecfg`'s own writer, so `mode` cannot end up spelled a way the
+    scanner ignores. The single-source case is the one that must be refused, and it is refused in words that
+    say what to do next.
+    """
+    dialogs = [
+        {
+            "title": "Naruto HQ",
+            "username": None,
+            "id": 888,
+            "mine": True,
+            "left": False,
+            "channel": True,
+            "members": 9,
+            "rights": {"post_messages": True, "edit_messages": True},
+        }
+    ]
+    sources = [
+        {
+            "id": 3,
+            "username": "naruto_hq",
+            "title": "Naruto HQ",
+            "telegram_channel_id": -100888,
+            "mode": "full",
+            "declared_series": "Naruto",
+            "declared_audio": "",
+            "declared_season": -1,
+            "destination_id": None,
+            "active": True,
+            "require_hindi_audio": True,
+            "include_subbed": False,
+        },
+        {
+            "id": 4,
+            "username": "naruto_uploads",
+            "title": "Naruto uploads",
+            "telegram_channel_id": -100999,
+            "mode": "full",
+            "declared_series": "Naruto",
+            "declared_audio": "",
+            "declared_season": -1,
+            "destination_id": None,
+            "active": True,
+            "require_hindi_audio": True,
+            "include_subbed": False,
+        },
+    ]
+    control, api, db, _w = discovery_bot(auto=True, dialogs=dialogs)
+    # Copies, both times: the fake applies an update to the row it holds, so the two bots below must not
+    # share one dict — the second would otherwise find the mode already switched by the first and report
+    # nothing, which is a fixture accident wearing the costume of a rule.
+    db.source_channels = [dict(row) for row in sources]
+    await control.dispatch(parse_update(_press(api, "n:discover")))
+    assert any("set mode = " in sql for sql, _ in db.writes), "reading stopped, through the switch writer"
+    assert "Naruto HQ: switched —" in api.sent[-1][1], api.sent[-1][1]
+
+    control2, api2, db2, _w2 = discovery_bot(auto=True, dialogs=dialogs)
+    db2.source_channels = [dict(sources[0])]
+    await control2.dispatch(parse_update(_press(api2, "n:discover")))
+    assert "not switched —" in api2.sent[-1][1], api2.sent[-1][1]
+    assert not any("set mode = " in sql for sql, _ in db2.writes), "and nothing was written to prove the point"
+
+
+@pytest.mark.asyncio
+async def test_a_discovery_number_that_is_not_on_the_page_is_refused_not_guessed() -> None:
+    control, _api, db, _walk = discovery_bot()
+    (text,) = await say(control, "/discover add 99")
+    assert "nothing on this page is numbered 99" in text and db.writes == []
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_discovery_action_writes_nothing_and_shows_the_usage() -> None:
+    control, _api, db, _walk = discovery_bot()
+    (text,) = await say(control, "/discover demolish")
+    assert "not something /discover does" in text and "usage: /discover" in text
+    assert db.writes == []
 
 
 @pytest.mark.asyncio

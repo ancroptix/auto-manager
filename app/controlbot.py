@@ -38,7 +38,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping
 
-from . import console, keyboards, sourcecfg
+from . import console, discover, keyboards, sourcecfg
 from .botapi import BotApi, Update
 from .sessions import forget as forget_session
 from .sessions import list_sessions, mask_phone, scrub, store as store_session, valid_name
@@ -80,6 +80,8 @@ HELP = """auto-manager control
 /declare     say how long a season is (Total Episodes, and the batch post)
 /source      add a source channel, say what it carries (series, audio, season), flip its switches
 /sources     every source channel, with its switches as buttons (the same list the menu shows)
+/discover    read the channels this account can see: member → a source, admin → a destination
+             /discover add 3 · /discover add all · /discover auto on|off
 /destination the channel a series publishes into: the card post, the link, the campaigns, the counts
              /destinations                    every one of them, which is what `/destination` alone says
              /destination <series|@handle|id>  one, with its buttons
@@ -124,6 +126,7 @@ _ROUTES: dict[str, str] = {
     "declare": "_declare",
     "source": "_source",
     "sources": "_sources",
+    "discover": "_discover",
     "destination": "_destination",
     "destinations": "_destination",
     "archive": "_archive",
@@ -379,6 +382,144 @@ class ControlBot:
         text, mark = console.sources_screen(rows, truncated=extra)
         return [Reply(text, markup=mark)]
 
+    _DISCOVER_USAGE = (
+        "usage: /discover [plan | add <n> | add all | auto on|off]\n"
+        "  /discover                read the account's channels and say what each one would become\n"
+        "  /discover add 3          write that one row, exactly as the screen described it\n"
+        "  /discover add all        write every row on the page, one at a time, and report each\n"
+        "  /discover auto on        keep doing it: roles re-read on every reconcile, switches applied there\n"
+        "  /discover auto off       go back to reading only when you ask\n\n"
+        "Discovery reads. It posts nothing, creates no channel in Telegram, and never rewrites a file that "
+        "was already published. A channel is a source when this account can only read it, and a destination "
+        "when it can post in it *and* the name follows `{TITLE} Anime in Hindi` — a name that does not "
+        "follow it is reported, not guessed at."
+    )
+
+    #: A dialog walk is a few API calls, and a stalled one must not hold up a chat reply forever. The
+    #: number is generous next to `app/probe.py`'s per-step budget because this walk has no bot menu to
+    #: wait on: 90 seconds of silence is already the longest a control-bot command should ever make you look.
+    _DISCOVER_TIMEOUT = 90.0
+
+    async def _discover_auto(self) -> bool:
+        """Whether auto mode is on, read the way the rest of this bot reads a flag.
+
+        Tolerant of the two spellings a jsonb boolean arrives in — `True` from a parsed value and
+        `"true"` from a row somebody edited by hand — and of a database that answers nothing at all, which
+        means off. An unread flag is not a licence to start switching channels.
+        """
+        try:
+            value = await self.db.config(discover.AUTO_KEY, False)
+        except Exception:  # noqa: BLE001 - a config read that fails is "off", never a crash in a DM
+            return False
+        if isinstance(value, str):
+            return value.strip().strip('"').casefold() in {"true", "on", "1", "yes"}
+        return bool(value)
+
+    async def _set_discover_auto(self, on: bool) -> None:
+        import json  # noqa: PLC0415  (only the writer needs the encoder)
+
+        await self.db.execute(
+            "insert into app.config (key, value, description) values ($1, $2::jsonb, $3)"
+            " on conflict (key) do update set value = excluded.value, updated_at = now()",
+            discover.AUTO_KEY,
+            json.dumps(bool(on)),
+            "Set from the control bot with /discover auto on|off. When true, app/handlers.py re-reads this "
+            "account's channel roles on every reconciliation and applies the member-reads / admin-publishes "
+            "switch; app/discover.py owns the rules and refuses a switch it cannot undo.",
+        )
+
+    async def _discover_dialogs(self) -> list | str:
+        """One dialog walk, on a client of its own, or the sentence that says why there is none.
+
+        Its own client for the reason `app/telegram_client.probe_once` gives: a read that fails must not be
+        able to take the worker's connection down with it. Nothing is sent to anyone by this call — it is the
+        account listing its own chats, which is why it runs in shadow mode while `/probe`'s menu questions do
+        not.
+        """
+        from .probe import collect_dialogs  # noqa: PLC0415
+        from .telegram_client import TelegramUserClient  # noqa: PLC0415
+
+        wrapper = TelegramUserClient(settings=self.settings, db=self.db)
+        try:
+            client = await wrapper.start()
+            return await asyncio.wait_for(collect_dialogs(client), self._DISCOVER_TIMEOUT)
+        except Exception as exc:  # noqa: BLE001 - the operator needs the reason, not a traceback
+            return (
+                f"the channels could not be read from this account: {type(exc).__name__}: {str(exc)[:160]}"
+                "\n\nNothing was written. `/status` says whether a session is stored and reachable, and "
+                "`/sessions` lists the names — a login that expired is the usual reason for this."
+            )
+        finally:
+            await wrapper.stop()
+
+    async def _discover(self, update: Update, args: list[str]) -> list[Reply]:
+        """``/discover`` — what this account can see, and the tap that files it.
+
+        The command exists because the operator should not have to type the channel numbers they can already
+        see in their own Telegram: the session the pipeline uses has the list, and the role it holds in each
+        channel is the only thing that decides whether that channel is a place files come *from* or a place
+        posts go *to*. Both halves are read, not configured: :mod:`app.rights` decides what "admin" means
+        and :func:`app.channels.destination_name` decides what a destination is called.
+
+        What is deliberately not here: creating a channel, sending an invite, adding a bot, founding a
+        series, or turning off a channel that nothing else could be read from. Those are the four places a
+        button could do something the operator did not mean, so each one is refused with the reason rather
+        than done quietly — see `app/discover.py`.
+        """
+        if self.db is None or not getattr(self.db, "connected", False):
+            return [Reply(
+                "the database is not reachable, so there is nothing to record a channel in. `/status` names "
+                "the reason."
+            )]
+        action = (args[0].strip().casefold() if args else "plan")
+        if action in {"help", "-h", "?"}:
+            return [Reply(self._DISCOVER_USAGE)]
+        if action == "auto":
+            word = " ".join(args[1:]).strip().casefold()
+            if word in sourcecfg.ON_WORDS:
+                await self._set_discover_auto(True)
+            elif word in sourcecfg.OFF_WORDS:
+                await self._set_discover_auto(False)
+            else:
+                return [Reply(
+                    f"`auto` needs on or off — I read `{word or 'nothing'}` as neither.\n{self._DISCOVER_USAGE}"
+                )]
+        dialogs = await self._discover_dialogs()
+        if isinstance(dialogs, str):
+            return [Reply(f"{dialogs}\n\n{self._DISCOVER_USAGE}")]
+        auto = await self._discover_auto()
+        swept = await discover.sweep(self.db, dialogs, auto=auto)
+        plan = swept["plan"]
+        outcomes = [dict(flip, title=flip.get("title") or flip.get("channel")) for flip in swept["flips"]]
+        if action in {"add", "apply"}:
+            wanted = " ".join(args[1:]).strip().casefold()
+            targets = [
+                finding
+                for finding in plan["findings"]
+                if finding.get("use") in ("source", "destination")
+                and (wanted == "all" or str(finding["index"]) == wanted)
+            ]
+            if not targets and wanted and wanted != "all":
+                return [Reply(
+                    f"nothing on this page is numbered {wanted}, so nothing was written. /discover shows the "
+                    "list again, and only the rows with a button can be added."
+                )]
+            for finding in targets:
+                adder = discover.add_destination if finding["use"] == "destination" else discover.add_source
+                outcome = await adder(self.db, finding)
+                # One vocabulary for the report's `applied` list: a writer says `ok` and `text`, the report
+                # says "was it done, and why", and translating here is what keeps `add_source` free to
+                # return the plan's own words instead of a paraphrase of them.
+                outcomes.append({**outcome, "applied": bool(outcome.get("ok")), "why": outcome.get("text") or ""})
+        elif action not in {"plan", "show", "auto"}:
+            return [Reply(f"`{action}` is not something /discover does, so nothing was written.\n\n{self._DISCOVER_USAGE}")]
+        lines = discover.report(plan, auto=auto, applied=outcomes).splitlines()
+        ran = "/discover" if action in {"plan", "show"} else f"/discover {' '.join(args)}"
+        text, mark = console.discover_screen(
+            lines, plan["findings"], auto=auto, note=console.screen_note(ran)
+        )
+        return [Reply(text, markup=mark)]
+
     _DESTINATION_USAGE = (
         "usage: /destination [<series|@handle|channel id>] [action]\n"
         "  /destination                          every destination channel, with its buttons\n"
@@ -547,7 +688,7 @@ class ControlBot:
                 "select key, value::text as value from app.config "
                 "where key in ('thumbnail.strict_mode','thumbnail.on_no_clean_candidate',"
                 "'ingest.require_hindi_audio','ingest.include_subbed_only','caption.button_rows',"
-                "'caption.total_episodes_unknown','joinrequest.message') "
+                "'caption.total_episodes_unknown','joinrequest.message','discover.auto') "
                 "order by key"
             )
             if settings:
@@ -579,7 +720,13 @@ class ControlBot:
             priority=5,
         )
         job_id = int((job or {}).get("id") or 0) if isinstance(job, dict) else int(job or 0)
-        return [Reply(f"reclaimed {reclaimed} stale lease(s); job {job_id} queued")]
+        note = ""
+        if await self._discover_auto():
+            # Said out loud because the reconcile job is where auto mode does its work: the operator should
+            # be able to tell, from this reply alone, whether their roles were re-read just now or whether
+            # the number above is the only thing that moved.
+            note = "\n\nauto discovery is on, so this run also re-reads your channel roles as it goes."
+        return [Reply(f"reclaimed {reclaimed} stale lease(s); job {job_id} queued{note}")]
 
     async def _probe(self, update: Update, args: list[str]) -> list[Reply]:
         if not self.settings.outbound_enabled:
@@ -2076,6 +2223,7 @@ class ControlBot:
     _CONSOLE_SCREENS = (
         "main",
         "sources",
+        "discover",
         "destinations",
         "queue",
         "bots",
@@ -2480,6 +2628,8 @@ class ControlBot:
             rows, extra = await self._console_screen_rows("s")
             text, mark = console.sources_screen(rows, note=note, truncated=extra)
             return [Reply(text, markup=mark)]
+        if key == "discover":
+            return await self._discover(None, [])
         if key == "destinations":
             rows, extra = await self._console_screen_rows("d")
             text, mark = console.destinations_screen(rows, note=note, truncated=extra)

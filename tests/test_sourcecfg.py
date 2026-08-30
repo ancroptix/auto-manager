@@ -29,7 +29,9 @@ def test_every_column_either_insert_writes_is_read_somewhere() -> None:
     """
     text = Path(inspect.getsourcefile(sourcecfg)).read_text(encoding="utf-8")
     blocks = re.findall(r"insert into (app\.\w+) \(([^)]*)\)", text, re.S)
-    assert len(blocks) == 2, "a source-channel insert and an archive-channel insert"
+    assert sorted(table for table, _ in blocks) == ["app.archive_channel", "app.destination", "app.source_channel"], (
+        "the source row, the archive row, and the destination row — the three things this bot may create"
+    )
 
     # A row needs its own identity and its own timestamps whether or not anything reads them, and the
     # `id` is generated. Everything else has to earn its place in the statement.

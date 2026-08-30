@@ -154,6 +154,7 @@ session at boot, if it restarts on its own.
 | `/source <@handle\|channel id> [series <name>] [audio <kind>] [season <n>] [title <text>]` | what a *files-only* source channel carries, stated once for the whole channel instead of guessed per file. `title` renames the row itself — what this bot calls it back to you, and, when no series is declared, one of the two signals `app/ingest.py` may read a series name out of (one signal is not two: it never founds a channel on its own). A channel added by number arrives with none, which is why the word exists here at all. With no arguments it shows what is declared **and what is switched**; `clear` stops assuming. It never re-decides a file that was already decided — parked ones are re-read on the next scan |
 | `/source <@handle\|channel id> add [series <name>] [title <text>]` | start watching that channel: the row in `app.source_channel` is written here, with its defaults printed back. Its own verb on purpose — a row is the decision to read a channel, so no other command makes one, and a lookup that finds nothing says `add` instead of naming a table |
 | `/source <channel> gate\|subs\|watch on\|off` | the three switches whose columns production code reads: `gate` is `require_hindi_audio`, `subs` is `include_subbed`, `watch` is `mode` (`on` is `full`, `off` is `ignore`). One column per command, and the same words switch it back |
+| `/discover [plan\|add <n>\|add all\|auto on\|off]` | what the spare account can see, sorted into the two kinds of channel this program has: a channel we can only read becomes a **source**, a channel we can post in becomes a **destination** — and only when its name follows `{TITLE} Anime in Hindi`, because that is the one place a series can be read from without guessing. `plan` (bare `/discover`) writes nothing; `add 3` writes the row the screen described, through the same `app/sourcecfg` writer `/source … add` uses; `auto on` lets the reconciliation job re-read the roles and apply the switch by itself. It creates no channel, sends nothing, and refuses to stop reading a series' only source |
 | `/sources` | every source channel with its switches as buttons — the same list the menu's `🎙 Sources` screen renders, from the same builder, so a typed line and a tap cannot disagree about a column. It is also what the console's "this row is gone" reply points at, which is the only reason that sentence is allowed to say it |
 | `/destination [<series\|@handle\|channel id>] [card <id\|show\|clear>\|campaigns\|campaign new <name>\|episodes <season> <count\|tba>\|inplace [plan\|off]]` | the channel a series publishes into, and the four things it can be set to. Bare `/destination` (or `/destinations`) lists them, 📤 for a channel that exists and 🏗 for a row whose channel is not built yet. Every action is delegated: `/card`, `/campaign`, `/declare` and `/inplace` stay the only paths that touch those columns, so this command spares the remembering and adds no new write. A destination is addressed by its own number, its title, or the handle of the source that feeds it — `app.destination` stores no username of its own |
 | `/archive [<@handle\|channel id> add [title <name>]]` | which private channel holds the master copy: bare `/archive` reads the list, `add` writes the missing row the archive job blocks on. The first row added is `is_primary`, because two primaries would make `app/writers.py` pick between them |
@@ -267,6 +268,7 @@ Open it with `🏠 Open the menu` under `/help`. Six screens:
 | `sources` | one row per configured channel, each labelled 👁 watching or 💤 ignored, with the series name after it | `🎙 Sources` |
 | `queue` | ready jobs and the pause state, with only the button that changes it (Pause when running, Resume when paused) | `🔌 Queue` |
 | `bots` | which storage bot, Channel Help bot and link provider are configured, plus `/probe` and `/sessions` | `🤖 Bots` |
+| `discover` | the channels this account can see, each with what it would become and why — plus `✅ Add everything on this page` and the auto switch | `🔎 Find channels` |
 | `destinations` | one row per series' own channel — 📤 when the channel exists in Telegram, 🏗 when only the row does — and each one opens its own screen | `📤 Destinations` |
 | `sessions` | the stored logins, by account name and username, with `▶ Use` and `🧹 Forget`. Never a session string, never even its length | `👤 Sessions` |
 | `joinmsg` | the three drafts numbered as `/joinmsg` numbers them, the wording now saved, and the way to say nothing | `📩 Join message` |
@@ -279,6 +281,16 @@ column is spelled — plus the season, the two names, the season's episode count
 `🖼 Caption in place` / `🔗 Links only` for the in-place half. `📤 Where its files are published` crosses to
 the destination screen for that series, and it crosses on the `destination_id` the ingest side recorded
 rather than on a title match; when the two are not linked yet, that is what the button says.
+
+`🔎 Find channels` is the one screen that starts with what Telegram says rather than with what you type: it
+walks the spare account's dialog list and sorts it by role — a channel this account can only **read** is
+offered as a source, a channel it can **post in** is offered as that series' destination when its name
+follows `{TITLE} Anime in Hindi`. `✅ Add everything on this page` files them through the same
+`app/sourcecfg.py` writers `/source … add` uses. What it will not do is in the reply, not in a footnote: it
+creates no channel in Telegram, it invents no series for a name that does not follow the rule, and it refuses
+to stop reading a series' only source — a switch that would leave a season with nothing to read is proposed
+and left alone. `✨ Let it switch on its own` is the one part that keeps working by itself: with it on, every
+reconciliation (which runs at boot) re-reads the roles and applies a role change the first time it notices.
 
 A destination's own screen is where the announcement is built: what it publishes, the card post a shareable
 link is made from and whether one was ever returned, the three in-place taps, `📣 Campaigns` and
