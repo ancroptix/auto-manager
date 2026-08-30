@@ -593,7 +593,9 @@ class ControlBot:
         text, mark = console.joinreq_screen(lines, choices, note=console.screen_note(ran))
         return [Reply(text, markup=mark)]
 
-    async def _joinreq_open(self, destination: Mapping[str, Any]) -> list[Reply]:
+    async def _joinreq_open(
+        self, destination: Mapping[str, Any], *, after: str | None = None
+    ) -> list[Reply]:
         """One channel: what it will say, what it already said, and the one button that starts it."""
         from . import joinmsg, writers  # noqa: PLC0415  (the pace constant lives with the loop it paces)
 
@@ -601,6 +603,11 @@ class ControlBot:
         row = await self._joinreq_row(int(destination["id"]), name)
         where = str(destination.get("title") or destination.get("telegram_channel_id") or destination["id"])
         lines = [f"{where} — series {destination.get('series') or '?'}"]
+        if after:
+            # What the write just did, above what the screen is about to do. The two are different facts and
+            # have to be read separately — a series founded from a channel title is exactly the sentence an
+            # operator needs to see *before* they start messaging people under that name.
+            lines.append(after)
         if row is None:
             saved = " ".join(str(await self.db.config(joinmsg.CONFIG_KEY, "") or "").split())
             lines.append(
@@ -624,7 +631,7 @@ class ControlBot:
         else:
             choices.append({"label": "⏸ Stop after this one", "command": f"/joinreq stop #{destination['id']}"})
             choices.append({"label": "▶️ Keep going", "command": f"/joinreq start #{destination['id']}"})
-        choices.append({"label": "✏️ Change the message", "command": "n:joinmsg"})
+        choices.append({"label": "✏️ Change the message", "screen": "joinmsg"})
         choices.append({"label": "📨 Other channels", "command": "/joinreq"})
         return await self._joinreq_screen(lines, choices, f"/joinreq open #{destination['id']}")
 
@@ -650,9 +657,16 @@ class ControlBot:
             campaign = await self._joinreq_row(int(row["id"]), self._JOINREQ_CAMPAIGN)
             state = f"{campaign['status']}, {int(campaign.get('sent') or 0)} sent" if campaign else "not started"
             if role is None:
+                # Unread is not the same as not allowed: a channel outside the dialog list's cap, or one the
+                # session lost the cache of, still has rights that the campaign's own read will settle when
+                # it asks Telegram for the pending requests. So the tap is offered, marked as unverified —
+                # withholding it would strand a working channel over a question the run answers anyway.
                 lines.append(
-                    f"• {row.get('title') or row.get('telegram_channel_id')} — {state}; this account was not "
-                    "in the list it just read, so nothing here says it can post (🔎 Find channels reads it)"
+                    f"• {row.get('title') or row.get('telegram_channel_id')} — {state}; it was not in the "
+                    "channels this account listed just now, so its rights here are unverified"
+                )
+                choices.append(
+                    {"label": f"⚠️ {str(row.get('title') or row['id'])[:32]}", "command": f"/joinreq open #{row['id']}"}
                 )
                 continue
             if role not in (discover.OWNER, discover.ADMIN):
@@ -723,15 +737,16 @@ class ControlBot:
                 "/joinreq add shows the list again."
             )]
         outcome = await discover.add_destination(self.db, finding)
-        if not outcome.get("ok") and "already a destination row" not in str(outcome.get("text") or ""):
-            return [Reply(f"it could not be filed:\n{outcome.get('text')}\n\n{self._JOINREQ_USAGE}")]
+        note = str(outcome.get("text") or "").strip()
+        if not outcome.get("ok") and "already a destination row" not in note:
+            return [Reply(f"it could not be filed:\n{note}\n\n{self._JOINREQ_USAGE}")]
         row_id = await discover._row_id(self.db, "app.destination", str(finding["channel"]))
         if row_id is None:
             return [Reply("the row was written but cannot be read back, so the screen stays closed.")]
         found = await self._find_destination(f"#{row_id}")
         if isinstance(found, str) or not found:
             return [Reply("filed, but the channel is not readable back yet — open it again in a moment.")]
-        return await self._joinreq_open(found[0])
+        return await self._joinreq_open(found[0], after=note or None)
 
     async def _joinreq(self, update: Update, args: list[str]) -> list[Reply]:
         """``/joinreq`` — the join-request campaign, startable without typing a channel or a name.
@@ -803,7 +818,27 @@ class ControlBot:
                 "one from the saved /joinmsg wording."
             )]
         code = joinmsg.confirm_code(int(row["id"]), row.get("message_template"))
-        return await self._campaign(update, [handle, "confirm", name, code])
+        replies = await self._campaign(update, [handle, "confirm", name, code])
+        after = await self._joinreq_row(int(destination["id"]), name)
+        if after is None or str(after.get("status")) not in {"ready", "running"}:
+            # `confirm` refused — the text breaks a rule, or the row moved under us. Its own sentence is the
+            # answer, and this command has nothing to add to a start that did not happen.
+            return replies
+        from . import writers  # noqa: PLC0415
+
+        return await self._joinreq_screen(
+            [
+                replies[0].text,
+                "",
+                f"It goes out at one person every {writers.JOIN_SEND_GAP_SECONDS:g} seconds, and a run that "
+                "does not finish passes the rest to the next one — a restart does not strand the list.",
+            ],
+            [
+                {"label": "⏸ Stop after this one", "command": f"/joinreq stop {handle}"},
+                {"label": "📨 All channels", "command": "/joinreq"},
+            ],
+            f"/joinreq go {handle}",
+        )
 
     _DESTINATION_USAGE = (
         "usage: /destination [<series|@handle|channel id>] [action]\n"

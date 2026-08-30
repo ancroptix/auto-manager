@@ -543,13 +543,14 @@ rendering from the approved templates; destination channel planning; the owner's
 bot, including logging the spare account in from a chat; and the Render/Supabase deployment
 surface with docs and a CI job.
 
-Eight job kinds remain **deliberately** unimplemented — `archive_media`, `storage_upload`,
-`link_verify`, `link_health_check`, `publish_post`, `edit_post`, `season_sticker` and
-`join_request_campaign`. Each raises `FeatureNotImplemented` and lands as `blocked`, which
-`/status` reports, because the protocols they depend on (the storage bot's menus, Channel
-Help's message shape, the copy-message call, the sticker pack's document ids, join-request
-delivery) have to be observed once against the real bots before they can be written
-honestly. `app/probe.py` is what obtains those observations from inside the deployment,
+Those eight job kinds — `archive_media`, `storage_upload`, `link_verify`, `link_health_check`,
+`publish_post`, `edit_post`, `season_sticker` and `join_request_campaign` — are **implemented** in
+`app/writers.py`, and each was written only after the protocol it depends on (the storage bot's menus, Channel
+Help's message shape, the copy-message call, the sticker pack's document ids, the join-request read) had been
+observed against a real bot rather than guessed at. What still raises `FeatureNotImplemented` and lands as
+`blocked`, which `/status` reports, is a missing human fact inside an otherwise runnable job: the archive
+channel nobody named, the sticker message nobody pointed at, the campaign text nobody approved.
+`app/probe.py` is what obtains those observations from inside the deployment,
 where the network exists; screenshots of the menus work too.
 
 Nothing here is silently skipped: a feature that cannot run yet is a loud blocked job, not

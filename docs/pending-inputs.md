@@ -201,7 +201,9 @@ The list below is the residual — what still stops each kind from completing, i
   address, and which sticker opens a season is not this program's call.
 - `join_request_campaign` — reads the still-pending requests of one channel, sends the wording of
   `/joinmsg`, and stops at `campaign.rate_per_hour` by pausing the campaign rather than pushing past
-  it. A campaign runs only after `/campaign … confirm <code>`.
+  it. A campaign runs only after `/campaign … confirm <code>` — or after the plan and the start tap on
+  `/joinreq`, which computes that code instead of asking you to type it, and paces one person every 3
+  seconds so a restart can resume the list.
 
 Three config rows carry the switches that decide the rest: `publish.route` (who presses send),
 `announcement.style` (how the notice is rendered, because the sampled posts were read and not asked

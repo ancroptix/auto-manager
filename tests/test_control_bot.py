@@ -190,8 +190,14 @@ class FakeDb:
             if not args:
                 return [dict(row) for row in self.destinations]  # /card's bare listing
             numeric, needle = args[0], str(args[1] or "").casefold()
+            # `#21` addresses the row by its own number, which is what a button knows: the real query ORs
+            # that third predicate in, and a fake that ignored it would answer "no such channel" to every
+            # tap that came from the console.
+            by_row = args[2] if len(args) > 2 else None
 
             def _hit(row: dict) -> bool:
+                if by_row is not None and row.get("id") == by_row:
+                    return True
                 if numeric is not None and row.get("telegram_channel_id") == numeric:
                     return True
                 if not needle:
@@ -414,11 +420,19 @@ class FakeDb:
             self.writes.append((sql, args))
             return 1
         if "update app.join_campaign set" in sql:
-            # /campaign's two state changes, mirrored onto the fake row so a test can read the
-            # status back instead of pattern-matching the SQL it was written with.
+            # /campaign's state changes, mirrored onto the fake row so a test can read the status back
+            # instead of pattern-matching the SQL it was written with. Both spellings the commands use: a
+            # literal (`status = 'ready'`) and a cast parameter (`status = $2::app.campaign_status`, which
+            # `/campaign pause` writes because one statement sets the status *and* the finished_at flag).
+            # A fake that read only the literal would let a pause that never parses look like a pass.
             status = re.search(r"status = '([a-z_]+)'", sql)
-            if status and self.campaign is not None:
-                self.campaign["status"] = status.group(1)
+            value = status.group(1) if status else None
+            if value is None and "::app.campaign_status" in sql and len(args) > 1:
+                value = str(args[1])
+            if value is not None and self.campaign is not None:
+                self.campaign["status"] = value
+            if "message_template = $" in sql and self.campaign is not None and args:
+                self.campaign["message_template"] = str(args[-1])
             self.writes.append((sql, args))
             return 1
         if "insert into app.season" in sql:
@@ -3229,3 +3243,182 @@ async def test_the_inplace_button_on_a_source_screen_is_the_command_itself() -> 
     assert "plan" in api.texts.lower()
     assert "ran: `/inplace @anime_uploads4u plan`" in api.sent[-1][1]
     assert db.writes == [], "a plan changes nothing, tapped or typed"
+
+
+# --------------------------------------------------------------------------- /joinreq, the campaign by button
+def joinreq_bot(*, dialogs=None, campaign=...):
+    """The wizard, on the discovery fake's dialog read: rights are asked now, and the screen shows them.
+
+    The campaign row is passed through rather than always seeded, because the whole point of the flow is the
+    difference between "not started" and "running", and a fake that could not answer "there is no row yet"
+    would hide the step that drafts one.
+    """
+    control, api, db, walk = discovery_bot(dialogs=dialogs) if dialogs else discovery_bot()
+    if campaign is not ...:
+        db.campaign = campaign
+    return control, api, db, walk
+
+
+@pytest.mark.asyncio
+async def test_joinreq_lists_only_the_channels_this_account_can_post_in() -> None:
+    """/joinreq answers "which channel do the requests come into" from the live read, not from a list.
+
+    The destination row exists for both channels here, but a campaign sends *from this account*, so the one
+    where the account turned out to be a member gets a sentence and no button. A button that starts a campaign
+    in a channel the account cannot even post in would fail a hundred DMs later, in a log the operator never
+    reads.
+    """
+    dialogs = discovery_dialogs()
+    dialogs.append(
+        {
+            "title": "Naruto HQ",
+            "username": "naruto_hq",
+            "id": 444555,
+            "mine": False,
+            "left": False,
+            "channel": True,
+            "members": 400,
+            "rights": None,
+        }
+    )
+    control, api, db, _w = joinreq_bot(dialogs=dialogs)
+    db.destinations = [
+        {
+            "id": 21,
+            "title": "Dekin no mogura Anime in Hindi",
+            "telegram_channel_id": -1002575861262,
+            "publish_mode": "link_post",
+            "series": "Dekin no mogura",
+        },
+        {
+            "id": 22,
+            "title": "Naruto HQ",
+            "telegram_channel_id": -100444555,
+            "publish_mode": "link_post",
+            "series": "Naruto",
+        },
+        {
+            "id": 23,
+            "title": "Somewhere else",
+            "telegram_channel_id": -100999999,
+            "publish_mode": "link_post",
+            "series": "Else",
+        },
+    ]
+    await control.dispatch(parse_update(_press(api, "n:joinreq")))
+    text = api.sent[-1][1]
+    labels = [one["text"] for row in api.markups[-1]["inline_keyboard"] for one in row]
+
+    assert "Naruto HQ" in text and "only a member" in text, text
+    assert not any("Naruto HQ" in one for one in labels), "no start button on a channel it cannot post in"
+    assert any(one.startswith("📨 Dekin no mogura") for one in labels), labels
+    assert any(one.startswith("⚠️ Somewhere else") for one in labels), "unread rights, so a marked tap"
+    assert "➕ Add a channel" in labels
+
+
+@pytest.mark.asyncio
+async def test_add_a_channel_files_the_destination_row_through_the_same_writer_as_discover() -> None:
+    """The wizard does not have its own idea of what a destination row is.
+
+    The pick list comes from `app/discover.py`'s classify (so a channel that already has a row cannot be
+    offered twice), and the write is `add_destination` — including the series row founded from the channel's
+    own name when nothing else could name it, which is what makes a channel the ingest side has never seen
+    usable for campaigns at all.
+    """
+    dialogs = discovery_dialogs()
+    dialogs.append(
+        {
+            "title": "One Piece",
+            "username": None,
+            "id": 777888,
+            "mine": True,
+            "left": False,
+            "channel": True,
+            "members": 15,
+            "rights": None,
+        }
+    )
+    control, api, db, _w = joinreq_bot(dialogs=dialogs)
+    await control.dispatch(parse_update(_press(api, "x:/joinreq add")))
+    listed = api.sent[-1][1]
+    labels = [one["text"] for row in api.markups[-1]["inline_keyboard"] for one in row]
+    assert any(one.startswith("✅ One Piece") for one in labels), labels
+
+    tapped = next(
+        one["callback_data"]
+        for row in api.markups[-1]["inline_keyboard"]
+        for one in row
+        if one["text"].startswith("✅ One Piece")
+    )
+    assert tapped.startswith("x:/joinreq file "), tapped
+    await control.dispatch(parse_update(_press(api, tapped)))
+    text = api.sent[-1][1]
+
+    assert "One Piece" in listed and "One Piece" in text, (listed, text)
+    assert any("insert into app.destination" in sql for sql, _ in db.writes), db.writes
+    assert "founded from the channel's own name" in text or "already a destination row" in text, text
+    assert "✏️ Change the message" in [one["text"] for row in api.markups[-1]["inline_keyboard"] for one in row]
+
+
+@pytest.mark.asyncio
+async def test_start_shows_the_words_then_the_tap_queues_the_run() -> None:
+    """Two taps, no typing: the plan on screen, then ✅ Yes — and the code that gates `ready` is computed.
+
+    `/campaign` keeps its own confirm step for the operator who types it; what the wizard removes is the
+    reading of a code, not the reading of the plan. The plan text — the message, the ceiling, the promise
+    that nobody is contacted twice — is the reply to the first tap, so the second one is a decision made with
+    the words in front of them.
+    """
+    campaign = {
+        "id": 7,
+        "name": "default",
+        "status": "draft",
+        "message_template": "{name}, aapka request dekh liya jaa raha hai",
+        "rate_per_hour": 20,
+        "confirm_required": True,
+    }
+    control, api, db, _w = joinreq_bot(campaign=campaign)
+    await control.dispatch(parse_update(_press(api, "x:/joinreq start #21")))
+    planned = api.sent[-1][1]
+    labels = [one["text"] for row in api.markups[-1]["inline_keyboard"] for one in row]
+    assert "aapka request dekh liya jaa raha hai" in planned, planned
+    assert "✅ Yes, start sending" in labels, labels
+    assert db.queued == [], "the plan alone queued nothing"
+
+    await control.dispatch(parse_update(_press(api, "x:/joinreq go #21")))
+    assert [one[0] for one in db.queued] == ["join_request_campaign"], db.queued
+    assert db.queued[0][1] == {"campaign_id": 7, "destination_id": 21}, db.queued[0][1]
+    assert db.campaign["status"] == "ready"
+    assert "one person every 3 seconds" in api.sent[-1][1].casefold() or "3 seconds" in api.sent[-1][1]
+
+
+@pytest.mark.asyncio
+async def test_stop_pauses_after_the_message_in_flight() -> None:
+    """`⏸ Stop` is a pause, and the sent list stays: this program does not un-send or delete anything."""
+    campaign = {
+        "id": 7,
+        "name": "default",
+        "status": "running",
+        "message_template": "{name}, aapka request dekh liya jaa raha hai",
+        "rate_per_hour": 20,
+        "confirm_required": True,
+    }
+    control, api, db, _w = joinreq_bot(campaign=campaign)
+    await control.dispatch(parse_update(_press(api, "x:/joinreq stop #21")))
+    assert db.campaign["status"] == "paused"
+    assert "stay sent" in api.sent[-1][1]
+
+
+@pytest.mark.asyncio
+async def test_an_empty_wording_is_refused_before_anybody_is_messaged() -> None:
+    """A campaign with no text is not a campaign that sends nothing; it is a bug waiting for `{name}`.
+
+    The refusal comes from `/campaign new`'s own check, and the wizard passes it through instead of drafting
+    an empty row of its own — which is why `start` on a channel with no saved wording ends at that sentence.
+    """
+    control, api, db, _w = joinreq_bot(campaign=None)
+    db.config_rows["joinrequest.message"] = ""
+    await control.dispatch(parse_update(_press(api, "x:/joinreq start #21")))
+    text = api.sent[-1][1]
+    assert "no campaign" in text.casefold() or "empty" in text.casefold() or "nothing" in text.casefold(), text
+    assert db.queued == []

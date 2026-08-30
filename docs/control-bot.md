@@ -158,7 +158,8 @@ session at boot, if it restarts on its own.
 | `/sources` | every source channel with its switches as buttons — the same list the menu's `🎙 Sources` screen renders, from the same builder, so a typed line and a tap cannot disagree about a column. It is also what the console's "this row is gone" reply points at, which is the only reason that sentence is allowed to say it |
 | `/destination [<series\|@handle\|channel id>] [card <id\|show\|clear>\|campaigns\|campaign new <name>\|episodes <season> <count\|tba>\|inplace [plan\|off]]` | the channel a series publishes into, and the four things it can be set to. Bare `/destination` (or `/destinations`) lists them, 📤 for a channel that exists and 🏗 for a row whose channel is not built yet. Every action is delegated: `/card`, `/campaign`, `/declare` and `/inplace` stay the only paths that touch those columns, so this command spares the remembering and adds no new write. A destination is addressed by its own number, its title, or the handle of the source that feeds it — `app.destination` stores no username of its own |
 | `/archive [<@handle\|channel id> add [title <name>]]` | which private channel holds the master copy: bare `/archive` reads the list, `add` writes the missing row the archive job blocks on. The first row added is `is_primary`, because two primaries would make `app/writers.py` pick between them |
-| `/joinmsg [show\|options\|use <n>\|set <text>\|clear]` | what a join requester is told, when you later run a campaign at them. `options` lists three drafts with the promise each one makes; `use 2` saves one, `set …` saves your own words (`{name}` and `{series}` are filled at send time), `clear` empties it so the app may contact nobody. Saving is not sending, and the reply says so — the sender is the blocked job kind `join_request_campaign`. It cannot approve or decline anyone, and it refuses a message that carries an invite link |
+| `/joinmsg [show\|options\|use <n>\|set <text>\|clear]` | what a join requester is told, when you later run a campaign at them. `options` lists three drafts with the promise each one makes; `use 2` saves one, `set …` saves your own words (`{name}` and `{series}` are filled at send time), `clear` empties it so the app may contact nobody. Saving is not sending, and the reply says so — sending is a campaign per channel, started from `/joinreq`. It cannot approve or decline anyone, and it refuses a message that carries an invite link |
+| `/joinreq [plan\|open <ref>\|start <ref>\|go <ref>\|stop <ref>\|add\|file <n>]` | the join-request campaign by button: the channels this account can **post in** (rights asked of Telegram on the spot, not read from a cached list), the exact words and who is waiting, then one tap to start. Sending goes to one person every **3 seconds**, nobody twice, up to the campaign's hourly ceiling; a run that does not finish hands the rest to the next one, so a restart or a spin-down resumes the list instead of stranding it. `add` lists the postable channels that have no row yet and `file <n>` writes one through discovery's writer (founding the series row from the channel's own name when nothing else names it). It never approves or declines a request, and no message is sent before the plan has been read on screen |
 | `/inplace <@handle\|channel id> [from <@other>] [plan\|off]` | publish by editing instead of posting: the channel's own file messages get the approved caption written onto them. No new channel, no copy, no delete, no buttons. `plan` shows what it would do and changes nothing; `from` compares with a second channel so episodes only *it* has are forwarded in; `off` goes back to the link route |
 | `/declare <series> <season> <episodes>` | state how long a season is — the only thing that can fill **◎ Total Episodes**, and the only thing that can make a season count as complete. It publishes nothing itself; the batch post stays the publisher's decision. `/declare bleach 2 tba` takes the claim back |
 | `/card <channel> <message id\|show\|clear>` | the post in that destination channel whose link the announcements channel carries. `show` reports whether a shareable link was ever returned; `clear` un-names it (the stored link stays, because deleting is not this program's verb). One number, per channel: without it `publish_post` blocks rather than announcing the invite |
@@ -272,6 +273,7 @@ Open it with `🏠 Open the menu` under `/help`. Six screens:
 | `destinations` | one row per series' own channel — 📤 when the channel exists in Telegram, 🏗 when only the row does — and each one opens its own screen | `📤 Destinations` |
 | `sessions` | the stored logins, by account name and username, with `▶ Use` and `🧹 Forget`. Never a session string, never even its length | `👤 Sessions` |
 | `joinmsg` | the three drafts numbered as `/joinmsg` numbers them, the wording now saved, and the way to say nothing | `📩 Join message` |
+| `joinreq` | one line per publishing channel with what this account may do there, and `➕ Add a channel` for the ones with no row yet — `📨` on a channel opens its message, pace and start tap | `📨 Who is waiting` |
 | `help` | the command list from §3, unchanged, because a button that hides its own words is a button with no manual | `❓ Help` |
 
 Tapping a channel's name on `sources` opens that channel's own screen: the three switches, the audio
@@ -297,6 +299,19 @@ creates no channel in Telegram, it names no series for a channel whose title say
 stop reading a series' only source — a switch that would leave a season with nothing to read is proposed and
 left alone. `✨ Let it switch on its own` is the one part that keeps working by itself: with it on, every
 reconciliation (which runs at boot) re-reads the roles and applies a role change the first time it notices.
+
+`📨 Who is waiting` (`/joinreq`) is the same campaign `/campaign` drives, with the typing taken out. It lists
+only the channels this account can post in — rights asked of Telegram on the spot, because a campaign writes
+from that session — and `➕ Add a channel` files one that has no row yet through the same writer discovery
+uses, founding the series row from the channel's own name and saying so in the reply. The campaign is drafted
+from the saved `/joinmsg` wording under one fixed name, so no name has to be invented, and what `confirm`
+gates with a code the wizard computes instead of asking for: the plan (the exact words, the ceiling, who is
+waiting right now) is the screen before the start tap, so the tap is the reading of it. `app/writers.py` then
+writes to **one person every 3 seconds** and stops at 20 per run so a run cannot outlive its job lease; the
+rest is handed to the next run under a key counted by the contacts already recorded, which is the same key the
+boot sweep uses, so a Render spin-down resumes a half-sent list instead of stranding it — and the two paths
+cannot queue the same send twice. `⏸ Stop` pauses after the message in flight; what was sent stays sent, and
+nothing in this flow approves or declines a join request.
 
 A destination's own screen is where the announcement is built: what it publishes, the card post a shareable
 link is made from and whether one was ever returned, the three in-place taps, `📣 Campaigns` and

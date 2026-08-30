@@ -867,7 +867,13 @@ def joinreq_screen(
     body = list(lines)
     buttons: list[list[dict[str, str] | None]] = []
     for choice in choices:
-        made = button(str(choice.get("label") or ""), payload_for(str(choice.get("command") or "")))
+        # A choice either runs a command (`x:/…`) or opens another screen (`n:…`), and both halves are said
+        # here rather than guessed at by the caller: a button that was meant to open the wording screen and
+        # silently disappeared because its payload did not start with a slash is the failure this prevents.
+        payload = payload_for(str(choice.get("command") or "")) if choice.get("command") else None
+        if payload is None and choice.get("screen"):
+            payload = f"{NAV_PREFIX}{str(choice['screen']).strip()}"
+        made = button(str(choice.get("label") or ""), payload or "")
         if made is None:
             body.append(f"  too long for a button — type it: {choice.get('command')}")
             continue

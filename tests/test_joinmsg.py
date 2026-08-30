@@ -146,7 +146,9 @@ async def test_the_command_saves_picks_refuses_and_never_claims_it_sent() -> Non
     shown = await say(control, "/joinmsg show")
     assert "Saved text (44 chars)" in shown[0], shown[0]
     assert "{name}, aapka request dekh liya jaa raha hai" in shown[0]
-    assert "nobody has gone out" in shown[0].casefold() or "nothing has gone out" in shown[0].casefold()
+    # The note may say what a campaign *will* say, and must never read as a report of what it *did*.
+    assert "does not mean sent" in shown[0].casefold(), shown[0]
+    assert "sent to" not in shown[0].casefold() and "delivered" not in shown[0].casefold()
 
     picked = await say(control, "/joinmsg use 2")
     assert any("saved" in line for line in picked), picked
@@ -197,7 +199,7 @@ async def test_no_subcommand_becomes_a_send() -> None:
     # nothing else. No enqueue call and no campaign table in the whole block means the start step cannot be
     # reached by accident from the wording screen, whatever gets added to either side later.
     assert "enqueue" not in block, "the wording command may not queue a job"
-    assert "join_campaign" not in block, "and it may not move a campaign's status either
+    assert "join_campaign" not in block, "and it may not move a campaign's status either"
 
 
 def test_the_spec_stops_saying_tbd_for_this_sentence() -> None:

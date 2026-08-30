@@ -58,7 +58,7 @@ Owner private Telegram chat  (control commands, review queues, approvals)
 | Config: fail-closed live mode, masked secrets, pooler detection | built, tested |
 | Deployment: `render.yaml` Blueprint, UptimeRobot `/health`, Dockerfile deliberately absent | built, tested |
 | Credential guard (`scripts/check_secrets.py`) + CI (`ops/ci.yml`) | built, tested |
-| Control bot: `/status` `/pause` `/probe` `/login` `/sessions` `/declare` `/source` `/destination` `/discover` (owner-only, [docs](docs/control-bot.md)) | built; tested against a fake transport, so Telegram-side behaviour is unverified from this network |
+| Control bot: `/status` `/pause` `/probe` `/login` `/sessions` `/declare` `/source` `/destination` `/discover` `/joinreq` (owner-only, [docs](docs/control-bot.md)) | built; tested against a fake transport, so Telegram-side behaviour is unverified from this network |
 | Local login helper (`scripts/login.py`) | kept as the offline fallback; the bot is the default path |
 | Source scanning and metadata parsing (series, season, episode, language, quality) | built (`normalize.py`, `ingest.py`); the live listener that feeds it needs a session |
 | Season boundaries: declared vs inferred, sticker ordering, publish hold | built (`seasons.py`, [docs](docs/seasons-and-channels.md)) |
