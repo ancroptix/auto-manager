@@ -15,6 +15,7 @@ Each of those is cheap to break and expensive to discover in front of a channel.
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 
 import pytest
 
@@ -251,3 +252,195 @@ def test_no_write_result_is_consumed_without_a_gate() -> None:
 
 def ast_unparse_line(src: str, line: int) -> str:  # noqa: D103 - a helper for the message above
     return src.splitlines()[line - 1].strip()[:60]
+
+
+# --------------------------------------------------------------------------- the join-request campaign
+class CampaignDb:
+    """The statements one campaign run makes, in order, with nothing invented between them.
+
+    This fake answers like a database only where the handler asks; every other query returns nothing,
+    because a silent `[]` is the answer that makes a wrong SQL string fail in the test instead of in a
+    DM thread. The point of recording `enqueue` calls is the hand-off: a campaign that stops early has to
+    ask for its next run, and a run that asks twice would message the same stranger twice.
+    """
+
+    def __init__(self, *, waiting: int, rate: int = 100, recorded: int = 0) -> None:
+        self.waiting = waiting
+        self.rate = rate
+        self.recorded = recorded
+        self.sql: list[tuple[str, tuple]] = []
+        self.queued: list[tuple[str, str]] = []
+
+    async def fetchrow(self, statement: str, *args):
+        self.sql.append((statement, args))
+        if "from app.join_campaign c" in statement:
+            return {
+                "id": 7,
+                "status": "ready",
+                "name": "default",
+                "message_template": "{name}, aapka request dekh liya jaa raha hai",
+                "rate_per_hour": self.rate,
+                "destination_id": 21,
+                "telegram_channel_id": -1002575861262,
+                "title": "Dekin no mogura Anime in Hindi",
+            }
+        return None
+
+    async def fetch(self, statement: str, *args):
+        self.sql.append((statement, args))
+        return []
+
+    async def fetchval(self, statement: str, *args):
+        self.sql.append((statement, args))
+        if "count(*) from app.join_campaign_contact" in statement and "sent_at" not in statement:
+            # The table's own count, so the continuation key is derived from what was recorded rather than
+            # from a number the test happens to agree with.
+            return self.recorded + sum(1 for sql, _ in self.sql if "insert into app.join_campaign_contact" in sql)
+        return 0
+
+    async def execute(self, statement: str, *args) -> int:
+        self.sql.append((statement, args))
+        return 1
+
+    async def enqueue(self, kind: str, dedup_key: str, **kwargs):
+        self.queued.append((kind, dedup_key))
+        return {"id": 99}
+
+
+class CampaignSender:
+    """The two calls the campaign makes on the session: who is waiting, and one text to one person."""
+
+    def __init__(self, *, action: str = "sent") -> None:
+        self.action = action
+        self.sent: list[tuple[str, str]] = []
+
+    async def pending_requests(self, peer, *, limit: int = 100):
+        rows = [{"user_id": 900 + n, "about": "", "date": ""} for n in range(self._waiting)]
+        return sender.Result(ok=True, action="read_requests", detail=f"{len(rows)} pending"), rows
+
+    def set_waiting(self, count: int) -> None:
+        self._waiting = count
+
+    async def send_text(self, peer, text: str, **kwargs):
+        self.sent.append((str(peer), text))
+        return sender.Result(ok=True, action=self.action, detail="sent")
+
+
+def _campaign_writers(db, *, outbound: bool, action: str = "sent") -> Writers:
+    from types import SimpleNamespace
+
+    writers = Writers(db=db, settings=SimpleNamespace(outbound_enabled=outbound))
+    transport = CampaignSender(action=action)
+    transport.set_waiting(db.waiting)
+    writers._writer = lambda peers, **kwargs: transport  # type: ignore[assignment]
+    writers.transport = transport  # type: ignore[attr-defined]
+    return writers
+
+
+@pytest.mark.asyncio
+async def test_a_campaign_writes_to_one_person_every_three_seconds(monkeypatch) -> None:
+    """The operator's own pacing — "har 3 second me ek user ko message" — as an assertion on the sleeps.
+
+    Spacing the sends is the *slower* of the two choices the queue allows, and the loop has to stay that
+    way however the ceiling is configured: a campaign that could write 1 200 messages an hour would
+    otherwise fire them back to back at people who only asked to join a channel.
+    """
+    from app import writers as writers_module
+
+    slept: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        slept.append(delay)
+
+    monkeypatch.setattr(writers_module.asyncio, "sleep", fake_sleep)
+    db = CampaignDb(waiting=5, rate=100)
+    handlers = _campaign_writers(db, outbound=True)
+
+    result = await handlers.join_request_campaign({"campaign_id": 7}, None)
+
+    assert result["sent"] == 5 and result["failed"] == 0
+    assert slept == [writers_module.JOIN_SEND_GAP_SECONDS] * 4, "a gap between sends, none before the first"
+    assert db.queued == [], "everyone is done, so there is no next run to ask for"
+    closing = [args for sql, args in db.sql if "app.join_campaign set status" in sql]
+    assert closing and closing[-1][1] == "completed" and closing[-1][2] is True, closing
+
+
+@pytest.mark.asyncio
+async def test_a_run_stops_at_the_lease_and_hands_the_rest_to_the_next_one(monkeypatch) -> None:
+    """Twenty people per run, then the next run under a key nobody else can duplicate.
+
+    `app.enqueue_job` gives a claimed job 120 seconds and `release_expired_locks` re-queues a stale one:
+    a handler that slept its way through 300 contacts would be handed to a second worker while the first was
+    still dialling, and two passes over the same strangers is the one thing a DM campaign must not do. The
+    continuation key counts the contacts already recorded, so the two paths that could resume this
+    campaign — the runner and the boot-time sweep in `app/handlers.py` — land on the same row.
+    """
+    from app import keys
+    from app import writers as writers_module
+
+    slept: list[float] = []
+    monkeypatch.setattr(writers_module.asyncio, "sleep", lambda delay: slept.append(delay) or _noop())
+
+    async def _noop():
+        return None
+
+    db = CampaignDb(waiting=writers_module.JOIN_MAX_PER_RUN + 7, rate=1000)
+    handlers = _campaign_writers(db, outbound=True)
+
+    result = await handlers.join_request_campaign({"campaign_id": 7}, None)
+
+    assert result["sent"] == writers_module.JOIN_MAX_PER_RUN, "the batch is capped, not the list"
+    assert result["waiting_after"] == 7 and result["continued"] is True
+    assert len(slept) == writers_module.JOIN_MAX_PER_RUN - 1
+    assert db.queued == [
+        ("join_request_campaign", keys.campaign_run_key(7, db.recorded + writers_module.JOIN_MAX_PER_RUN))
+    ]
+    assert not any("'completed'" in sql for sql, _ in db.sql), "the campaign is still running"
+
+
+@pytest.mark.asyncio
+async def test_a_shadow_run_does_not_pace_itself(monkeypatch) -> None:
+    """Nothing goes on the wire in shadow mode, so sleeping between plans would only make a dry run slow.
+
+    The count is still spent the way a live run spends it — the ceiling has to be honest about what this
+    plan would cost — but the gap exists to protect real messages from looking like a flood.
+    """
+    from app import writers as writers_module
+
+    slept: list[float] = []
+    monkeypatch.setattr(writers_module.asyncio, "sleep", lambda delay: slept.append(delay) or _noop())
+
+    async def _noop():
+        return None
+
+    db = CampaignDb(waiting=4, rate=100)
+    handlers = _campaign_writers(db, outbound=False, action="planned")
+
+    result = await handlers.join_request_campaign({"campaign_id": 7}, None)
+
+    assert slept == []
+    assert result["sent"] == 4, "planned sends are counted, which is what keeps the ceiling honest"
+
+
+def test_the_resume_key_counts_contacts_instead_of_trying_again() -> None:
+    """Two callers, one key, no duplicate run — and a key that moves only when the campaign moved."""
+    from app import keys
+
+    assert keys.campaign_run_key(7, 0) == "campaign:7:run0"
+    assert keys.campaign_run_key(7, 12) == "campaign:7:run12"
+    assert keys.campaign_run_key(7, -3) == keys.campaign_run_key(7, 0), "no negative counter in a key"
+    assert keys.campaign_run_key(7, 12) != keys.campaign_key(21, "default"), "a run is not a start"
+
+
+def test_the_boot_sweep_resumes_a_campaign_that_was_left_running() -> None:
+    """Render free tier sleeps in fifteen minutes; a half-sent campaign has to be picked up, not forgotten.
+
+    Asserted on the statement and the key rather than on a mock of the loop, because the bug this guards is
+    the resume asking for a job under a key that the still-queued run already holds: that dedupes to nothing,
+    and the operator sees a campaign sitting at `running` with nobody assigned to it.
+    """
+    from app import handlers as handlers_module
+
+    source = Path(handlers_module.__file__).read_text(encoding="utf-8")
+    assert "campaign_run_key" in source, "the resume has to use the shared key, not its own spelling"
+    assert "status in ('ready', 'running')" in source

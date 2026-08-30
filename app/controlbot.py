@@ -93,6 +93,7 @@ HELP = """auto-manager control
 /card        name the post a shareable link is made from, per destination channel (the announcement)
 /sticker     which sticker message opens a season, and from where
 /campaign    draft, plan, confirm a join-request campaign: two steps before anyone is messaged
+/joinreq     the same thing by button: pick a channel you post in, read the plan, start (1 per 3 seconds)
 /sessions    stored Telegram sessions (never their contents)
 /use <name>  make one session the active account
 /forget <n>  delete a stored session from the database
@@ -127,6 +128,7 @@ _ROUTES: dict[str, str] = {
     "source": "_source",
     "sources": "_sources",
     "discover": "_discover",
+    "joinreq": "_joinreq",
     "destination": "_destination",
     "destinations": "_destination",
     "archive": "_archive",
@@ -554,6 +556,255 @@ class ControlBot:
         )
         return [Reply(text, markup=mark)]
 
+    _JOINREQ_USAGE = (
+        "usage: /joinreq [plan | open <ref> | start <ref> | go <ref> | stop <ref> | add | file <n>]\n"
+        "  /joinreq                every channel this account can post in, and what is set for it\n"
+        "  /joinreq open #21       that channel: the message, what has been sent, and the start button\n"
+        "  /joinreq start #21      the plan — who is waiting right now, and the exact words\n"
+        "  /joinreq go #21         start it: one person every 3 seconds, nobody twice, no approvals\n"
+        "  /joinreq stop #21       stop after the message in flight; what was sent stays sent\n"
+        "  /joinreq add            read the account and list the channels it can post in that are not here\n"
+        "  /joinreq file 3         file that channel as a series' publishing channel and open it\n\n"
+        "Which channel is offered is read from Telegram now, not from a cached list: the account has to be "
+        "the owner or an admin who may post there, and a channel where it is only a member is not offered. "
+        "Nothing here approves or declines a join request, and no message is written to anyone before the "
+        "plan has been shown."
+    )
+
+    #: The campaign the buttons use. One name per channel is the whole interface — a campaign name an
+    #: operator has to invent is a typed step, and `/campaign <channel> list` still shows every name that
+    #: exists, including the ones typed before this screen did.
+    _JOINREQ_CAMPAIGN = "default"
+
+    async def _joinreq_row(self, destination_id: int, name: str) -> dict | None:
+        """The campaign row behind one channel, with what has been sent. A read, twice used and never written."""
+        return await self.db.fetchrow(
+            "select c.id, c.name, c.status, c.message_template, c.rate_per_hour,"
+            " (select count(*) from app.join_campaign_contact k where k.campaign_id = c.id"
+            "  and k.status = 'sent') as sent,"
+            " (select count(*) from app.join_campaign_contact k where k.campaign_id = c.id"
+            "  and k.status = 'failed') as failed"
+            " from app.join_campaign c where c.destination_id = $1 and lower(c.name) = lower($2)",
+            int(destination_id),
+            name,
+        )
+
+    async def _joinreq_screen(self, lines: list[str], choices: list[dict], ran: str) -> list[Reply]:
+        text, mark = console.joinreq_screen(lines, choices, note=console.screen_note(ran))
+        return [Reply(text, markup=mark)]
+
+    async def _joinreq_open(self, destination: Mapping[str, Any]) -> list[Reply]:
+        """One channel: what it will say, what it already said, and the one button that starts it."""
+        from . import joinmsg, writers  # noqa: PLC0415  (the pace constant lives with the loop it paces)
+
+        name = self._JOINREQ_CAMPAIGN
+        row = await self._joinreq_row(int(destination["id"]), name)
+        where = str(destination.get("title") or destination.get("telegram_channel_id") or destination["id"])
+        lines = [f"{where} — series {destination.get('series') or '?'}"]
+        if row is None:
+            saved = " ".join(str(await self.db.config(joinmsg.CONFIG_KEY, "") or "").split())
+            lines.append(
+                "the message: "
+                + (f"saved wording, {len(saved)} chars — {saved[:120]}" if saved else
+                   "nothing is saved yet, so 📩 Join message has to fill the wording in first")
+            )
+            lines.append("campaign: not started")
+        else:
+            lines.append(f"the message: {row.get('message_template') or '(empty)'}")
+            lines.append(
+                f"campaign: {row['status']}, {int(row.get('sent') or 0)} sent, {int(row.get('failed') or 0)} failed"
+            )
+        lines.append(
+            f"pace: one person every {writers.JOIN_SEND_GAP_SECONDS:g} seconds, at most "
+            f"{int((row or {}).get('rate_per_hour') or 20)} per hour, and nobody is written to twice"
+        )
+        choices = []
+        if row is None or str(row.get("status")) in {"draft", "paused", "failed"}:
+            choices.append({"label": "▶️ Start sending", "command": f"/joinreq start #{destination['id']}"})
+        else:
+            choices.append({"label": "⏸ Stop after this one", "command": f"/joinreq stop #{destination['id']}"})
+            choices.append({"label": "▶️ Keep going", "command": f"/joinreq start #{destination['id']}"})
+        choices.append({"label": "✏️ Change the message", "command": "n:joinmsg"})
+        choices.append({"label": "📨 Other channels", "command": "/joinreq"})
+        return await self._joinreq_screen(lines, choices, f"/joinreq open #{destination['id']}")
+
+    async def _joinreq_list(self) -> list[Reply]:
+        """Every publishing channel this account can actually post in, and what each one is set to do."""
+        from . import discover  # noqa: PLC0415
+
+        dialogs = await self._discover_dialogs(verify_rights=True)
+        if isinstance(dialogs, str):
+            return [Reply(f"{dialogs}\n\n{self._JOINREQ_USAGE}")]
+        roles = {
+            str(one.get("id")): discover.role_of(one)
+            for one in dialogs
+            if isinstance(one, Mapping) and one.get("id") is not None
+        }
+        rows = list(await self.db.fetch(self._CONSOLE_DEST_SQL + " order by d.id") or [])
+        lines = [f"{len(rows)} publishing channel(s) are on record, and the rights were read now."]
+        choices: list[dict] = []
+        for row in rows:
+            role = roles.get(str(row.get("telegram_channel_id"))) or roles.get(
+                str(row.get("telegram_channel_id") or "").replace("-100", "")
+            )
+            campaign = await self._joinreq_row(int(row["id"]), self._JOINREQ_CAMPAIGN)
+            state = f"{campaign['status']}, {int(campaign.get('sent') or 0)} sent" if campaign else "not started"
+            if role is None:
+                lines.append(
+                    f"• {row.get('title') or row.get('telegram_channel_id')} — {state}; this account was not "
+                    "in the list it just read, so nothing here says it can post (🔎 Find channels reads it)"
+                )
+                continue
+            if role not in (discover.OWNER, discover.ADMIN):
+                # The message goes out from this account, so a channel it cannot post in cannot run a
+                # campaign. Saying which row it *is* (a source) is the fix, not a dead end.
+                lines.append(
+                    f"• {row.get('title') or row.get('telegram_channel_id')} — the account is only a "
+                    f"{role} there, so it cannot be asked to message people; 🔎 Find channels files it as a source"
+                )
+                continue
+            lines.append(f"• {row.get('title') or row.get('telegram_channel_id')} — {role}, {state}")
+            choices.append({"label": f"📨 {str(row.get('title') or row['id'])[:34]}", "command": f"/joinreq open #{row['id']}"})
+        choices.append({"label": "➕ Add a channel", "command": "/joinreq add"})
+        return await self._joinreq_screen(lines, choices, "/joinreq")
+
+    async def _joinreq_add(self) -> list[Reply]:
+        """The channels this account posts in that have no row yet — the same read /discover makes."""
+        from . import discover  # noqa: PLC0415
+
+        dialogs = await self._discover_dialogs(verify_rights=True)
+        if isinstance(dialogs, str):
+            return [Reply(f"{dialogs}\n\n{self._JOINREQ_USAGE}")]
+        plan = await discover.unfiled_channels(self.db, dialogs)
+        candidates = [one for one in plan["findings"] if one.get("use") == "destination"]
+        if not candidates:
+            return await self._joinreq_screen(
+                [
+                    "nothing new to add: every channel this account can post in is already on the list,",
+                    f"and {plan['read']} dialog(s) were read just now.",
+                ],
+                [{"label": "📨 Back to the channels", "command": "/joinreq"}],
+                "/joinreq add",
+            )
+        lines = ["pick the channel the join requests came into — it becomes that series' publishing channel:"]
+        for finding in candidates[: console.LIST_LIMIT]:
+            lines.append(
+                f"  {finding['index']}. {finding.get('title') or finding['channel']} — {finding['role']}"
+                + (f", series {finding['series']}" if finding.get("series") else "")
+            )
+        if len(candidates) > console.LIST_LIMIT:
+            lines.append(f"  … and {len(candidates) - console.LIST_LIMIT} more; /sources lists every channel")
+        choices = [
+            {"label": f"✅ {str(one.get('title') or one['channel'])[:34]}", "command": f"/joinreq file {one['index']}"}
+            for one in candidates[: console.LIST_LIMIT]
+        ]
+        return await self._joinreq_screen(lines, choices, "/joinreq add")
+
+    async def _joinreq_file(self, number: str) -> list[Reply]:
+        """File one picked channel as a destination, through discovery's writer, then open it."""
+        from . import discover  # noqa: PLC0415
+
+        dialogs = await self._discover_dialogs(verify_rights=True)
+        if isinstance(dialogs, str):
+            return [Reply(f"{dialogs}\n\n{self._JOINREQ_USAGE}")]
+        plan = await discover.unfiled_channels(self.db, dialogs)
+        wanted = (number or "").strip().lstrip("#")
+        finding = next(
+            (
+                one
+                for one in plan["findings"]
+                if one.get("use") == "destination" and str(one["index"]) == wanted
+            ),
+            None,
+        )
+        if finding is None:
+            return [Reply(
+                f"nothing on that list is numbered {wanted or '-'}, so nothing was written. "
+                "/joinreq add shows the list again."
+            )]
+        outcome = await discover.add_destination(self.db, finding)
+        if not outcome.get("ok") and "already a destination row" not in str(outcome.get("text") or ""):
+            return [Reply(f"it could not be filed:\n{outcome.get('text')}\n\n{self._JOINREQ_USAGE}")]
+        row_id = await discover._row_id(self.db, "app.destination", str(finding["channel"]))
+        if row_id is None:
+            return [Reply("the row was written but cannot be read back, so the screen stays closed.")]
+        found = await self._find_destination(f"#{row_id}")
+        if isinstance(found, str) or not found:
+            return [Reply("filed, but the channel is not readable back yet — open it again in a moment.")]
+        return await self._joinreq_open(found[0])
+
+    async def _joinreq(self, update: Update, args: list[str]) -> list[Reply]:
+        """``/joinreq`` — the join-request campaign, startable without typing a channel or a name.
+
+        Three taps, in the order the operator described: pick the channel the requests came into (only the
+        ones this account can post in are offered, and that is read from Telegram on the spot), see the exact
+        words and who is waiting, start. `app/writers.py` then sends one message every
+        `JOIN_SEND_GAP_SECONDS` up to the campaign's own hourly ceiling, and a campaign that is not finished
+        is handed to the next run so a restart or a spin-down does not strand half a list.
+
+        What is deliberately kept from `/campaign`: the row is still drafted from the saved `/joinmsg` wording
+        and still has to pass `confirm` — the code is computed here instead of typed, because the tap on the
+        plan *is* the reading of the plan, and an operator who never sees the words must not be able to start
+        a DM to two hundred strangers by accident.
+        """
+        from . import joinmsg  # noqa: PLC0415
+
+        if self.db is None or not getattr(self.db, "connected", False):
+            return [Reply(
+                "the database is not reachable, so there is no campaign to start. `/status` names the reason."
+            )]
+        action = (args[0].strip().casefold() if args else "plan")
+        if action in {"help", "-h", "?"}:
+            return [Reply(self._JOINREQ_USAGE)]
+        if action in {"plan", "list", "show", "refresh"}:
+            return await self._joinreq_list()
+        if action == "add":
+            return await self._joinreq_add()
+        if action == "file":
+            return await self._joinreq_file(" ".join(args[1:]).strip())
+        if action not in {"open", "start", "go", "stop"}:
+            return [Reply(f"`{action}` is not something /joinreq does, so nothing was written.\n\n{self._JOINREQ_USAGE}")]
+        ref = " ".join(args[1:]).strip()
+        if not ref:
+            return [Reply(f"`{action}` needs a channel — the number on the button, or #21.\n\n{self._JOINREQ_USAGE}")]
+        found = await self._find_destination(ref)
+        if isinstance(found, str):
+            return [Reply(f"{found}\n\n{self._JOINREQ_USAGE}")]
+        if len(found) > 1:
+            return [Reply("that name matches more than one channel; use the number on the button.")]
+        destination = found[0]
+        name = self._JOINREQ_CAMPAIGN
+        handle = f"#{int(destination['id'])}"
+
+        if action == "open":
+            return await self._joinreq_open(destination)
+        if action == "stop":
+            return await self._campaign(update, [handle, "pause", name])
+        if action == "start":
+            if await self._joinreq_row(int(destination["id"]), name) is None:
+                drafted = await self._campaign(update, [handle, "new", name])
+                if await self._joinreq_row(int(destination["id"]), name) is None:
+                    # `new` refused — there is nothing saved to draft from, or the wording breaks a rule.
+                    # Its own sentence is the answer; starting on an empty template would be sending "".
+                    return drafted
+            planned = (await self._campaign(update, [handle, "plan", name]))[0].text
+            return await self._joinreq_screen(
+                [planned, "", "One person every 3 seconds, and nobody is written to twice by this campaign."],
+                [
+                    {"label": "✅ Yes, start sending", "command": f"/joinreq go {handle}"},
+                    {"label": "🧿 Not now", "command": f"/joinreq open {handle}"},
+                ],
+                f"/joinreq start {handle}",
+            )
+        row = await self._joinreq_row(int(destination["id"]), name)
+        if row is None:
+            return [Reply(
+                "there is no campaign to start for that channel yet — 📨 open it and tap Start, which drafts "
+                "one from the saved /joinmsg wording."
+            )]
+        code = joinmsg.confirm_code(int(row["id"]), row.get("message_template"))
+        return await self._campaign(update, [handle, "confirm", name, code])
+
     _DESTINATION_USAGE = (
         "usage: /destination [<series|@handle|channel id>] [action]\n"
         "  /destination                          every destination channel, with its buttons\n"
@@ -823,9 +1074,9 @@ class ControlBot:
         "  /joinmsg use 2        save one of them as the message\n"
         "  /joinmsg set <text>   save your own words ({name} and {series} are filled in)\n"
         "  /joinmsg clear        empty it — the app may contact nobody\n\n"
-        "Saving a message does not send one. A campaign is owner-triggered, per channel, and the\n"
-        "sender that would carry it is not built yet (job kind join_request_campaign), so this\n"
-        "command only ever changes what would be said. It never approves or declines a request."
+        "Saving a message does not send one. This command only chooses the words; the sending is a\n"
+        "campaign per channel, started from 📨 Who is waiting (or /joinreq), one person every 3 seconds,\n"
+        "nobody twice. It never approves or declines a join request."
     )
 
     async def _joinmsg(self, update: Update, args: list[str]) -> list[Reply]:
@@ -909,9 +1160,9 @@ class ControlBot:
             return [Reply("cleared. nobody is contacted, and a campaign would have nothing to say.")]
         return [
             Reply(
-                f"saved ({len(' '.join(text.split()))} chars). It goes to nobody yet: sending a "
-                f"join-request campaign is still the blocked job kind join_request_campaign, "
-                f"because there is no sender wired.{note}"
+                f"saved ({len(' '.join(text.split()))} chars). Nobody has been written to yet — this "
+                f"only sets the words, and the sending starts per channel from 📨 Who is waiting "
+                f"(or /joinreq), one person every 3 seconds.{note}"
             )
         ]
 
@@ -1721,6 +1972,10 @@ class ControlBot:
         channel that publishes into it — which is how the operator names these channels anyway.
         """
         stripped = handle.lstrip("@")
+        # `#21` addresses the row by its own number, which is what a button knows and not what a human types.
+        # A bare number stays the channel id — `app.destination.id` is unique, but a typed `21` means the
+        # Telegram number far more often than it means a row, and the row number has to be asked for by name.
+        row_ref = stripped[1:] if stripped.startswith("#") else None
         numeric = int(stripped) if stripped.lstrip("-").isdigit() and stripped != "-" else None
         rows = await self.db.fetch(
             """
@@ -1732,16 +1987,18 @@ class ControlBot:
              where ($1::bigint is not null and d.telegram_channel_id = $1)
                 or ($2::text is not null and lower(btrim(coalesce(d.title, ''))) = lower($2))
                 or ($2::text is not null and lower(btrim(coalesce(sc.username, ''), '@')) = lower($2))
+                or ($3::int is not null and d.id = $3)
              order by d.id
             """,
             numeric,
             stripped,
+            int(row_ref) if row_ref and row_ref.isdigit() else None,
         )
         if not rows:
             return (
-                f"`{handle}` matches no destination channel, by its own id or title or the source "
-                "channel that publishes into it. /destinations lists what exists; a destination row "
-                "is written by the ingest side when a series first arrives."
+                f"`{handle}` matches no destination channel, by its row number (`#21`), its own id, its "
+                "title, or the source channel that publishes into it. /destinations lists what exists, and "
+                "📨 Who is waiting adds a channel this account can post in without leaving the buttons."
             )
         return list(rows)
 
@@ -2259,6 +2516,7 @@ class ControlBot:
         "sources",
         "discover",
         "destinations",
+        "joinreq",
         "queue",
         "bots",
         "sessions",
@@ -2664,6 +2922,10 @@ class ControlBot:
             return [Reply(text, markup=mark)]
         if key == "discover":
             return await self._discover(None, [])
+        if key == "joinreq":
+            # The screen and the command are the same code on purpose: the tap on 📨 has to show exactly
+            # what `/joinreq` would print, including the rights read that decides which channels are offered.
+            return await self._joinreq(None, [])
         if key == "destinations":
             rows, extra = await self._console_screen_rows("d")
             text, mark = console.destinations_screen(rows, note=note, truncated=extra)

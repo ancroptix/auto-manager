@@ -85,6 +85,7 @@ __all__ = [
     "add_destination",
     "sweep",
     "name_key",
+    "unfiled_channels",
     "pair_findings",
     "_row_id",
     "apply_pair",
@@ -600,6 +601,18 @@ async def apply_pair(db: Any, pair: Mapping[str, Any]) -> dict[str, Any]:
         "sources": linked,
         "text": "\n".join(line for line in lines if line),
     }
+
+
+async def unfiled_channels(db: Any, dialogs: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """The dialog list against the two config tables: findings for what has no row yet.
+
+    Any command that offers to file a channel has to ask this same question, and the answer is only honest if
+    it comes from the same two SELECTs and the same `classify` the discovery screen runs. A command with its
+    own "is it already there?" query is a command that offers to write a row which exists.
+    """
+    sources = list(await db.fetch(_SOURCES_SQL) or [])
+    destinations = list(await db.fetch(_DESTINATIONS_SQL) or [])
+    return classify(dialogs, sources=sources, destinations=destinations)
 
 
 async def sweep(db: Any, dialogs: Sequence[Mapping[str, Any]], *, auto: bool) -> dict[str, Any]:

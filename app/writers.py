@@ -29,6 +29,7 @@ and an answer that does not parse is a blocked job rather than a retry.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any, Mapping, Sequence
 
@@ -881,6 +882,20 @@ async def season_sticker(self: Writers, job: dict[str, Any], ctx: Any) -> dict[s
     return {"season_id": int(season_id), "result": sender.describe(result), "sticker_message_id": result.message_id}
 
 
+#: One message per this many seconds, per the operator's own instruction: "har 3 second me ek user ko
+#: message." A fixed gap between sends is the *slower* choice than the queue allows, and `rate_per_hour`
+#: still stops the run at the ceiling — the gap spaces the messages out, it does not raise the ceiling, and
+#: nothing here sleeps to dodge a flood wait (`app/sender.py` holds that rule where a wait is real).
+JOIN_SEND_GAP_SECONDS = 3.0
+
+#: How many people one run may contact. `app.enqueue_job` gives a claimed job a 120-second lease and
+#: `release_expired_locks` hands a stale one to whoever asks next, so a run that sleeps past its lease would
+#: be claimed a second time while the first is still dialling — two passes over the same strangers, which is
+#: the one failure mode a campaign of DMs must not have. Twenty at three seconds apart finishes inside the
+#: lease with room to spare, and the rest is handed to the next run.
+JOIN_MAX_PER_RUN = 20
+
+
 async def join_request_campaign(self: Writers, job: dict[str, Any], ctx: Any) -> dict[str, Any]:
     """Answer the still-pending join requests of one channel with the operator's own sentence.
 
@@ -955,12 +970,19 @@ async def join_request_campaign(self: Writers, job: dict[str, Any], ctx: Any) ->
 
     message = " ".join(str(campaign["message_template"]).split())
     series = str(campaign.get("title") or "")
+    batch_real_send = bool(getattr(self.settings, "outbound_enabled", False))
     # No peer allowlist for the people themselves: they are named by Telegram's own list of pending
     # requests for this channel, which is as close to "this account asked to be contacted" as a
     # campaign gets. The ceiling and the one-per-person rule are what bound it.
-    writer = self._writer([], max_writes=budget)
+    batch = waiting[: min(budget, JOIN_MAX_PER_RUN)]
+    writer = self._writer([], max_writes=len(batch))
     sent = failed = 0
-    for entry in waiting[:budget]:
+    for position, entry in enumerate(batch):
+        if position and batch_real_send:
+            # Between sends, never before the first, and not at all in shadow mode: a planned message puts
+            # nothing on the wire, so making a dry run of this take a minute per twenty people would be a
+            # slow test, not a safe one.
+            await asyncio.sleep(JOIN_SEND_GAP_SECONDS)
         user_id = int(entry["user_id"])
         await self.db.execute(
             "insert into app.join_campaign_contact (campaign_id, telegram_user_id, status, attempts)"
@@ -988,7 +1010,7 @@ async def join_request_campaign(self: Writers, job: dict[str, Any], ctx: Any) ->
                 user_id,
                 result.detail[:400],
             )
-    remaining = len(waiting) - (sent + failed)
+    remaining = len(waiting) - len(batch)
     finished = remaining <= 0
     # The status is passed as text and cast, and the "did we run out of people" flag is its own
     # parameter: reusing $2 for both the enum column and a `case when $2 = 'completed'` comparison makes
@@ -1001,7 +1023,31 @@ async def join_request_campaign(self: Writers, job: dict[str, Any], ctx: Any) ->
         "completed" if finished else "running",
         finished,
     )
-    return {"campaign_id": int(campaign_id), "sent": sent, "failed": failed, "waiting_after": max(0, remaining)}
+    if not finished:
+        # Passed to the next run rather than slept through, because the next run is also what a restart or a
+        # Render spin-down resumes from — `app/handlers.py` uses the same key for the same reason, so a
+        # campaign is never sent to twice by the overlap of the two paths.
+        recorded = int(
+            await self.db.fetchval(
+                "select count(*) from app.join_campaign_contact where campaign_id = $1", int(campaign_id)
+            )
+            or 0
+        )
+        await self.db.enqueue(
+            JobKind.JOIN_REQUEST_CAMPAIGN.value,
+            keys.campaign_run_key(int(campaign_id), recorded),
+            stage=JobStage.DISCOVERED,
+            payload={"campaign_id": int(campaign_id), "destination_id": campaign.get("destination_id")},
+            destination_id=campaign.get("destination_id"),
+        )
+    return {
+        "campaign_id": int(campaign_id),
+        "sent": sent,
+        "failed": failed,
+        "waiting_after": max(0, remaining),
+        "gap_seconds": JOIN_SEND_GAP_SECONDS,
+        "continued": not finished,
+    }
 
 
 # --- mixed into Writers, and the registry the worker reads ---------------------------------------

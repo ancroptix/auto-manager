@@ -28,6 +28,25 @@ from typing import Any, Awaitable, Callable, Mapping
 from . import ingest, storagebot, thumbnails
 from .db import Database
 from . import discover
+
+#: Campaigns the boot sweep picks up again. A run of `app/writers.py`'s campaign handler stops after what
+#: fits inside its job lease and asks for its next run under `keys.campaign_run_key`, counted by the contacts
+#: already recorded — so this query asks for the *same* key, and `app.enqueue_job`'s unique dedup key
+#: swallows one of the two. `queued` and `running` are the states in which a job already exists, and a
+#: `blocked` campaign is left alone on purpose: that status means a human has to answer something.
+RESUMABLE_CAMPAIGNS_SQL = (
+    "select c.id, c.destination_id,"
+    " (select count(*) from app.join_campaign_contact k where k.campaign_id = c.id) as contacts"
+    " from app.join_campaign c"
+    " where c.status in ('ready', 'running')"
+    " and c.message_template is not null and btrim(c.message_template) <> ''"
+    " and not exists ("
+    "   select 1 from app.job j"
+    "    where j.kind = 'join_request_campaign'"
+    "      and j.status in ('queued', 'running')"
+    "      and (j.payload ->> 'campaign_id')::int = c.id"
+    " ) order by c.id limit 10"
+)
 from .keys import archive_key
 from .stages import JobKind, JobStage
 from .writers import FeatureNotImplemented, NeedsInput, build_writers
@@ -175,6 +194,29 @@ async def reconciliation(job: dict[str, Any], ctx: Context) -> dict[str, Any]:
                 )
     except Exception as exc:  # noqa: BLE001 - a sweep that fails must not fail the reconciliation
         log.warning("reconciliation: channel roles could not be re-read (%s)", str(exc)[:160])
+    # A campaign that was half-sent when the instance stopped. Render's free tier spins down, and a
+    # join-request campaign that quietly stays at `running` with nobody assigned to it is the worst of both:
+    # the operator believes people are being written to, and they are not. Same key as the runner's own
+    # hand-off, so the two paths cannot queue the same run twice.
+    try:
+        from . import keys  # noqa: PLC0415
+        from .stages import JobKind, JobStage  # noqa: PLC0415
+
+        resumed = 0
+        for row in list(await ctx.db.fetch(RESUMABLE_CAMPAIGNS_SQL) or []):
+            queued = await ctx.db.enqueue(
+                JobKind.JOIN_REQUEST_CAMPAIGN.value,
+                keys.campaign_run_key(int(row["id"]), int(row.get("contacts") or 0)),
+                stage=JobStage.DISCOVERED,
+                payload={"campaign_id": int(row["id"]), "destination_id": row.get("destination_id")},
+                destination_id=row.get("destination_id"),
+            )
+            resumed += 1 if queued else 0
+        if resumed:
+            log.info("reconciliation: %s join-request campaign run(s) queued", resumed)
+            result["campaigns_resumed"] = resumed
+    except Exception as exc:  # noqa: BLE001 - a resume that fails must not fail the reconciliation
+        log.warning("reconciliation: join campaigns could not be re-queued (%s)", str(exc)[:160])
         result["discover"] = {"error": f"{type(exc).__name__}: {str(exc)[:160]}"}
     return result
 

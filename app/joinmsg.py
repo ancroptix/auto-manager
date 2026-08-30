@@ -17,10 +17,11 @@ So this module owns three things and nothing else:
 * **the refusals**, which is where the judgement lives. See :func:`refusals` — the short version is
   that no campaign text may carry an invite link, and no command here can approve a request.
 
-What is **not** here: a sender. Contacting people is the job kind ``join_request_campaign``, and it
-is still blocked for the same reason as ``publish_post`` — there is no MTProto write path yet. A
-saved message is a *setting*, not a queue of DMs, and :func:`status_note` says so in the same
-breath as the character count, so nobody reads "saved" as "sent".
+What is **not** here: a queue. A saved message is a *setting*, and one person is only written to when a
+campaign for a specific channel is started (:mod:`app.writers`' ``join_request_campaign``, reached from
+``/joinreq`` in the control bot). This module holds the wording and its rules, and refuses both an invite
+link and any wording that reads like a decision about the request — :func:`status_note` says which of the two
+halves is true in the same breath as the character count, so nobody reads "saved" as "sent".
 """
 
 from __future__ import annotations
@@ -217,6 +218,7 @@ def status_note(value: object) -> str:
             "`/joinmsg options` shows three drafts to pick from)"
         )
     return (
-        f"join requests: a message is saved ({len(' '.join(str(value).split()))} chars), and sending "
-        "is still blocked on the campaign sender (join_request_campaign), so nothing has gone out"
+        f"join requests: a message is saved ({len(' '.join(str(value).split()))} chars) and is what a "
+        "campaign will say; it goes out only per channel once that campaign is started (/joinreq), so "
+        "saved here does not mean sent"
     )

@@ -72,6 +72,7 @@ __all__ = [
     "row_payload",
     "source_screen",
     "discover_screen",
+    "joinreq_screen",
     "sources_screen",
     "TABLES",
     "row_ref",
@@ -83,7 +84,7 @@ __all__ = [
 #: fails if the two lists ever disagree in either direction, because a screen nobody can reach is dead code
 #: and a button that leads nowhere is a 404 in a chat window.
 NAV: frozenset[str] = frozenset(
-    {"main", "sources", "destinations", "discover", "queue", "bots", "sessions", "joinmsg", "help"}
+    {"main", "sources", "destinations", "discover", "joinreq", "queue", "bots", "sessions", "joinmsg", "help"}
 )
 
 #: Which table a row of the console lives in, as the one letter that rides in a payload. `app.destination`
@@ -476,7 +477,8 @@ def main_screen(facts: Mapping[str, Any]) -> tuple[str, dict[str, Any] | None]:
         [button("🎙 Sources", f"{NAV_PREFIX}sources"), button("📤 Destinations", f"{NAV_PREFIX}destinations")],
         [button("🔎 Find channels", f"{NAV_PREFIX}discover")],
         [button("🔌 Queue", f"{NAV_PREFIX}queue"), button("🤖 Bots", f"{NAV_PREFIX}bots")],
-        [button("📩 Join message", f"{NAV_PREFIX}joinmsg"), button("👤 Sessions", f"{NAV_PREFIX}sessions")],
+        [button("📨 Who is waiting", f"{NAV_PREFIX}joinreq"), button("📩 Join message", f"{NAV_PREFIX}joinmsg")],
+        [button("👤 Sessions", f"{NAV_PREFIX}sessions")],
         *_tail("main", None),
     ]
     return render("main", "auto-manager · control", lines, rows)
@@ -849,6 +851,31 @@ def bots_screen(
     return render("bots", "the bots and the archive", lines, buttons, note=note)
 
 
+def joinreq_screen(
+    lines: Sequence[str],
+    choices: Sequence[Mapping[str, str]],
+    *,
+    note: str | None = None,
+) -> tuple[str, dict | None]:
+    """Join requests, one channel per line and one tap to start it.
+
+    `choices` is the whole interface rule of this screen: the *command* decides which taps exist (it is the
+    one that read the account's rights and the campaign rows), and this function only turns them into
+    buttons. A label too long for a button is not sliced — the line stays and the command is written out
+    under it, because a cut label describes a different channel than the one it would open.
+    """
+    body = list(lines)
+    buttons: list[list[dict[str, str] | None]] = []
+    for choice in choices:
+        made = button(str(choice.get("label") or ""), payload_for(str(choice.get("command") or "")))
+        if made is None:
+            body.append(f"  too long for a button — type it: {choice.get('command')}")
+            continue
+        buttons.append([made])
+    buttons.extend(_tail("joinreq"))
+    return render("joinreq", "who is waiting to join", body, buttons, note=note)
+
+
 def joinmsg_screen(
     *,
     current: str | None = None,
@@ -857,8 +884,8 @@ def joinmsg_screen(
 ) -> tuple[str, dict | None]:
     """The join-request wording: pick a draft, write your own, or say nothing.
 
-    The wording stays the operator's and only theirs — this screen can save it and cannot send it, and it
-    says so in the same breath, because the sender is still a job kind waiting to be wired.
+    The wording stays the operator's and only theirs — this screen saves it and sends nothing. Sending is a
+    campaign per channel, started from `📨 Who is waiting to join`, which is the button below.
     """
     body = " ".join(str(current or "").split())
     lines = [f"saved now: {body[:220]}" if body else "saved now: nothing — the app may contact nobody."]
@@ -873,6 +900,7 @@ def joinmsg_screen(
         ]
     )
     buttons.append([button("👁 Show the rules", payload_for("/joinmsg"))])
+    buttons.append([button("📨 Who is waiting to join", f"{NAV_PREFIX}joinreq")])
     buttons.extend(_tail("joinmsg"))
     return render("joinmsg", "what a join requester is told", lines, buttons, note=note)
 

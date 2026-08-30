@@ -136,7 +136,11 @@ async def test_the_command_saves_picks_refuses_and_never_claims_it_sent() -> Non
     control, _api, db = bot(db=FakeDb())
 
     saved = await say(control, "/joinmsg set {name}, aapka request dekh liya jaa raha hai")
-    assert any("saved" in line and "join_request_campaign" in line for line in saved), saved
+    # "saved" and "sent" must never share a sentence. The reply names where sending actually starts and how
+    # fast it goes, because that is the question the operator asked when they said the button was missing —
+    # and it must not read as though the wording alone wrote to anybody.
+    assert any("saved" in line and "Nobody has been written to yet" in line for line in saved), saved
+    assert any("3 seconds" in line and "/joinreq" in line for line in saved), saved
     assert db.config_rows["joinrequest.message"].startswith("{name}")
 
     shown = await say(control, "/joinmsg show")
@@ -187,9 +191,13 @@ async def test_no_subcommand_becomes_a_send() -> None:
 
     source = Path(controlbot.__file__).read_text(encoding="utf-8")
     block = source[source.index("    async def _joinmsg") : source.index("    async def _sessions")]
-    for forbidden in ("ready", "running", "start", "send now", "approve", "decline"):
+    for forbidden in ("ready", "running", "start sending", "send now", "approve", "decline"):
         assert forbidden not in block.casefold(), f"/joinmsg grew {forbidden!r} and must not"
-    assert "join_request_campaign" in block, "and it still has to name what is missing"
+    # The stronger form of the same rule, now that a sender exists: this command touches the wording key and
+    # nothing else. No enqueue call and no campaign table in the whole block means the start step cannot be
+    # reached by accident from the wording screen, whatever gets added to either side later.
+    assert "enqueue" not in block, "the wording command may not queue a job"
+    assert "join_campaign" not in block, "and it may not move a campaign's status either
 
 
 def test_the_spec_stops_saying_tbd_for_this_sentence() -> None:

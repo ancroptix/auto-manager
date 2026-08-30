@@ -107,6 +107,10 @@ def build_screen(key: str) -> tuple[str, dict | None]:
         "queue": lambda: console.queue_screen(paused=False, ready=0),
         "bots": lambda: console.bots_screen(),
         "destinations": lambda: console.destinations_screen(DEST_ROWS),
+        "joinreq": lambda: console.joinreq_screen(
+            ["1 publishing channel(s) are on record, and the rights were read now."],
+            [{"label": "➕ Add a channel", "command": "/joinreq add"}],
+        ),
         "discover": lambda: console.discover_screen(
             ["1 dialogs read: 1 worth a decision, 0 already configured"],
             PLAN["findings"],
