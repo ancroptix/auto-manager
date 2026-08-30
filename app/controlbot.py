@@ -79,6 +79,12 @@ HELP = """auto-manager control
 /probe       ask the storage bot and Channel Help their questions (report arrives here)
 /declare     say how long a season is (Total Episodes, and the batch post)
 /source      add a source channel, say what it carries (series, audio, season), flip its switches
+/sources     every source channel, with its switches as buttons (the same list the menu shows)
+/destination the channel a series publishes into: the card post, the link, the campaigns, the counts
+             /destinations                    every one of them, which is what `/destination` alone says
+             /destination <series|@handle|id>  one, with its buttons
+             /destination <one> card <id|show|clear>   campaigns   episodes <season> <count|tba>
+             /destination <one> inplace [plan|off]    (a private channel's id is in any link to a post)
 /archive     which private channel holds the master copy: /archive <@handle|id> add title <name>
 /inplace     caption the files already posted in your own channel (no delete; link + post still run)
 /joinmsg     what a join requester is told: options, your own words, or switch it off
@@ -117,6 +123,9 @@ _ROUTES: dict[str, str] = {
     "probe": "_probe",
     "declare": "_declare",
     "source": "_source",
+    "sources": "_sources",
+    "destination": "_destination",
+    "destinations": "_destination",
     "archive": "_archive",
     "inplace": "_inplace",
     "joinmsg": "_joinmsg",
@@ -354,6 +363,107 @@ class ControlBot:
         if one is None:
             return [Reply(HELP)]
         return [Reply(HELP, markup={"inline_keyboard": [[one]]})]
+
+    async def _sources(self, update: Update, args: list[str]) -> list[Reply]:
+        """`/sources` — every source channel, with its switches as buttons.
+
+        The list the menu shows, reachable by words as well: the console's refusal text points here, and a
+        list that only exists behind a tap cannot be quoted in a bug report or read on a client that renders
+        no keyboards. Same builder, so the two can never disagree.
+        """
+        if self.db is None or not getattr(self.db, "connected", False):
+            return [Reply(
+                "the database is not reachable, so there is nothing to list. `/status` names the reason."
+            )]
+        rows, extra = await self._console_screen_rows("s")
+        text, mark = console.sources_screen(rows, truncated=extra)
+        return [Reply(text, markup=mark)]
+
+    _DESTINATION_USAGE = (
+        "usage: /destination [<series|@handle|channel id>] [action]\n"
+        "  /destination                          every destination channel, with its buttons\n"
+        "  /destination Bleach                   one of them: what it publishes, the card post, the link\n"
+        "  /destination Bleach card 512          make message 512 the post a shareable link is made from\n"
+        "  /destination Bleach card show|clear   what is named, or stop naming it (the stored link stays)\n"
+        "  /destination Bleach campaigns         the join-request campaigns recorded for it\n"
+        "  /destination Bleach campaign new <n>  draft one from the saved /joinmsg wording\n"
+        "  /destination Bleach episodes 2 12     this series' season length (tba goes back to not claiming)\n"
+        "  /destination Bleach inplace plan      caption the files already there instead of posting links\n\n"
+        "A destination is addressed by its own channel id, its title, or the @handle of the source that "
+        "publishes into it — `app.destination` stores no username of its own, so those are the three names "
+        "it can be called by."
+    )
+
+    async def _destination(self, update: Update, args: list[str]) -> list[Reply]:
+        """`/destination` — the channel a series publishes into, and the four things it can be set to.
+
+        This command is here because the bot has been telling people about it for a round: "the card post",
+        "the campaigns", "the link" all belong to a destination row, and each was only reachable through its
+        own command with a channel named in it. So `/destination` resolves the row once — by channel id, by
+        title, or by the source handle paired with it — and hands each action to the command that already
+        owns it. Nothing is written here: `_card`, `_campaign`, `_declare` and `_inplace` stay the only
+        paths that touch those columns, which is what keeps a tap and a typed line the same write.
+        """
+        if self.db is None or not getattr(self.db, "connected", False):
+            return [Reply(
+                "the database is not reachable, so there is nothing to show about a destination channel. "
+                "`/status` names the reason."
+            )]
+        text = [a.strip() for a in args if a.strip()]
+        if not text:
+            rows, extra = await self._console_screen_rows("d")
+            screen, mark = console.destinations_screen(rows, truncated=extra)
+            return [Reply(screen, markup=mark)]
+        if text[0].casefold() in {"help", "-h", "?"}:
+            return [Reply(self._DESTINATION_USAGE)]
+        handle, rest = text[0], text[1:]
+        found = await self._find_destination(handle)
+        if isinstance(found, str):
+            return [Reply(f"{found}\n\n{self._DESTINATION_USAGE}")]
+        if len(found) > 1:
+            names = ", ".join(str(row.get("title") or row.get("id")) for row in found)
+            return [Reply(
+                f"`{handle}` matches {len(found)} destinations ({names}), so I am not picking one. Use the "
+                "channel number."
+            )]
+        row = found[0]
+        full = await self._console_row("d", int(row["id"]))
+        row = full or row
+        action = (rest[0] if rest else "show").casefold()
+        tail = rest[1:]
+        ref = str(row.get("telegram_channel_id") or "").strip()
+        if action == "show":
+            screen, mark = console.destination_screen(row)
+            return [Reply(screen, markup=mark)]
+        if not ref or ref in {"0", "None"}:
+            return [Reply(
+                "this series has a destination row but no channel id stored yet, so there is nothing to "
+                "point a card or a campaign at. The channel is built by the pipeline when the first episode "
+                "is ready — /status shows that job."
+            )]
+        if action == "card":
+            return await self._card(update, [ref, *tail])
+        if action in {"campaigns", "campaign"}:
+            return await self._campaign(update, [ref, *tail])
+        if action == "inplace":
+            return await self._inplace(update, [ref, *tail])
+        if action == "episodes":
+            series = str(row.get("series") or "").strip()
+            if not series:
+                return [Reply(
+                    "this destination row is not linked to a series title I can quote, so there is nothing "
+                    "to declare against. `/declare <series> <season> <count>` names it directly."
+                )]
+            if not tail:
+                return [Reply(
+                    f"how many episodes, and of which season? `/destination {handle} episodes 2 12`\n"
+                    f"(or `tba` as the count, to stop claiming a length for that season)"
+                )]
+            return await self._declare(update, [series, *tail])
+        return [Reply(
+            f"`{action}` is not something /destination does, so nothing was written.\n\n"
+            f"{self._DESTINATION_USAGE}"
+        )]
 
     async def _status(self, update: Update, args: list[str]) -> list[Reply]:
         lines = [
@@ -1963,14 +2073,61 @@ class ControlBot:
     # database and run a command. The keys below are the screens a button may open, and a test
     # (tests/test_console.py) holds this tuple against `console.NAV` in both directions, so neither a
     # screen nobody can reach nor a button that leads nowhere can survive a refactor.
-    _CONSOLE_SCREENS = ("main", "sources", "queue", "bots", "joinmsg", "help")
+    _CONSOLE_SCREENS = (
+        "main",
+        "sources",
+        "destinations",
+        "queue",
+        "bots",
+        "sessions",
+        "joinmsg",
+        "help",
+    )
 
     _CONSOLE_SOURCE_SQL = (
-        "select id, username, title, telegram_channel_id, mode, active, require_hindi_audio, "
-        "include_subbed, coalesce(declared_series, '') as declared_series, "
+        "select id, username, title, telegram_channel_id, destination_id, mode, active, "
+        "require_hindi_audio, include_subbed, coalesce(declared_series, '') as declared_series, "
         "coalesce(declared_audio, '') as declared_audio, "
         "coalesce(declared_season, -1) as declared_season from app.source_channel "
     )
+
+    # The destination rows the screens print. The series title is joined, not subselected, because a
+    # subselect that names `app.series` in the `from` position is a second way to ask the same question —
+    # and the destination half of `/card` already joins it this way, so both readers keep one shape.
+    _CONSOLE_DEST_SQL = (
+        "select d.id, d.title, d.telegram_channel_id, d.publish_mode, d.card_message_id, "
+        "d.announcement_link, d.announcement_link_at, d.channel_help_added, d.owner_promoted, "
+        "sr.title as series from app.destination d "
+        "join app.series sr on sr.id = d.series_id "
+    )
+
+    async def _console_row(self, kind: str, row_id: int) -> dict | None:
+        """One row, read by the table letter a payload carries — the tap's whole point, in one place.
+
+        `console.TABLES` owns the letters and this owns the SQL; nothing else gets to pair them, because the
+        failure of doing it in two places is a destination tap updating a source row — a wrong write, not a
+        wrong screen.
+        """
+        where = "where d.id = $1" if kind == "d" else "where id = $1"
+        rows = await self._console_rows(kind, where=where, args=(row_id,))
+        return rows[0] if rows else None
+
+    async def _console_screen_rows(self, kind: str) -> tuple[list, bool]:
+        """One page of a list, and whether there is more behind it.
+
+        The screen is told, not left to imply it: `app/console.py` prints the cap when the flag is set, and a
+        list that quietly stopped at 50 is the silent truncation this project refuses everywhere else.
+        """
+        rows = await self._console_rows(kind, limit=f" limit {console.LIST_LIMIT + 1}")
+        return rows[: console.LIST_LIMIT], len(rows) > console.LIST_LIMIT
+
+    async def _console_rows(
+        self, kind: str, *, where: str = "", limit: str = "", args: tuple = ()
+    ) -> list:
+        """The list form of the same read, so a screen and a command never disagree about a column."""
+        base = self._CONSOLE_DEST_SQL if kind == "d" else self._CONSOLE_SOURCE_SQL
+        order = "order by d.id" if kind == "d" else "order by id"
+        return list(await self.db.fetch(f"{base}{where} {order}{limit}", *args))
 
     async def _console_tap(self, update: Update, payload: str) -> list[Reply]:
         """One tap, dispatched by the prefix `app/console.py` puts on it.
@@ -1993,14 +2150,14 @@ class ControlBot:
             parsed = console.parse_prompt(payload)
             if parsed is None:
                 return [Reply("that button asked for something this bot no longer knows how to ask.")]
-            slot, row_id = parsed
+            slot, ref = parsed
             row = None
-            if row_id is not None:
-                rows = await self.db.fetch(self._CONSOLE_SOURCE_SQL + "where id = $1", row_id)
-                if not rows:
-                    return [Reply(self._console_gone(row_id))]
-                row = rows[0]
-            self.console_owed[chat] = (slot, row_id)
+            if ref is not None:
+                kind, row_id = console.parse_ref(ref) or ("s", 0)
+                row = await self._console_row(kind, row_id)
+                if row is None:
+                    return [Reply(self._console_gone(row_id, kind))]
+            self.console_owed[chat] = (slot, ref)
             text, mark = console.waiting_screen(slot, row)
             return [Reply(text, markup=mark)]
 
@@ -2028,29 +2185,72 @@ class ControlBot:
             return [Reply("that button is not one this bot can read, so nothing was changed.")]
         if self.db is None or not getattr(self.db, "connected", False):
             return unreadable
-        row_id, verb, arg = parsed
-        rows = await self.db.fetch(self._CONSOLE_SOURCE_SQL + "where id = $1", row_id)
-        if not rows:
-            return [Reply(self._console_gone(row_id))]
-        row = rows[0]
+        kind, row_id, verb, arg = parsed
+        row = await self._console_row(kind, row_id)
+        if row is None:
+            return [Reply(self._console_gone(row_id, kind))]
         if verb == "open":
-            text, mark = console.source_screen(row)
+            text, mark = self._console_row_screen(kind, row)
             return [Reply(text, markup=mark)]
-        command = self._console_command(row, verb, arg)
+        if verb == "dest":
+            # The one button that crosses between the two tables, and it crosses on a stored
+            # `destination_id` rather than on a name match: which channel a source publishes into is a fact
+            # the ingest side recorded, and re-deriving it from a title here would be a second answer.
+            linked = row.get("destination_id")
+            if linked in (None, "", 0):
+                return [Reply(
+                    "this channel's files are not linked to a destination row yet, so there is nothing to "
+                    "open. The link is written when the series' own channel is created or named; until then "
+                    "/destination lists what exists and /status shows what the queue is doing."
+                )]
+            found = await self._console_row("d", int(linked))
+            if found is None:
+                return [Reply(self._console_gone(linked, "d"))]
+            text, mark = console.destination_screen(
+                found,
+                note=console.screen_note(f"/destination {found.get('telegram_channel_id')}"),
+            )
+            return [Reply(text, markup=mark)]
+        command = self._console_command(kind, row, verb, arg)
         if command is None:
-            return [Reply(
-                f"I could not turn that tap into a command, so nothing was written. The row is still "
-                f"`{row_id}` and its switches are unchanged."
-            )]
+            return [Reply(self._console_no_command(kind, row, verb))]
         replies = await self._console_run(update, command)
         # Re-read the row rather than describing the write: the screen the operator is shown is the
         # database's answer, not this command's intention.
-        after = await self.db.fetch(self._CONSOLE_SOURCE_SQL + "where id = $1", row_id)
+        after = await self._console_row(kind, row_id)
         note = console.screen_note(command, replies[0].text if replies else None)
         if after:
-            text, mark = console.source_screen(after[0], note=note)
+            text, mark = self._console_row_screen(kind, after, note)
             return [*replies, Reply(text, markup=mark)]
         return replies
+
+    def _console_row_screen(
+        self, kind: str, row: Mapping[str, Any], note: str | None = None
+    ) -> tuple[str, dict | None]:
+        """The per-row screen, chosen by the table letter. One call site for the tapped and typed views."""
+        if kind == "d":
+            return console.destination_screen(row, note=note)
+        return console.source_screen(row, note=note)
+
+    @staticmethod
+    def _console_no_command(kind: str, row: Mapping[str, Any], verb: str) -> str:
+        """Why a tap could not be turned into words, said about the row it was pressed on."""
+        where = "destination" if kind == "d" else "source"
+        if kind == "d" and row.get("telegram_channel_id") in (None, "", 0):
+            return (
+                "this series has a destination row but no channel yet, so there is nothing to point a card "
+                "or a campaign at. The channel is built by the pipeline when the first episode is ready — "
+                "/status shows that job, and it is not something to name by hand."
+            )
+        if kind == "s" and verb == "episodes":
+            return (
+                "I cannot say how many episodes a season has for this channel, because no series name is set "
+                "on it yet. Tap 🎬 Series name first — the count belongs to a series, not to a row."
+            )
+        return (
+            f"I could not turn that tap into a command, so nothing was written. `{verb}` is not something I "
+            f"know how to do to a {where} channel — the screen under it lists what I do."
+        )
 
     async def _console_answer(self, update: Update, text: str) -> list[Reply]:
         """The one free-text answer a screen asked for, turned back into a command.
@@ -2059,10 +2259,12 @@ class ControlBot:
         runs through the same refusals a typed command would hit, so the console cannot accept a value the
         keyboard would reject.
         """
-        slot, row_id = self.console_owed.pop(update.chat_id, ("add", None))
+        slot, ref = self.console_owed.pop(update.chat_id, ("add", None))
         value = " ".join(str(text or "").split())
         if not value:
             return [Reply("an empty answer changes nothing, and I did not write one.")]
+        if slot in {"archive", "archive_title"}:
+            return await self._console_archive_answer(update, slot, value)
         if slot == "joinmsg":
             from . import joinmsg  # noqa: PLC0415  (the module owns its own key and presets)
 
@@ -2079,39 +2281,111 @@ class ControlBot:
             # naming the new channel and setting its switches is what an operator does next, and reading the
             # list back is also how they see a refusal was honoured.
             replies = await self._console_run(update, f"/source {value} add")
-            rows = await self.db.fetch(self._CONSOLE_SOURCE_SQL + "order by id")
+            # The list, capped and said to be capped exactly as the screen itself would be: an answer that
+            # lands on a shorter-looking page than the button it came from is a page that got read wrong.
+            rows, extra = await self._console_screen_rows("s")
             screen, mark = console.sources_screen(
-                list(rows), note=console.screen_note(f"/source {value} add", replies[0].text if replies else None)
+                rows,
+                truncated=extra,
+                note=console.screen_note(f"/source {value} add", replies[0].text if replies else None),
             )
             return [*replies, Reply(screen, markup=mark)]
-        rows = await self.db.fetch(self._CONSOLE_SOURCE_SQL + "where id = $1", int(row_id or 0))
-        if not rows:
-            return [Reply(self._console_gone(row_id))]
-        command = self._console_command(rows[0], slot, value)
+        kind, row_id = console.parse_ref(ref or "") or ("s", 0)
+        row = await self._console_row(kind, row_id)
+        if row is None:
+            return [Reply(self._console_gone(row_id, kind))]
+        command = self._console_command(kind, row, slot, value)
         if command is None:
-            return [Reply(
-                f"I cannot put `{value}` into that field, so nothing was written. The question was for "
-                f"`{slot}`, and the row is unchanged."
-            )]
+            return [Reply(self._console_no_command(kind, row, slot))]
         replies = await self._console_run(update, command)
-        after = await self.db.fetch(self._CONSOLE_SOURCE_SQL + "where id = $1", int(row_id or 0))
+        after = await self._console_row(kind, row_id)
         if after:
-            text, mark = console.source_screen(after[0], note=console.screen_note(command))
+            text, mark = self._console_row_screen(kind, after, console.screen_note(command))
             return [*replies, Reply(text, markup=mark)]
         return replies
 
+    async def _console_archive_answer(self, update: Update, slot: str, value: str) -> list[Reply]:
+        """The two archive answers, which address no row of their own.
+
+        `/archive` takes a channel, and the channel to name is either the one being pointed at now or the
+        one already recorded — so the prompt carries no row reference and this half reads the archive row
+        itself. Naming is refused before it reaches `/archive` when there is no archive to name, because
+        "which one?" is a question the operator can only answer if we ask it.
+        """
+        if slot == "archive":
+            # The channel and what to call it, off one line. `/archive` refuses to record a row nobody can
+            # name — it is the one channel no message is read from, so nothing else gives it a title — and
+            # asking twice would leave a half-answer on disk between the two questions. A line with no name
+            # on it goes to the command anyway, so the operator reads that refusal in its own words.
+            words = value.split(maxsplit=1)
+            ref, title = (words[0], words[1].strip()) if len(words) > 1 else (value, "")
+            command = f"/archive {ref} add title {title}" if title else f"/archive {ref} add"
+        else:
+            rows = await self.db.fetch(
+                "select id, telegram_channel_id, title, is_primary from app.archive_channel order by id limit 1"
+            )
+            if not rows:
+                return [Reply(
+                    "there is no archive channel recorded yet, so there is nothing to name. Tap "
+                    "📦 Point at an archive first — that one takes the channel, and this one only renames it."
+                )]
+            current = rows[0]
+            ref = str(current.get("telegram_channel_id") or "").strip()
+            if not ref:
+                return [Reply(
+                    "the archive row has no channel id stored, so I cannot address it to rename it. "
+                    f"`/archive` shows what is recorded (row {current.get('id')})."
+                )]
+            command = f"/archive {ref} title {value}"
+        replies = await self._console_run(update, command)
+        rows = await self.db.fetch(
+            "select id, telegram_channel_id, title, is_primary from app.archive_channel order by id limit 1"
+        )
+        screen, mark = console.bots_screen(
+            storage=await self.db.config("bots.storage_username", "") or None,
+            help_bot=await self.db.config("bots.channel_help_username", "") or None,
+            link=await self.db.config("bots.link_provider_username", "") or None,
+            archive=rows[0] if rows else None,
+            note=console.screen_note(command, replies[0].text if replies else None),
+        )
+        return [*replies, Reply(screen, markup=mark)]
+
     @staticmethod
     def _console_command(
-        row: Mapping[str, Any] | None, verb: str, arg: str | None
+        kind: str, row: Mapping[str, Any] | None, verb: str, arg: str | None
     ) -> str | None:
         """Turn a tap on a row into the exact line the operator could have typed.
 
-        `@handle` when the row has one and the number when it does not, because those are the two things
-        `_find_source_channel` answers to; a private channel with no handle has only the number, and a
-        command naming it by title would match nothing.
+        A source is addressed by `@handle` when it has one and by its number when it does not, because those
+        are the two things `_find_source_channel` answers to. A destination has no username of its own, so it
+        is addressed by number — which is also how `_find_destination` matches it, alongside a title or the
+        handle of the source paired with it.
+
+        Every value is re-checked against the module that owns the vocabulary, never against a copy: a
+        button built from a stale list would run a command that refuses, and "refused" arriving after a tap
+        is what makes an operator stop trusting taps.
         """
         if not row:
             return None
+        from .normalize import DECLARED_AUDIO  # noqa: PLC0415  (the vocabulary lives in one place)
+
+        value = " ".join(str(arg or "").split())
+        if kind == "d":
+            ref = str(row.get("telegram_channel_id") or "").strip()
+            if not ref or ref in {"0", "None"}:
+                return None
+            if verb == "card":
+                target = value.casefold()
+                if target in {"show", "clear"} or target.isdigit():
+                    return f"/destination {ref} card {target}"
+                return None
+            if verb == "campaigns" and not value:
+                return f"/destination {ref} campaigns"
+            if verb == "campaign" and value:
+                return f"/destination {ref} campaign new {value}"
+            if verb == "episodes" and value:
+                return f"/destination {ref} episodes {value}"
+            return ControlBot._console_inplace(ref, verb, value)
         handle = str(row.get("username") or "").strip().lstrip("@")
         ref = f"@{handle}" if handle else str(row.get("telegram_channel_id") or "")
         if not ref or ref == "@":
@@ -2122,23 +2396,55 @@ class ControlBot:
                 return None
             return f"/source {ref} {verb} {target}"
         if verb == "audio":
-            from .normalize import DECLARED_AUDIO  # noqa: PLC0415  (the vocabulary lives in one place)
-
-            kind = str(arg or "").strip().casefold()
-            if kind not in DECLARED_AUDIO:
+            word = value.casefold()
+            if word not in DECLARED_AUDIO:
                 return None
-            return f"/source {ref} audio {kind}"
+            return f"/source {ref} audio {word}"
         if verb in {"series", "title", "season"}:
-            value = " ".join(str(arg or "").split())
             return f"/source {ref} {verb} {value}" if value else None
+        if verb == "episodes":
+            # `/declare` is addressed by series, not by row, so the row only supplies the name it already
+            # carries. A row with no series declared has nothing to declare about — `_console_no_command`
+            # says that out loud instead of sending an empty title at the parser.
+            series = str(row.get("declared_series") or "").strip()
+            return f"/declare {series} {value}" if series and value else None
+        return ControlBot._console_inplace(ref, verb, value)
+
+    @staticmethod
+    def _console_inplace(ref: str, verb: str, value: str) -> str | None:
+        """The three in-place taps, on either table's row. One command, two doors into it.
+
+        `on` is the bare command and not a word the operator has to know: `/inplace <channel>` already means
+        "do it", and inventing `/inplace <channel> on` would put a word in the console that a typed line
+        rejects — which is the collision this project has been burned by before.
+        """
+        if verb != "inplace":
+            return None
+        target = value.casefold()
+        if target == "on":
+            return f"/inplace {ref}"
+        if target in {"plan", "off"}:
+            return f"/inplace {ref} {target}"
         return None
 
-    def _console_gone(self, row_id: Any) -> str:
-        """What a tap on a row that is not there answers with — and it writes nothing."""
+    @staticmethod
+    def _console_gone(row_id: Any, kind: str = "s") -> str:
+        """What a tap on a row that is not there answers with — and it writes nothing.
+
+        The list to re-read and the button to start over are different per table, so the letter is carried
+        into the message: telling someone to read the source list because a *destination* row went away sends
+        them to the one screen that cannot show them what happened.
+        """
+        if kind == "d":
+            return (
+                f"that destination is not stored any more (no row {row_id}), so nothing was changed.\n"
+                "the screen you tapped was drawn against a row that has since gone. /destination is the list "
+                "to read now, or tap 📤 Destinations on the menu."
+            )
         return (
             f"that channel is not configured any more (no row {row_id}), so nothing was changed.\n"
-            "the screen you tapped was drawn against a row that has since gone. /sources is the one to "
-            "read now — or start over with ➕ Add a channel."
+            "the screen you tapped was drawn against a row that has since gone. /sources is the list to read "
+            "now — or start over with ➕ Add a channel."
         )
 
     async def _console_run(self, update: Update, command: str) -> list[Reply]:
@@ -2171,8 +2477,19 @@ class ControlBot:
                 "reason, and it is usually `DATABASE_URL` pointing at the transaction pooler."
             )]
         if key == "sources":
-            rows = await self.db.fetch(self._CONSOLE_SOURCE_SQL + "order by id")
-            text, mark = console.sources_screen(list(rows), note=note)
+            rows, extra = await self._console_screen_rows("s")
+            text, mark = console.sources_screen(rows, note=note, truncated=extra)
+            return [Reply(text, markup=mark)]
+        if key == "destinations":
+            rows, extra = await self._console_screen_rows("d")
+            text, mark = console.destinations_screen(rows, note=note, truncated=extra)
+            return [Reply(text, markup=mark)]
+        if key == "sessions":
+            rows = list(await list_sessions(self.db))
+            extra = len(rows) > console.LIST_LIMIT
+            text, mark = console.sessions_screen(
+                rows[: console.LIST_LIMIT], note=note, truncated=extra
+            )
             return [Reply(text, markup=mark)]
         if key == "main":
             text, mark = console.main_screen(await self._console_facts())
@@ -2190,10 +2507,14 @@ class ControlBot:
             )
             return [Reply(text, markup=mark)]
         if key == "bots":
+            archive = await self.db.fetch(
+                "select id, telegram_channel_id, title, is_primary from app.archive_channel order by id limit 1"
+            )
             text, mark = console.bots_screen(
                 storage=await self.db.config("bots.storage_username", "") or None,
                 help_bot=await self.db.config("bots.channel_help_username", "") or None,
                 link=await self.db.config("bots.link_provider_username", "") or None,
+                archive=archive[0] if archive else None,
                 note=note,
             )
             return [Reply(text, markup=mark)]
@@ -2223,13 +2544,14 @@ class ControlBot:
         # second answer to the same question.
         try:
             facts["sources"] = await self.db.fetchval("select count(*) from app.source_channel")
+            facts["destinations"] = await self.db.fetchval("select count(*) from app.destination")
             queue = await self.db.queue_health() or {}
             facts["ready"] = queue.get("queued")
             facts["blocked"] = queue.get("blocked")
             facts["sessions"] = len(await list_sessions(self.db)) if getattr(self.db, "connected", False) else None
         except Exception as exc:  # noqa: BLE001 - a count that fails is a `?`, never a crash in a DM
             log.info("console counts unread: %s", str(exc)[:120])
-        for key in ("sources", "ready", "blocked", "sessions"):
+        for key in ("sources", "destinations", "ready", "blocked", "sessions"):
             if facts.get(key) is None:
                 facts[key] = "?"
             elif str(facts.get(key)).isdigit():

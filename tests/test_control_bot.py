@@ -171,10 +171,16 @@ class FakeDb:
                 {"key": "thumbnail.strict_mode", "value": "true"},
             ]
         if "from app.series" in sql:
+            if not args:
+                return [dict(row) for row in self.series]
             needle = str(args[0] or "")
             hits = [row for row in self.series if needle and needle in row["normalized_title"]]
             return hits or ([] if needle else [dict(row) for row in self.series])
         if "from app.destination d" in sql:  # /card and /campaign name a channel three ways
+            if "where d.id = $1" in sql:
+                # The console resolves a tap's row id, and `/destination` re-reads the row after a write, so
+                # a fake that could not answer this would hide a real fault in the newest half of the bot.
+                return [dict(row) for row in self.destinations if row.get("id") == args[0]]
             if not args:
                 return [dict(row) for row in self.destinations]  # /card's bare listing
             numeric, needle = args[0], str(args[1] or "").casefold()
@@ -314,6 +320,18 @@ class FakeDb:
             mode = _re.search(r"publish_mode = '([^']+)'", sql)
             if mode and self.destination is not None:
                 self.destination["publish_mode"] = mode.group(1)
+            if "set card_message_id = $2" in sql or "card_message_id = null" in sql:
+                # The console re-reads the row after a write, so a fake that let the write vanish would test
+                # the screen against a lie — and the card line on that screen is the whole point of `/card`.
+                target = args[0]
+                value = args[1] if "set card_message_id = $2" in sql else None
+                for row in ([self.destination] if self.destination is not None else []) + list(
+                    self.destinations
+                ):
+                    if row.get("id") == target:
+                        row["card_message_id"] = value
+                        if value is None:
+                            row["announcement_link"] = None  # `/card clear` nulls both, in one statement
             if "paired_source_channel_id" in sql and self.destination is not None:
                 self.destination["paired_source_channel_id"] = args[1]
             self.writes.append((sql, args))
@@ -1677,7 +1695,10 @@ async def test_card_records_the_post_the_announcement_is_built_from(make_setting
     assert "card_message_id = $2" in sql and args == (21, 42), (sql, args)
 
     shown = text_of(await control._card(None, ["-1001234", "show"]))
-    assert "no card message named" in shown, "show reads the row, not what the command just said"
+    assert "card message 42" in shown, (
+        "show reads the row back — and the fake now applies the write, so a read that disagreed with the "
+        "database would be caught here rather than on a screen"
+    )
 
     listed = text_of(await control._card(None, []))
     assert "Dekin no mogura" in listed, "the bare command lists what exists"
@@ -2368,7 +2389,10 @@ async def test_the_source_list_names_every_configured_channel_by_name() -> None:
     await control.dispatch(parse_update(_press(api, "n:sources")))
     assert "anime_uploads4u" in api.sent[-1][1], "the handle, which is what the operator knows it as"
     rows = api.markups[-1]["inline_keyboard"]
-    assert rows[0][0]["callback_data"] == "r:3:open"
+    assert rows[0][0]["callback_data"] == "r:s3:open", (
+        "the payload names the table as well as the row: `app.destination` has its own row 3, and a button "
+        "that could not tell them apart would be one tap away from editing the wrong channel"
+    )
 
 
 @pytest.mark.asyncio
@@ -2578,3 +2602,232 @@ async def test_no_tap_deletes_the_message_it_was_pressed_on() -> None:
     control, api, db = bot()
     await control.dispatch(parse_update(_press(api, "p:series:3")))
     assert api.deleted == [], "the question a screen asked is not a secret either"
+
+
+# --------------------------------------------------------------------- the destinations half
+#
+# `/destination` and its screens came out of one line in this bot's own refusals: `_find_destination` told
+# the operator that "/destinations lists what exists", and nothing served `/destinations`. A promise of a
+# command that is not there reads as a bot that ignores its owner, so the promise is now kept — and held by
+# `tests/test_console.py::test_no_reply_promise_a_command_the_router_does_not_serve`, which fails for any
+# `/word` shown to a human that the router does not take.
+
+
+@pytest.mark.asyncio
+async def test_destination_list_is_the_same_thing_as_the_screen() -> None:
+    """Typed words and a tap reach one builder, so they cannot disagree about a column.
+
+    The keyboard arrives with the list too: a screen that only the menu can produce would make the typed
+    command a worse answer than the button, which is the hierarchy this whole layer is trying to remove.
+    """
+    control, api, db = bot()
+    typed = await control.handle(update("/destination"))
+    await control.dispatch(parse_update(_press(api, "n:destinations")))
+    (reply,) = typed
+    assert reply.text == api.sent[-1][1], "the same text, either way"
+    assert reply.markup == api.markups[-1], "and the same buttons"
+    assert "Dekin no mogura" in reply.text
+
+
+@pytest.mark.asyncio
+async def test_a_destination_tap_opens_its_own_screen_and_names_the_command_it_ran() -> None:
+    control, api, db = bot()
+    await control.dispatch(parse_update(_press(api, "r:d21:card:show")))
+    assert "Dekin no mogura" in api.texts
+    assert "ran: `/destination -1001234 card show`" in api.sent[-1][1]
+    assert "not named" in api.sent[-1][1], "and the screen says what the card line means"
+
+
+@pytest.mark.asyncio
+async def test_naming_a_card_post_from_a_screen_writes_the_row_it_was_asked_about() -> None:
+    """The whole chain: prompt → one typed number → the command `/card` owns → the screen, re-read.
+
+    The write is checked on the database rather than on the reply, because the reply is the part this bot
+    could get wrong cheerfully. `announcement_link` is not touched by naming a card — the stored link is
+    left alone on purpose, and that decision belongs to `/card`, not to the console.
+    """
+    control, api, db = bot()
+    await control.dispatch(parse_update(_press(api, "p:card:d21")))
+    assert "message number" in api.sent[-1][1]
+    replies = await say(control, "512")
+    assert db.destinations[0]["card_message_id"] == 512, "the row was written"
+    assert "update app.destination set card_message_id = $2" in db.writes[-1][0]
+    assert "card post for Dekin no mogura" in replies[0], "the command answers in its own words"
+    assert "card post: message 512" in replies[-1], "and the screen arrives re-read, not remembered"
+
+
+@pytest.mark.asyncio
+async def test_a_question_asked_about_the_wrong_table_is_refused_before_any_typing() -> None:
+    """`card` is a destination's column, so a button may not ask for one on a source row.
+
+    The payload is forgeable — that is what makes it worth refusing. `parse_prompt` rejects the shape and
+    the operator gets a sentence about the button rather than a question they can answer into nowhere.
+    """
+    control, api, db = bot()
+    replies = await control.handle(parse_update(_press(api, "p:card:s3")))
+    assert replies and "no longer knows how to ask" in replies[0].text
+    assert api.sent == [] and db.writes == [], "nothing was asked, so nothing could be written"
+
+
+@pytest.mark.asyncio
+async def test_a_tap_on_a_destination_never_writes_a_source_row() -> None:
+    """The table letter in the payload is not decoration: it is the only thing separating row 21 from row 3.
+
+    Asserted on the untouched row rather than on the reply, because a wrong write is precisely the failure a
+    screen cannot report about itself.
+    """
+    control, api, db = bot()
+    before = dict(db.source_channels[0])
+    await control.dispatch(parse_update(_press(api, "r:d21:inplace:off")))
+    assert db.source_channels[0] == before
+    assert not any("app.source_channel" in sql for sql, _ in db.writes), (
+        "a destination tap writes a destination row, or nothing at all"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_destination_with_no_channel_yet_is_refused_with_a_way_forward() -> None:
+    """The row can exist before the channel does, and "there is nothing to point a card at" must say why.
+
+    An honest refusal is actionable: it names who builds the channel and which command shows that job, so
+    the operator is not left looking for a setting that is not missing.
+    """
+    control, api, db = bot()
+    db.destinations.append(
+        {"id": 22, "title": None, "telegram_channel_id": None, "series": "Bleach", "publish_mode": "link_post"}
+    )
+    replies = await say(control, "/destination Bleach card 512")
+    assert replies and "no channel id stored" in replies[0]
+    assert db.writes == [], "and a refusal writes nothing"
+
+
+@pytest.mark.asyncio
+async def test_episode_counts_come_from_the_destination_that_knows_the_series() -> None:
+    """`/destination <one> episodes 2 12` is `/declare <series> 2 12` with the name already filled in.
+
+    The point is the typing that disappears, not a new write path: `_declare` still owns the column, the
+    refusal when two series match, and the `tba` spelling that stops claiming a length.
+    """
+    control, api, db = bot()
+    (text,) = await say(control, "/destination -1001234 episodes 2 12")
+    assert "declared 12 episodes" in text, "the season length was recorded, by the command that owns it"
+    assert any("insert into app.season" in sql for sql, _ in db.writes), "onto the season row, not a new one"
+    assert "12" in text or "season" in text.lower()
+    (noanswer,) = await say(control, "/destination -1001234 episodes")
+    assert "how many episodes" in noanswer
+
+
+@pytest.mark.asyncio
+async def test_campaigns_are_listed_from_the_destination_they_belong_to() -> None:
+    """`/destination <one> campaigns` and `/campaign <one>` are one handler, because the rows are one table.
+
+    A destination is what a campaign sends from, so `/campaign` already takes a destination handle — the new
+    command only spares the operator the remembering of which channel a series publishes into.
+    """
+    control, api, db = bot()
+    (a,) = await say(control, "/destination -1001234 campaigns")
+    (b,) = await say(control, "/campaign -1001234")
+    assert a == b, "the same answer, reached either way"
+
+
+@pytest.mark.asyncio
+async def test_a_source_can_jump_to_the_destination_it_feeds() -> None:
+    """The one cross-table tap, and it rides on `destination_id` rather than on a title match.
+
+    Without the link the button still has to say something true, so both halves are checked here: the jump
+    when the ingest side recorded one, and the refusal that explains what records it when it has not.
+    """
+    control, api, db = bot()
+    replies = await control.handle(parse_update(_press(api, "r:s3:dest")))
+    assert replies and "not linked to a destination row yet" in replies[0].text
+
+    db.source_channels[0]["destination_id"] = 21
+    await control.dispatch(parse_update(_press(api, "r:s3:dest")))
+    assert "destination ·" in api.sent[-1][1], "and once it is linked, the jump lands on that row"
+
+
+@pytest.mark.asyncio
+async def test_the_gone_row_message_points_at_a_command_that_exists() -> None:
+    """/sources is routed, which is the only reason that sentence is allowed to say it.
+
+    The refusal used to name a command nothing served. The wording is kept because it is the right
+    instruction — the list is the thing to re-read — and this test is what stops it decaying back.
+    """
+    control, api, db = bot()
+    from app import controlbot as module
+
+    assert "sources" in module._ROUTES, "the promise in the text is kept by the router"
+    replies = await control.handle(parse_update(_press(api, "r:999:gate:off")))
+    assert "/sources" in replies[0].text
+    (listing,) = await say(control, "/sources")
+    assert "anime_uploads4u" in listing and "👁" in listing
+
+
+@pytest.mark.asyncio
+async def test_the_archive_can_be_pointed_at_without_leaving_the_menu() -> None:
+    """`📦 Point at an archive` then one number: the archive row used to need two commands and a dashboard.
+
+    The rename is refused while there is nothing to name — "which archive?" is a question the operator can
+    only answer if the bot asks it, and asking it after a wrong write is too late.
+    """
+    control, api, db = bot()
+    await control.dispatch(parse_update(_press(api, "p:archive_title")))
+    (refused,) = await say(control, "Master copies")
+    assert "no archive channel recorded" in refused and db.archive_channels == []
+
+    await control.dispatch(parse_update(_press(api, "p:archive")))
+    assert "on one line" in api.sent[-1][1], "the question says what shape the answer has"
+    await say(control, "-100999888777 Master copies")
+    assert db.archive_channels, "the archive row was written"
+    assert db.archive_channels[0]["title"] == "Master copies"
+    assert "archive" in api.sent[-1][1].lower(), "and the bots screen came back showing it"
+
+
+@pytest.mark.asyncio
+async def test_the_sessions_screen_offers_only_the_two_verbs_that_exist() -> None:
+    """Use one session, forget one — and never a session string, never even its length.
+
+    `list_sessions` refuses to select the string; the screen repeats the refusal one layer up, because a
+    value that reaches a chat window stays in the cloud forever, which is the opposite of what this bot
+    promises about logins.
+    """
+    db = FakeDb(stored=[{"name": "spare", "kind": "user", "active": True, "length_chars": 300}])
+    control, api, db2 = bot(db=db)
+    db.stored[0]["username"] = "Turvei"
+    await control.dispatch(parse_update(_press(api, "n:sessions")))
+    text = api.sent[-1][1]
+    assert "spare" in text and "@Turvei" in text
+    assert "300" not in text and "AAAA" not in text
+    labels = [one["text"] for one in api.markups[-1]["inline_keyboard"][0]]
+    assert labels == ["▶ Use spare", "🧹 Forget spare"], labels
+    (forgot,) = await say(control, "/forget nosuch")
+    assert "nothing stored under" in forgot
+
+
+@pytest.mark.asyncio
+async def test_a_source_with_no_series_is_refused_an_episode_count() -> None:
+    """`📅 Episodes in a season` on a row that has no series name has nowhere to put the number.
+
+    The refusal names the button to press first, which is the difference between "that was wrong" and a
+    screen the operator can actually finish. And nothing was asked, so no answer is waiting to be typed.
+    """
+    control, api, db = bot()
+    db.source_channels[0]["declared_series"] = ""
+    await control.dispatch(parse_update(_press(api, "p:episodes:s3")))
+    replies = await say(control, "2 12")
+    assert replies and "no series name is set" in replies[0]
+    assert db.writes == [], "and the answer was not written anywhere"
+
+
+@pytest.mark.asyncio
+async def test_the_inplace_button_on_a_source_screen_is_the_command_itself() -> None:
+    """`🖼 Show the plan` runs `/inplace <channel> plan`, and `🔗 Links only` runs `… off`.
+
+    There is deliberately no `/inplace <channel> on`: the bare command already means "do it", and inventing a
+    word for the button that the typed line rejects is the collision this project has been burned by before.
+    """
+    control, api, db = bot()
+    await control.dispatch(parse_update(_press(api, "r:s3:inplace:plan")))
+    assert "plan" in api.texts.lower()
+    assert "ran: `/inplace @anime_uploads4u plan`" in api.sent[-1][1]
+    assert db.writes == [], "a plan changes nothing, tapped or typed"

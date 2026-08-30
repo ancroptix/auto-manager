@@ -154,6 +154,8 @@ session at boot, if it restarts on its own.
 | `/source <@handle\|channel id> [series <name>] [audio <kind>] [season <n>] [title <text>]` | what a *files-only* source channel carries, stated once for the whole channel instead of guessed per file. `title` renames the row itself — what this bot calls it back to you, and, when no series is declared, one of the two signals `app/ingest.py` may read a series name out of (one signal is not two: it never founds a channel on its own). A channel added by number arrives with none, which is why the word exists here at all. With no arguments it shows what is declared **and what is switched**; `clear` stops assuming. It never re-decides a file that was already decided — parked ones are re-read on the next scan |
 | `/source <@handle\|channel id> add [series <name>] [title <text>]` | start watching that channel: the row in `app.source_channel` is written here, with its defaults printed back. Its own verb on purpose — a row is the decision to read a channel, so no other command makes one, and a lookup that finds nothing says `add` instead of naming a table |
 | `/source <channel> gate\|subs\|watch on\|off` | the three switches whose columns production code reads: `gate` is `require_hindi_audio`, `subs` is `include_subbed`, `watch` is `mode` (`on` is `full`, `off` is `ignore`). One column per command, and the same words switch it back |
+| `/sources` | every source channel with its switches as buttons — the same list the menu's `🎙 Sources` screen renders, from the same builder, so a typed line and a tap cannot disagree about a column. It is also what the console's "this row is gone" reply points at, which is the only reason that sentence is allowed to say it |
+| `/destination [<series\|@handle\|channel id>] [card <id\|show\|clear>\|campaigns\|campaign new <name>\|episodes <season> <count\|tba>\|inplace [plan\|off]]` | the channel a series publishes into, and the four things it can be set to. Bare `/destination` (or `/destinations`) lists them, 📤 for a channel that exists and 🏗 for a row whose channel is not built yet. Every action is delegated: `/card`, `/campaign`, `/declare` and `/inplace` stay the only paths that touch those columns, so this command spares the remembering and adds no new write. A destination is addressed by its own number, its title, or the handle of the source that feeds it — `app.destination` stores no username of its own |
 | `/archive [<@handle\|channel id> add [title <name>]]` | which private channel holds the master copy: bare `/archive` reads the list, `add` writes the missing row the archive job blocks on. The first row added is `is_primary`, because two primaries would make `app/writers.py` pick between them |
 | `/joinmsg [show\|options\|use <n>\|set <text>\|clear]` | what a join requester is told, when you later run a campaign at them. `options` lists three drafts with the promise each one makes; `use 2` saves one, `set …` saves your own words (`{name}` and `{series}` are filled at send time), `clear` empties it so the app may contact nobody. Saving is not sending, and the reply says so — the sender is the blocked job kind `join_request_campaign`. It cannot approve or decline anyone, and it refuses a message that carries an invite link |
 | `/inplace <@handle\|channel id> [from <@other>] [plan\|off]` | publish by editing instead of posting: the channel's own file messages get the approved caption written onto them. No new channel, no copy, no delete, no buttons. `plan` shows what it would do and changes nothing; `from` compares with a second channel so episodes only *it* has are forwarded in; `off` goes back to the link route |
@@ -265,15 +267,28 @@ Open it with `🏠 Open the menu` under `/help`. Six screens:
 | `sources` | one row per configured channel, each labelled 👁 watching or 💤 ignored, with the series name after it | `🎙 Sources` |
 | `queue` | ready jobs and the pause state, with only the button that changes it (Pause when running, Resume when paused) | `🔌 Queue` |
 | `bots` | which storage bot, Channel Help bot and link provider are configured, plus `/probe` and `/sessions` | `🤖 Bots` |
+| `destinations` | one row per series' own channel — 📤 when the channel exists in Telegram, 🏗 when only the row does — and each one opens its own screen | `📤 Destinations` |
+| `sessions` | the stored logins, by account name and username, with `▶ Use` and `🧹 Forget`. Never a session string, never even its length | `👤 Sessions` |
 | `joinmsg` | the three drafts numbered as `/joinmsg` numbers them, the wording now saved, and the way to say nothing | `📩 Join message` |
 | `help` | the command list from §3, unchanged, because a button that hides its own words is a button with no manual | `❓ Help` |
 
 Tapping a channel's name on `sources` opens that channel's own screen: the three switches, the audio
 vocabulary as direct picks — one button per spelling `normalize.DECLARED_AUDIO` accepts (`hindi`, `dual`,
 `dual_audio`, `multi`, `multi_audio`, `subbed`, `subbed_only`, `unknown`), so nobody has to remember how the
-column is spelled — plus the season and the two names. `↻ Refresh` is the last row of every screen, and
-every screen but the menu has a `◀` beside it: a screen is a snapshot, and the refresh is the only honest way
-to make it true again. Nothing on a screen is a knob the app does not read.
+column is spelled — plus the season, the two names, the season's episode count, and `🖼 Show the plan` /
+`🖼 Caption in place` / `🔗 Links only` for the in-place half. `📤 Where its files are published` crosses to
+the destination screen for that series, and it crosses on the `destination_id` the ingest side recorded
+rather than on a title match; when the two are not linked yet, that is what the button says.
+
+A destination's own screen is where the announcement is built: what it publishes, the card post a shareable
+link is made from and whether one was ever returned, the three in-place taps, `📣 Campaigns` and
+`➕ Draft one`, and `📅 Episodes in a season`. The bio and the channel picture are deliberately **not**
+buttons: they are written while the channel is built, and a screen that offered a knob for something no
+command reads is a knob that lies.
+
+`↻ Refresh` is the last row of every screen, and every screen but the menu has a `◀` beside it: a screen is a
+snapshot, and the refresh is the only honest way to make it true again. Nothing on a screen is a knob the app
+does not read.
 
 **Typing is left for the one thing a button cannot carry: a name, a number, or your own wording.** A screen
 that needs one sends `one more thing` with the question, and the message that asks it has the exit in it —
@@ -286,6 +301,15 @@ Two more rules, both earned:
   message and its first line is `ran: `/source @something gate off` — the exact command your tap became.
   It is not decoration: it is the line that goes in a bug report, and the only way to tell a screen that
   lied from a write that worked.
+- **A tap may not be sent a word the router does not serve.** `/destination` exists because two refusals in
+  this bot used to end in `the command is /destinations` and `/sources`, and neither was routed: the operator
+  typed them, the bot stayed silent, and silence after a promise is how a bot stops being trusted.
+  `tests/test_console.py::test_no_reply_promise_a_command_the_router_does_not_serve` now reads every string
+  literal in the two files and fails for any `/word` that is shown to a human and not routed.
+- **A row reference names its table.** `r:s3:gate:off` is a source row and `r:d21:card:show` a destination
+  row, because both tables have a row 3 and a button that could not tell them apart is one typo away from
+  editing the wrong channel. The older letter-less spelling still means the source row it always meant, so
+  the buttons under an open message do not die when this ships.
 - **A long name costs a button, never a fact.** `callback_data` has 64 bytes and labels have their own cap.
   Over either, `app/keyboards.py` drops the button and the screen keeps the whole sentence in its text — no
   truncation, because a truncated command is a different command and a truncated label is a promise about
