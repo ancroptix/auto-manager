@@ -504,8 +504,9 @@ def discover_screen(
     *,
     auto: bool,
     note: str | None = None,
+    pairs: Sequence[Mapping[str, Any]] = (),
 ) -> tuple[str, dict | None]:
-    """What the spare account can see, one button per channel worth a row.
+    """What the spare account can see, one button per series that can be wired in one tap.
 
     The findings are the proposals `app/discover.py` decided and ``lines`` is its own report of them: this
     screen adds no verdict of its own, only a tap for each channel that can be added and the two decisions
@@ -518,8 +519,25 @@ def discover_screen(
     """
     buttons: list[list[dict[str, str] | None]] = []
     body = list(lines)
+    for pair in pairs or ():
+        # The tap an operator actually wants: not "add this channel" for each of three channels, but "set
+        # this show up", which writes the series, both rows and the link between them. The channel lines stay
+        # on the screen as what it is about to do, and lose their own buttons while they are inside a pair —
+        # two ways to start the same write is how a half-configured channel gets made by accident.
+        made = button(
+            f"✅ Set up {str(pair.get('series') or pair.get('key') or '?')[:32]}",
+            payload_for(f"/discover pair {pair['index']}"),
+        )
+        if made is None:
+            body.append(f"  too long for a button — type it: /discover pair {pair['index']}")
+            continue
+        buttons.append([made])
+    if len(list(pairs or ())) > 1:
+        # Only when there is more than one to do: with a single pair the bulk button would be the same tap
+        # twice, and two buttons for one decision is the clutter this screen was rebuilt to remove.
+        buttons.append([button("✅ Set up every pair on this page", payload_for("/discover pair all"))])
     for finding in findings:
-        if finding.get("use") not in ("source", "destination"):
+        if finding.get("use") not in ("source", "destination") or finding.get("pair"):
             continue
         who = (
             str(finding.get("title") or "").strip()
@@ -532,8 +550,11 @@ def discover_screen(
             body.append(f"  too long for a button — type it: /discover add {finding['index']}")
             continue
         buttons.append([made])
-    if buttons:
-        buttons.append([button("✅ Add everything on this page", payload_for("/discover add all"))])
+    unpaired = [one for one in findings if one.get("use") in ("source", "destination") and not one.get("pair")]
+    if len(unpaired) > 1:
+        # Only for what is left over: bulk-adding a page of channels a pair already covers would ask the same
+        # question twice, and the pair tap is the one that also links them.
+        buttons.append([button("✅ Add the rest on this page", payload_for("/discover add all"))])
     switch = (
         button("🧿 Stop switching on its own", payload_for("/discover auto off"))
         if auto

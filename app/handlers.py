@@ -154,11 +154,16 @@ async def reconciliation(job: dict[str, Any], ctx: Context) -> dict[str, Any]:
         if bool(await ctx.db.config(discover.AUTO_KEY, False)) and ctx.telegram is not None:
             from .probe import collect_dialogs  # noqa: PLC0415  (the walk lives with the probe that owns it)
 
-            entries = await collect_dialogs(ctx.telegram)
+            entries = await collect_dialogs(
+                ctx.telegram, verify_rights=True, rights_limit=discover.AUTO_RIGHTS_LIMIT
+            )
             swept = await discover.sweep(ctx.db, entries, auto=True)
             flipped = [one for one in swept["flips"] if one.get("applied")]
             result["discover"] = {
                 "read": len(entries),
+                "rights_re_read": sum(
+                    1 for one in entries if isinstance(one, dict) and one.get("rights_source") == "participant"
+                ),
                 "switched": len(flipped),
                 "rights_written": int((swept.get("rights") or {}).get("written") or 0),
             }

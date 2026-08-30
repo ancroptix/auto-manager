@@ -367,12 +367,12 @@ def test_every_screen_can_be_re_read_and_left() -> None:
 
 
 def test_the_discovery_screen_offers_only_the_rows_that_can_be_written() -> None:
-    """A button per addable channel, no button for the one that needs a name first.
+    """A button per channel that can be filed, and no button for a chat that cannot be a row at all.
 
-    The admin channel whose title is not a destination name is printed with its reason and left without a
-    tap: the row cannot be written until a series is named, and a button that leads to a refusal is the
-    decoration this project refuses. The member shelf and the named destination both get one, and the
-    numbers they carry are the findings' own indexes, which is the only address a not-yet-existing row has.
+    The admin channel whose name is not a destination name gets a tap now — being able to post is what makes
+    a channel a destination, and the series it would be filed under is said on the line above the button.
+    What still has no tap is the group chat: `discover_screen` renders no verdict of its own, so a row with
+    `use=None` stays a line of text explaining why, exactly as `app/discover.py` wrote it.
     """
     text, payload = console.discover_screen(
         discover.report(PLAN, auto=False).splitlines(), PLAN["findings"], auto=False
@@ -381,14 +381,56 @@ def test_the_discovery_screen_offers_only_the_rows_that_can_be_written() -> None
     labels = [one["text"] for row in rows for one in row]
     assert any(one.startswith("📥 anime_uploads4u") for one in labels), labels
     assert any(one.startswith("📤 Bleach Anime in Hindi") for one in labels), labels
-    assert not any("Naruto HQ" in one for one in labels), "a row with no verdict gets no button"
-    assert "Naruto HQ" in text, "but it does get a line and the reason"
-    assert [one["callback_data"] for row in rows[:2] for one in row] == [
+    assert any(one.startswith("📤 Naruto HQ") for one in labels), "postable is enough to offer a row"
+    assert not any("Some friends chat" in one for one in labels), "a group chat is not a channel"
+    assert "Some friends chat" not in text or "skipped, on purpose" in text
+    assert [one["callback_data"] for row in rows[:3] for one in row] == [
         "x:/discover add 1",
         "x:/discover add 2",
-    ], rows[:2]
-    assert "✅ Add everything on this page" in labels and "✨ Let it switch on its own" in labels
+        "x:/discover add 4",
+    ], rows[:3]
+    assert "✅ Add the rest on this page" in labels and "✨ Let it switch on its own" in labels
     assert "auto is off" in text, "and the screen says so in the report's words, not the button's"
+
+
+def test_one_tap_per_series_is_the_button_a_pair_gets() -> None:
+    """A pair is one decision, so it gets one button — and its two channel rows lose theirs.
+
+    The screen is where "super simple" has to land: the operator should not have to add a source, then a
+    destination, then work out that a link is missing. `app/discover.apply_pair` is the whole setup, and a
+    per-row `📥`/`📤` next to it would be a second way to do half of it, which is how half-configured channels
+    get made by accident.
+    """
+    dialogs = [
+        {"title": "Mob Psycho 100", "username": "mpsanime", "id": 111, "mine": False,
+         "left": False, "channel": True, "rights": None, "members": 40},
+        {"title": "Mob Psycho 100 Anime in Hindi", "username": None, "id": 222, "mine": True,
+         "left": False, "channel": True, "rights": {"post_messages": True}, "members": 9},
+    ]
+    plan = discover.classify(dialogs)
+    text, payload = console.discover_screen(
+        discover.report(plan, auto=False).splitlines(),
+        plan["findings"],
+        auto=False,
+        pairs=plan["pairs"],
+    )
+    labels = [one["text"] for row in payload["inline_keyboard"] for one in row]
+    datas = [one["callback_data"] for row in payload["inline_keyboard"] for one in row]
+    assert "✅ Set up Mob Psycho 100" in labels, labels
+    assert "x:/discover pair 1" in datas
+    assert "✅ Set up every pair on this page" not in labels, "one pair, one tap — not the same tap twice"
+    assert not any(one.startswith("📥 Mob Psycho 100") for one in labels), "the pair tap does that row too"
+
+    dialogs.append({"title": "Naruto", "username": "naruto_hq", "id": 333, "mine": False,
+                    "left": False, "channel": True, "rights": None, "members": 12})
+    dialogs.append({"title": "Naruto", "username": None, "id": 444, "mine": True,
+                    "left": False, "channel": True, "rights": {"post_messages": True}, "members": 7})
+    two = discover.classify(dialogs)
+    assert len(two["pairs"]) == 2
+    _text, payload = console.discover_screen(["two pairs"], two["findings"], auto=False, pairs=two["pairs"])
+    datas = [one["callback_data"] for row in payload["inline_keyboard"] for one in row]
+    assert "x:/discover pair 2" in datas and "x:/discover pair all" in datas
+    assert "Mob Psycho 100 — reads from" in text, "the line still says what the tap will do"
 
 
 def test_a_discovery_row_too_long_for_a_button_says_what_to_type() -> None:

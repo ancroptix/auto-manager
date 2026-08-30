@@ -383,16 +383,18 @@ class ControlBot:
         return [Reply(text, markup=mark)]
 
     _DISCOVER_USAGE = (
-        "usage: /discover [plan | add <n> | add all | auto on|off]\n"
+        "usage: /discover [plan | add <n> | add all | pair <n> | pair all | auto on|off]\n"
         "  /discover                read the account's channels and say what each one would become\n"
         "  /discover add 3          write that one row, exactly as the screen described it\n"
         "  /discover add all        write every row on the page, one at a time, and report each\n"
-        "  /discover auto on        keep doing it: roles re-read on every reconcile, switches applied there\n"
+        "  /discover pair 1         one series, one tap: its row if it is new, both channels, the link\n"
+        "  /discover pair all       the same for every pair the page can see\n"
+        "  /discover auto on        keep re-reading roles on every reconcile, and apply the switch there\n"
         "  /discover auto off       go back to reading only when you ask\n\n"
         "Discovery reads. It posts nothing, creates no channel in Telegram, and never rewrites a file that "
-        "was already published. A channel is a source when this account can only read it, and a destination "
-        "when it can post in it *and* the name follows `{TITLE} Anime in Hindi` — a name that does not "
-        "follow it is reported, not guessed at."
+        "was already published. A channel is a source when this account can only read it and a destination "
+        "when it can post there; two channels of the same name are the same series, and the name a "
+        "destination is spelled with (`{TITLE} Anime in Hindi`) strips down to that same series."
     )
 
     #: A dialog walk is a few API calls, and a stalled one must not hold up a chat reply forever. The
@@ -428,7 +430,7 @@ class ControlBot:
             "switch; app/discover.py owns the rules and refuses a switch it cannot undo.",
         )
 
-    async def _discover_dialogs(self) -> list | str:
+    async def _discover_dialogs(self, *, verify_rights: bool = False) -> list | str:
         """One dialog walk, on a client of its own, or the sentence that says why there is none.
 
         Its own client for the reason `app/telegram_client.probe_once` gives: a read that fails must not be
@@ -442,7 +444,9 @@ class ControlBot:
         wrapper = TelegramUserClient(settings=self.settings, db=self.db)
         try:
             client = await wrapper.start()
-            return await asyncio.wait_for(collect_dialogs(client), self._DISCOVER_TIMEOUT)
+            return await asyncio.wait_for(
+                collect_dialogs(client, verify_rights=verify_rights), self._DISCOVER_TIMEOUT
+            )
         except Exception as exc:  # noqa: BLE001 - the operator needs the reason, not a traceback
             return (
                 f"the channels could not be read from this account: {type(exc).__name__}: {str(exc)[:160]}"
@@ -461,10 +465,16 @@ class ControlBot:
         posts go *to*. Both halves are read, not configured: :mod:`app.rights` decides what "admin" means
         and :func:`app.channels.destination_name` decides what a destination is called.
 
-        What is deliberately not here: creating a channel, sending an invite, adding a bot, founding a
-        series, or turning off a channel that nothing else could be read from. Those are the four places a
-        button could do something the operator did not mean, so each one is refused with the reason rather
-        than done quietly — see `app/discover.py`.
+        One tap per series — `✅ Set up <series>` — writes the whole setup: the series row if nothing has
+        named it yet, the destination row for the channel this account can post in, a source row for each
+        channel of the same name it can only read, and `destination_id` linking them. That is the operator's
+        own rule, from their own words: the source channel and the destination channel of `Mob Psycho 100`
+        are the same show, and what tells them apart is that the account can post in one of them.
+
+        What is deliberately not here: creating a channel in Telegram, sending an invite, adding a bot, or
+        turning off the only channel a series reads from. Those are the places a button could do something the
+        operator did not mean, so each one is refused with the reason rather than done quietly — see
+        `app/discover.py`.
         """
         if self.db is None or not getattr(self.db, "connected", False):
             return [Reply(
@@ -484,10 +494,15 @@ class ControlBot:
                 return [Reply(
                     f"`auto` needs on or off — I read `{word or 'nothing'}` as neither.\n{self._DISCOVER_USAGE}"
                 )]
-        dialogs = await self._discover_dialogs()
+        dialogs = await self._discover_dialogs(verify_rights=True)
         if isinstance(dialogs, str):
             return [Reply(f"{dialogs}\n\n{self._DISCOVER_USAGE}")]
         auto = await self._discover_auto()
+        # Said out loud, because the answer to "where am I admin" is only as good as how it was found: a
+        # channel whose rights Telegram would not confirm keeps the session's weaker answer, and an operator
+        # reading "member" deserves to know that is what the cached list said, not what was asked now.
+        asked = sum(1 for one in dialogs if isinstance(one, Mapping) and one.get("rights_source") == "participant")
+        refused = [one for one in dialogs if isinstance(one, Mapping) and one.get("rights_error")]
         swept = await discover.sweep(self.db, dialogs, auto=auto)
         plan = swept["plan"]
         outcomes = [dict(flip, title=flip.get("title") or flip.get("channel")) for flip in swept["flips"]]
@@ -511,12 +526,31 @@ class ControlBot:
                 # says "was it done, and why", and translating here is what keeps `add_source` free to
                 # return the plan's own words instead of a paraphrase of them.
                 outcomes.append({**outcome, "applied": bool(outcome.get("ok")), "why": outcome.get("text") or ""})
+        elif action == "pair":
+            wanted = " ".join(args[1:]).strip().casefold()
+            targets = [
+                pair for pair in plan.get("pairs") or [] if wanted == "all" or str(pair["index"]) == wanted
+            ]
+            if not targets:
+                return [Reply(
+                    f"nothing on this page can be paired as {wanted or 'that'}, so nothing was written. "
+                    "A pair needs one channel this account can post in and one it can only read, with the "
+                    "same name — /discover shows what was found."
+                )]
+            for pair in targets:
+                outcome = await discover.apply_pair(self.db, pair)
+                outcomes.append({**outcome, "applied": bool(outcome.get("ok")), "why": outcome.get("text") or ""})
         elif action not in {"plan", "show", "auto"}:
             return [Reply(f"`{action}` is not something /discover does, so nothing was written.\n\n{self._DISCOVER_USAGE}")]
         lines = discover.report(plan, auto=auto, applied=outcomes).splitlines()
+        if asked or refused:
+            note = f"rights asked of Telegram directly for {asked} channel" + ("" if asked == 1 else "s")
+            if refused:
+                note += f", {len(refused)} would not answer and kept the session's older answer"
+            lines.insert(1, note)
         ran = "/discover" if action in {"plan", "show"} else f"/discover {' '.join(args)}"
         text, mark = console.discover_screen(
-            lines, plan["findings"], auto=auto, note=console.screen_note(ran)
+            lines, plan["findings"], auto=auto, note=console.screen_note(ran), pairs=plan.get("pairs") or []
         )
         return [Reply(text, markup=mark)]
 

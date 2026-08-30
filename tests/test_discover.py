@@ -56,6 +56,8 @@ class Db:
         self.sources, self.destinations, self.series = sources, destinations, series
         self.sql: list[tuple[str, tuple]] = []
         self.config_value: Any = False
+        # What a re-run finds when a row is already there: the mode the existing source row holds.
+        self.mode = "full"
 
     async def fetch(self, statement: str, *args: Any) -> list[dict]:
         self.sql.append((statement, args))
@@ -75,6 +77,21 @@ class Db:
             return 901
         if "insert into app.destination" in statement:
             return 902
+        if "insert into app.series" in statement:
+            return 77
+        return None
+
+    async def fetchrow(self, statement: str, *args: Any) -> Any:
+        """The three reads a pairing makes after it writes. The ids are the ones `fetchval` handed out,
+        which is the point: a link built from a number nobody returned would pass a test that only counts
+        statements and still put every source in the database on one channel."""
+        self.sql.append((statement, args))
+        if "from app.destination" in statement:
+            return {"id": 902}
+        if "select mode from app.source_channel" in statement:
+            return {"mode": self.mode}
+        if "from app.source_channel" in statement:
+            return {"id": 901}
         return None
 
     async def execute(self, statement: str, *args: Any) -> int:
@@ -86,6 +103,9 @@ class Db:
 
     def names(self, needle: str) -> list[str]:
         return [statement for statement, _ in self.sql if needle in statement]
+
+    def args(self, needle: str) -> list[tuple]:
+        return [args for statement, args in self.sql if needle in statement]
 
 
 # --------------------------------------------------------------------------- reading the role
@@ -148,7 +168,14 @@ def test_a_channel_we_cannot_write_in_becomes_a_source_and_that_is_said() -> Non
     assert "we can only read it" in finding["why"] and "something to take in" in finding["why"]
 
 
-def test_an_admin_channel_is_a_destination_only_when_its_name_says_which_series() -> None:
+def test_being_able_to_post_is_what_makes_a_channel_a_destination() -> None:
+    """The bug the operator reported, as a test: their publishing channel is named like its source.
+
+    `Naruto HQ` is a channel they run, so it is a destination — a name that is not `{TITLE} Anime in Hindi`
+    stopped being a reason for no verdict at all, because their setup has both sides named `Mob Psycho 100`
+    and discovery answered "nothing". What is *not* conceded here: a title that names no series and pairs with
+    nothing is refused at the write, not filed under a guess.
+    """
     plan = discover.classify(
         [
             dialog("Bleach Anime in Hindi", did=222, mine=True),
@@ -157,8 +184,20 @@ def test_an_admin_channel_is_a_destination_only_when_its_name_says_which_series(
     )
     named, unnamed = plan["findings"]
     assert (named["use"], named["series"]) == ("destination", "Bleach")
-    assert unnamed["use"] is None, "no verdict, so no button and no row"
-    assert "name does not follow" in unnamed["why"] and "a title is not a series" in unnamed["why"]
+    assert unnamed["use"] == "destination", "we can post there — that is what the word means"
+    assert unnamed["series"] == "Naruto HQ", "named by its own title, which the reply has to say out loud"
+    assert "we can post here" in unnamed["why"]
+
+
+@pytest.mark.asyncio
+async def test_a_channel_with_no_name_to_file_it_under_is_refused_at_the_write() -> None:
+    db = Db()
+    plan = discover.classify([dialog("", did=888, post=True)])
+    refused = await discover.add_destination(db, plan["findings"][0])
+
+    assert not refused["ok"] and "nothing here says what series this channel is for" in refused["text"]
+    assert db.names("insert into app.series") == [], "and no series row was founded from an empty title"
+    assert db.names("insert into app.destination") == []
 
 
 def test_a_group_and_a_left_channel_are_skipped_out_loud() -> None:
@@ -262,15 +301,25 @@ async def test_a_source_finding_is_written_by_the_command_writer_not_a_copy_of_i
 
 
 @pytest.mark.asyncio
-async def test_a_destination_needs_a_series_row_that_already_exists() -> None:
+async def test_a_series_that_is_not_stored_yet_is_founded_by_the_statement_the_pipeline_files_with() -> None:
+    """Reversed on the operator's ask, and still one writer: a fresh install must not be stuck forever.
+
+    Refusing until "the first file" existed was defensible while the only name on offer was one read out of
+    the destination template. Their two channels are both named the show itself, so that refusal meant the
+    setup could never be detected at all. The row is founded through `app/ingest.ensure_series` — asserted by
+    the statement, because a second spelling of `normalized_title` is how one show ends up in two rows — and
+    the reply says where the name came from, so a wrong spelling is visible before the second pair inherits it.
+    """
     db = Db(series=[])
     finding = discover.classify([dialog("Bleach Anime in Hindi", did=222, mine=True)])["findings"][0]
-    refused = await discover.add_destination(db, finding)
+    written = await discover.add_destination(db, finding)
 
-    assert not refused["ok"]
-    assert "no series called 'Bleach' is stored yet" in refused["text"]
-    assert db.names("insert into app.destination") == [], "and nothing was half-written"
-    assert "inventing the row" in refused["text"], "the reason is said, not just the refusal"
+    assert written["ok"] and written["series_id"] == 77
+    assert db.names("insert into app.series"), "the series was founded, not waited for"
+    assert "on conflict (normalized_title) do update" in db.names("insert into app.series")[0]
+    assert db.args("insert into app.series")[0][0] == "Bleach", "the name from the channel title, stripped"
+    assert "founded from the channel's own name" in written["text"]
+    assert "Nothing was created in Telegram" in written["text"]
 
 
 @pytest.mark.asyncio
@@ -396,3 +445,130 @@ def test_a_refused_switch_is_printed_as_refused_rather_than_left_out() -> None:
     assert any("not switched" in line for line in lines), lines
     assert "only watched channel reading Naruto" in text, "the reason travels to the screen, not just the log"
     assert payload["inline_keyboard"][-1][0]["text"] == "↻ Refresh"
+
+
+# --------------------------------------------------------------------------- one name, two channels
+def test_two_channels_of_the_same_name_are_one_series_and_one_pair() -> None:
+    """The operator's rule as written: `Mob Psycho 100` and `Mob Psycho 100` are one show, and what tells
+    them apart is that this account can post in one of them. The template spelling is not a third thing — it
+    strips down into the same group, so a channel named either way pairs with the other.
+    """
+    plan = discover.classify(
+        [
+            dialog("Mob Psycho 100", did=111, username="mps100"),
+            dialog("Mob Psycho 100 Anime in Hindi", did=222, mine=True),
+        ]
+    )
+    pairs = plan["pairs"]
+    assert [pair["series"] for pair in pairs] == ["Mob Psycho 100"]
+    source, destination = plan["findings"]
+    assert (source["pair"], destination["pair"]) == (1, 1)
+    assert source["series"] == destination["series"] == "Mob Psycho 100"
+    assert (destination["channel"], source["channel"]) == (-100222, -100111)
+    report = discover.report(plan, auto=False)
+    assert "reads from Mob Psycho 100" in report and "publishes into Mob Psycho 100 Anime in Hindi" in report
+
+
+def test_the_pairing_key_is_the_name_the_series_is_filed_under() -> None:
+    """`app/normalize.normalize_title` decides both sides of every comparison in this program, so a pair key
+    that used its own idea of "same name" would be a third spelling of a series title. That is the one thing
+    a pairing cannot afford: a channel that pairs with nothing is a bug the operator can see, and a channel
+    that pairs with the wrong show is not.
+    """
+    assert discover.name_key("Mob Psycho 100")[0] == discover.name_key("MOB PSYCHO 100")[0]
+    assert discover.name_key("Mob Psycho 100 Anime in Hindi") == discover.name_key("Mob Psycho 100")
+    assert discover.name_key("") is None, "a channel with no title has no name to pair on"
+
+
+def test_two_channels_of_one_name_that_can_both_be_posted_in_are_left_alone() -> None:
+    """Which of two identical-named channels holds the series is the operator's data to fix, and a pair
+    picked by list order would put files where they did not ask for them.
+    """
+    plan = discover.classify(
+        [
+            dialog("Mob Psycho 100", did=111, username="mpsanime"),
+            dialog("Mob Psycho 100", did=222, mine=True),
+            dialog("Mob Psycho 100", did=333, post=True),
+        ]
+    )
+    assert plan["pairs"] == [], "no group with two postable channels is pairable"
+    posts = [one for one in plan["findings"] if one["use"] == "destination"]
+    assert len(posts) == 2
+    assert plan["findings"][0]["pair"] == 1 or plan["findings"][0]["ambiguous"] is None
+    assert all("2 channels of this name can be posted in" in one["ambiguous"] for one in posts)
+
+
+@pytest.mark.asyncio
+async def test_one_tap_writes_the_series_both_rows_and_the_link_between_them() -> None:
+    """What `✅ Set up <series>` is allowed to do, checked statement by statement.
+
+    The order is the point as much as the set: the series row has to exist before the destination can point at
+    it (`app.destination.series_id` is NOT NULL), and the link is the last write because a source that names a
+    destination which is not there yet would publish nothing and look like the pipeline broke.
+    """
+    db = Db()
+    plan = discover.classify(
+        [
+            dialog("Mob Psycho 100", did=111, username="mpsanime"),
+            dialog("Mob Psycho 100 Anime in Hindi", did=222, mine=True),
+        ]
+    )
+    result = await discover.apply_pair(db, plan["pairs"][0])
+
+    assert result["ok"] and result["what"] == "pair" and result["sources"] == 1
+    written = [needle for needle in ("insert into app.series", "insert into app.destination",
+                                    "insert into app.source_channel") if db.names(needle)]
+    assert len(written) == 3, written
+    link = db.args("update app.source_channel set destination_id")
+    assert link == [(901, 902)], "the source row and the destination row the writes just returned"
+    assert "-100111" not in "".join(db.names("destination_id = $2"))
+    assert "is watched, and what it posts is published into" in result["text"]
+    assert "Nothing was created in Telegram" in result["text"], "the half this path never does"
+
+
+@pytest.mark.asyncio
+async def test_a_pair_that_is_half_written_is_finished_rather_than_refused() -> None:
+    """Idempotence is the whole reason one tap can be tapped twice: `insert_channel` answers None for a row
+    that exists, and if that ended the run the source would stay unlinked forever — the state the operator
+    was stuck in, described back to them as "already configured".
+    """
+    db = Db()
+    db.mode = "ignore"  # switched off earlier, by a role flip or by hand
+    plan = discover.classify(
+        [
+            dialog("Mob Psycho 100", did=111, username="mpsanime"),
+            dialog("Mob Psycho 100 Anime in Hindi", did=222, mine=True),
+        ]
+    )
+    result = await discover.apply_pair(db, plan["pairs"][0])
+
+    assert result["ok"]
+    assert db.names("update app.source_channel set mode"), "the switch back on"
+    assert "was switched off, and is watching again" in result["text"]
+    assert db.args("update app.source_channel set destination_id") == [(901, 902)]
+
+
+@pytest.mark.asyncio
+async def test_the_series_name_read_off_a_channel_is_recorded_as_read_off_a_channel() -> None:
+    """/status prints where a declaration came from, so a discovered name must not be filed as a typed one.
+
+    The words "operator" on that line are what tells an operator that a mistake is theirs to fix in the
+    dashboard; "discovered" is what tells them to check the spelling the screen just showed them.
+    """
+    db = Db()
+    finding = discover.classify([dialog("Mob Psycho 100", did=111, username="mpsanime")])["findings"][0]
+    written = await discover.add_source(db, finding)
+
+    assert written["ok"]
+    assert db.args("declared_by = $3")[0][2] == "discovered from this channel's name"
+    assert db.args("declared_by = $3")[0][1] == "Mob Psycho 100"
+
+
+def test_the_auto_sweep_asks_about_fewer_channels_than_the_screen_does() -> None:
+    """A worker loop that spent half a minute on rights would delay the files it is there to move; the
+    screen, whose only job is to answer "where am I admin", can afford the full read. The numbers are pinned
+    so the two paths stay deliberately different instead of drifting into one.
+    """
+    from app import probe
+
+    assert discover.AUTO_RIGHTS_LIMIT < probe.RIGHTS_LIMIT
