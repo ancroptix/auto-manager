@@ -254,6 +254,13 @@ class FakeDb:
             return None
         if "from app.join_campaign" in sql:
             return dict(self.campaign) if self.campaign else None
+        if "telegram_channel_id = $1" in sql:
+            # asyncpg refuses to bind a str to a bigint column, and every fake in this file used to accept
+            # it. A lookup that "works" against a lenient fake is how `int` vs `str` shipped to the operator
+            # as a crash, so the fakes are now as strict as the driver about the one argument the app most
+            # often gets wrong.
+            if not isinstance(args[0], int):
+                raise RuntimeError(f"fetchrow: {args[0]!r} cannot be bound to telegram_channel_id")
         if "from app.destination where telegram_channel_id" in sql:
             # A pairing looks its rows back up by channel number, because `insert_destination` answers None
             # when the row was already there and the link still has to be made. Without this arm the generic
@@ -285,6 +292,22 @@ class FakeDb:
             return dict(self.stored[-1]) if self.stored else None
         return {"id": 42}
 
+    @staticmethod
+    def _binding_is_int(sql: str, args: tuple) -> None:
+        """Every channel id the fake is asked to store has to be an integer, like the column is.
+
+        The insert statements name their columns, so the check reads the id's position out of the SQL rather
+        than trusting the caller: a writer that starts passing `str(id)` would otherwise plan a row the
+        production database refuses, and the test for it would pass.
+        """
+        match = re.search(r"insert into app\.\w+ \((.*?)\)", sql, re.S)
+        if not match or "telegram_channel_id" not in match.group(1):
+            return
+        names = [one.strip() for one in match.group(1).split(",")]
+        index = names.index("telegram_channel_id")
+        if index < len(args) and not isinstance(args[index], int):
+            raise RuntimeError(f"{args[index]!r} cannot be bound to telegram_channel_id")
+
     async def fetchval(self, sql: str, *args: Any):
         if "insert into app.archive_channel" in sql:
             names = [
@@ -299,6 +322,7 @@ class FakeDb:
             self.archive_channels.append(row)
             self.writes.append((sql, args))
             return row["id"]
+        self._binding_is_int(sql, tuple(args))
         if "insert into app.series" in sql:
             # `app/ingest.ensure_series`, and the only arm that may answer for a series row: the upsert's
             # `on conflict` means a real database hands back the existing id, so a name already stored must

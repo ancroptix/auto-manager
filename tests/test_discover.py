@@ -82,10 +82,15 @@ class Db:
         return None
 
     async def fetchrow(self, statement: str, *args: Any) -> Any:
-        """The three reads a pairing makes after it writes. The ids are the ones `fetchval` handed out,
+        """The three reads a pairing makes after it writes.
+ The ids are the ones `fetchval` handed out,
         which is the point: a link built from a number nobody returned would pass a test that only counts
         statements and still put every source in the database on one channel."""
         self.sql.append((statement, args))
+        if "telegram_channel_id = $1" in statement and not isinstance(args[0], int):
+            # The column is a bigint, so asyncpg refuses a str and stops the query. A fake that answered any
+            # spelling let a real crash reach the operator's chat; the strictness belongs here as well.
+            raise RuntimeError(f"{args[0]!r} cannot be bound to telegram_channel_id")
         if "from app.destination" in statement:
             return {"id": 902}
         if "select mode from app.source_channel" in statement:
@@ -572,3 +577,21 @@ def test_the_auto_sweep_asks_about_fewer_channels_than_the_screen_does() -> None
     from app import probe
 
     assert discover.AUTO_RIGHTS_LIMIT < probe.RIGHTS_LIMIT
+
+
+@pytest.mark.asyncio
+async def test_a_channel_id_is_handled_as_the_number_the_column_is() -> None:
+    """The bug the operator met after tapping ✅ on their channel, in the shape that catches it for good.
+
+    `_row_id` was called with `str(channel)`, every fake in this repository answered happily, and Postgres
+    did not: `invalid input for query argument $1: '-1003520329961' (str object cannot be interpreted as an
+    integer)`. `telegram_channel_id` is a bigint, so what the app sends has to be a number however the id was
+    spelled on the way in — the marked form, the raw form, or text an operator typed.
+    """
+    db = Db()
+    assert await discover._row_id(db, "app.destination", -100222) == 902
+    assert await discover._row_id(db, "app.destination", "-100222") == 902
+    assert await discover._row_id(db, "app.destination", "222") == 902
+    sent = [args for statement, args in db.sql if "telegram_channel_id = $1" in statement]
+    assert all(isinstance(one[0], int) for one in sent), sent
+    assert await discover._row_id(db, "app.destination", "not a channel") is None, "no query for a non-number"

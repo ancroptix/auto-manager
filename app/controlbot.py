@@ -740,7 +740,7 @@ class ControlBot:
         note = str(outcome.get("text") or "").strip()
         if not outcome.get("ok") and "already a destination row" not in note:
             return [Reply(f"it could not be filed:\n{note}\n\n{self._JOINREQ_USAGE}")]
-        row_id = await discover._row_id(self.db, "app.destination", str(finding["channel"]))
+        row_id = await discover._row_id(self.db, "app.destination", finding["channel"])
         if row_id is None:
             return [Reply("the row was written but cannot be read back, so the screen stays closed.")]
         found = await self._find_destination(f"#{row_id}")

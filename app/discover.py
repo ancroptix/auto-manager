@@ -521,10 +521,21 @@ async def add_destination(db: Any, finding: Mapping[str, Any]) -> dict[str, Any]
     }
 
 
-async def _row_id(db: Any, table: str, channel: str) -> int | None:
+async def _row_id(db: Any, table: str, channel: Any) -> int | None:
     """The row this channel already has, if any. Both insert paths answer None for that, and a link needs
-    the number: re-running a pairing that is half done must finish it, not refuse to touch it."""
-    row = await db.fetchrow(f"select id from {table} where telegram_channel_id = $1", channel)
+    the number: re-running a pairing that is half done must finish it, not refuse to touch it.
+
+    The id is sent as the integer the column is. A `str(channel)` here looked harmless against every fake
+    in this repository and failed in front of the operator with `invalid input for query argument $1:
+    '-1003520329961' (str object cannot be interpreted as an integer)`: `telegram_channel_id` is a bigint,
+    and asyncpg checks that rather than guessing. So the same `marked_channel_id` the rest of this module
+    matches with is what prepares the argument — it accepts both spellings a channel id arrives in and
+    refuses to send anything that is not digits.
+    """
+    marked = marked_channel_id(channel)
+    if marked is None:
+        return None
+    row = await db.fetchrow(f"select id from {table} where telegram_channel_id = $1", marked)
     return None if row is None else int(row["id"])
 
 
@@ -553,7 +564,7 @@ async def apply_pair(db: Any, pair: Mapping[str, Any]) -> dict[str, Any]:
             "text": "this pair has no name to file it under",
         }
     outcome = await add_destination(db, {**destination, "series": title})
-    destination_id = await _row_id(db, "app.destination", str(destination.get("channel")))
+    destination_id = await _row_id(db, "app.destination", destination.get("channel"))
     if destination_id is None:
         # Either the write was refused or the row is not readable back; in both cases there is nothing to link
         # sources to, and half a setup is worse than none — a watched channel with no destination posts
@@ -570,7 +581,7 @@ async def apply_pair(db: Any, pair: Mapping[str, Any]) -> dict[str, Any]:
     linked = 0
     for finding in sources:
         added = await add_source(db, finding)
-        source_id = await _row_id(db, "app.source_channel", str(finding.get("channel")))
+        source_id = await _row_id(db, "app.source_channel", finding.get("channel"))
         if source_id is None:
             lines.append(f"{finding.get('title') or finding.get('channel')}: {added.get('text')}")
             continue
