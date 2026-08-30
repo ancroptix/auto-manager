@@ -40,6 +40,7 @@ log = logging.getLogger("auto_manager.probe")
 
 __all__ = [
     "collect_dialogs",
+    "RIGHTS_LIMIT",
     "DIALOG_LIMIT",
     "MAX_BUTTONS_SHOWN",
     "MAX_COMMANDS_SHOWN",
@@ -419,34 +420,96 @@ def _read_bot_profile(answered: Any) -> dict[str, Any]:
 DIALOG_LIMIT = 150
 
 
-async def collect_dialogs(client: Any, *, timeout: float = 75.0, limit: int = DIALOG_LIMIT) -> list[dict[str, Any]]:
+#: How many channels get their rights asked about directly, on a run that asks. One
+#: `channels.getParticipant` per channel is the whole cost, and it is the difference between "the dialog
+#: cache has no `admin_rights`, so member" and "Telegram says this account posts here" — which is the
+#: question an operator is really asking when they report that the bot cannot tell where they are admin.
+RIGHTS_LIMIT = 80
+
+
+async def collect_dialogs(
+    client: Any,
+    *,
+    timeout: float = 75.0,
+    limit: int = DIALOG_LIMIT,
+    verify_rights: bool = False,
+    rights_limit: int = RIGHTS_LIMIT,
+) -> list[dict[str, Any]]:
     """One pass over the account's dialog list, in the shape :func:`app.rights.plan` reads.
 
-    Every key is always present, ``None`` included: "we are a member" and "we never looked" have to stay
-    two different facts, and omitting the rights key for a member once made them the same one.
+    Every key is always present, ``None`` included: "we are a member" and "we never looked" have to stay two
+    different facts, and omitting the rights key for a member once made them the same one.
+
+    ``verify_rights`` asks Telegram, per channel, what this account may actually do there. It is not the
+    default because it is one request per channel: a probe that only wants the bots' menus should not pay
+    for it, while `/discover`, whose whole answer is "where am I admin", should not trust a cached flag that
+    is often simply absent. Callers count the outcome themselves — `rights_source` says which answer an
+    entry holds and `rights_error` says where the ask was refused — because a report that lost that
+    distinction would be back to calling an unread channel a member.
     """
     entries: list[dict[str, Any]] = []
+    asked = 0
     async for dialog in _drain(client.iter_dialogs(), timeout):
         entity = getattr(dialog, "entity", None)
         if entity is None:
             continue
-        entries.append(
-            {
-                "title": (getattr(entity, "title", None) or getattr(entity, "first_name", None) or "")[:60],
-                "username": getattr(entity, "username", None),
-                # The id is what makes a private channel matchable: with no @handle to compare, the
-                # marked numeric id is the only key the dashboard row and the entity share.
-                "id": getattr(entity, "id", None),
-                "mine": bool(getattr(entity, "creator", False)),
-                "left": bool(getattr(entity, "left", False)),
-                "members": getattr(entity, "participants_count", None),
-                "channel": getattr(entity, "broadcast", None) is not None,
-                "rights": channel_rights.rights_of(entity),
-            }
-        )
+        entry: dict[str, Any] = {
+            "title": (getattr(entity, "title", None) or getattr(entity, "first_name", None) or "")[:60],
+            "username": getattr(entity, "username", None),
+            # The id is what makes a private channel matchable: with no @handle to compare, the marked
+            # numeric id is the only key the dashboard row and the entity share.
+            "id": getattr(entity, "id", None),
+            "mine": bool(getattr(entity, "creator", False)),
+            "left": bool(getattr(entity, "left", False)),
+            "members": getattr(entity, "participants_count", None),
+            "channel": getattr(entity, "broadcast", None) is not None,
+            "rights": channel_rights.rights_of(entity),
+            # Which of two possible answers this entry holds, because they are not equally good: the
+            # dialog's own `channel` object is a snapshot the session was handed, `getParticipant` is now.
+            "rights_source": "dialog",
+            "rights_error": None,
+        }
+        entries.append(entry)
+        if entry["channel"] and verify_rights and asked < rights_limit:
+            asked += 1
+            entries[-1] = await _verify_rights(client, entity, entry, timeout=timeout)
         if len(entries) >= limit:
             break
     return entries
+
+
+async def _verify_rights(client: Any, entity: Any, entry: dict[str, Any], *, timeout: float) -> dict[str, Any]:
+    """One channel, one question: what is this account allowed to do here, according to Telegram.
+
+    A failure is recorded on the entry and the dialog's answer is kept — a channel that refused the ask is
+    "not re-read", never "member". That distinction is the whole reason `app/rights.py` refuses to write a
+    guess, and it is what keeps a temporary flood wait from flipping a destination into a source.
+    """
+    from telethon import types  # noqa: PLC0415  (only this ask needs the type)
+
+    try:
+        permissions = await asyncio.wait_for(
+            client.get_permissions(entity, types.InputPeerSelf()), timeout
+        )
+    except Exception as exc:  # noqa: BLE001 - one channel refusing cannot spoil the whole list
+        entry["rights_error"] = f"{type(exc).__name__}: {str(exc)[:80]}"
+        return entry
+    if permissions is None:
+        entry["rights_error"] = "Telegram answered nothing for this peer"
+        return entry
+    entry["mine"] = bool(permissions.is_creator)
+    entry["left"] = bool(permissions.has_left)
+    rights = {
+        name: bool(getattr(permissions, name, False))
+        for name in ("post_messages", "edit_messages", "delete_messages", "invite_users", "add_admins")
+    }
+    if permissions.is_admin and not any(rights.values()):
+        # A real Telegram answer — an admin who may only manage calls — and it must not read as "member"
+        # to a caller that looks at `post_messages`. `we_are_admin` still decides what counts.
+        rights["is_admin"] = True
+    entry["rights"] = rights
+    entry["rights_source"] = "participant"
+    return entry
 
 
 async def probe_account(

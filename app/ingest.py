@@ -35,7 +35,8 @@ from .keys import (
 )
 from .stages import JobKind, JobStage
 
-__all__ = ["record_message", "season_stream", "SOURCE_MODE_IGNORED"]
+__all__ = [
+    "ensure_series","record_message", "season_stream", "SOURCE_MODE_IGNORED"]
 
 SOURCE_MODE_IGNORED = "ignore"
 
@@ -355,10 +356,18 @@ async def record_message(
 # ---------------------------------------------------------------------------
 
 
-async def _resolve_series(db: Any, channel_series_id: int | None, parsed: normalize.ParsedEpisode) -> int:
-    if channel_series_id:
-        return int(channel_series_id)
-    title = parsed.series or "Untitled"
+async def ensure_series(db: Any, title: str) -> int:
+    """Found a series by name, or return the one that already answers to it. The only statement that does.
+
+    It stays in the module the pipeline files from, rather than next to whoever wants a series:
+    `normalized_title` is the key the whole schema hangs episodes off, and a second writer spelling it a
+    different way would put one show in two rows — the mistake a fan-translated title makes easy.
+
+    `/discover` calls it, because pairing a channel we administer with a channel we read means naming the
+    series they are both named after, and waiting for the first file would leave the operator looking at a
+    screen that says "not yet". Every caller has to say in its own reply where its title came from; this
+    function neither decides nor refuses that, and stores the title as given.
+    """
     return int(
         await db.fetchval(
             """
@@ -372,6 +381,12 @@ async def _resolve_series(db: Any, channel_series_id: int | None, parsed: normal
             normalize_title(title),
         )
     )
+
+
+async def _resolve_series(db: Any, channel_series_id: int | None, parsed: normalize.ParsedEpisode) -> int:
+    if channel_series_id:
+        return int(channel_series_id)
+    return await ensure_series(db, parsed.series or "Untitled")
 
 
 async def season_stream(db: Any, series_id: int, *, season_number: int | None = None) -> dict[str, Any]:

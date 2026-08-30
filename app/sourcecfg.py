@@ -41,6 +41,7 @@ __all__ = [
     "insert_archive",
     "insert_channel",
     "insert_destination",
+    "link_destination",
     "plan_new_destination",
     "plan_archive",
     "parse_toggle",
@@ -255,6 +256,7 @@ def plan_new(
     entity: Mapping[str, Any] | None = None,
     title: str | None = None,
     series: str | None = None,
+    declared_by: str = "operator",
 ) -> dict[str, Any] | str:
     """Decide what the new row should hold. Returns a message when it cannot decide honestly.
 
@@ -292,6 +294,10 @@ def plan_new(
         "require_hindi_audio": True,
         "include_subbed": False,
         "series": str(series).strip() if series else None,
+        # Who is standing behind the series name. `operator` is the truth for a typed line and a lie for a
+        # name read off a channel title, and `/status` prints the difference: "the file said Hindi" has to
+        # stay tellable apart from "you told me to assume it".
+        "declared_by": str(declared_by or "operator").strip()[:60],
         "verified": entity is not None,
     }
 
@@ -357,6 +363,21 @@ def plan_new_destination(
     }
 
 
+async def link_destination(db: Any, source_id: int, destination_id: int) -> None:
+    """Point a source row at the channel its files are published into.
+
+    One column, and the pipeline already reads it: `app/controlbot.py`'s `/inplace` looks a destination up by
+    `destination_id` first and by channel number second, and the console's cross-row button refuses until it
+    is set. Nothing else in this program wrote it before now, which is the reason a paired channel looked
+    unpaired on screen.
+    """
+    await db.execute(
+        "update app.source_channel set destination_id = $2, updated_at = now() where id = $1",
+        int(source_id),
+        int(destination_id),
+    )
+
+
 async def insert_destination(db: Any, plan: Mapping[str, Any]) -> int | None:
     """Write the destination row. One per channel number, and never a second for the same series.
 
@@ -414,10 +435,11 @@ async def insert_channel(db: Any, plan: Mapping[str, Any]) -> int | None:
         return None
     if plan.get("series"):
         await db.execute(
-            "update app.source_channel set declared_series = $2, declared_by = 'operator',"
+            "update app.source_channel set declared_series = $2, declared_by = $3,"
             " declared_at = now(), updated_at = now() where id = $1",
             int(new_id),
             str(plan["series"]),
+            str(plan.get("declared_by") or "operator"),
         )
     return int(new_id)
 
