@@ -458,8 +458,15 @@ class ControlBot:
         finally:
             await wrapper.stop()
 
-    async def _pending_requests(self, peer: str) -> tuple[int | None, str | None]:
-        """How many join requests are waiting in a channel, on a session of the bot's own.
+    async def _pending_requests(self, peer: str) -> tuple[int | None, int | None, str | None]:
+        """How many join requests are waiting, how many this look could read, and why if neither.
+
+        Two numbers because they answer two different questions. Telegram's counters say how big the queue
+        is; the read's rows say how far into it this look reached, and a page of 100 in a queue of 3 000 is
+        both true at once. Printing only the second is how an operator is told "100 pending" for the tenth
+        run in a row and starts to suspect the bot is stuck. The first version printed neither honestly: it
+        counted the rows of one linkless query, that query answers nothing for a private channel's primary
+        `+ABCDEF` link, and a queue of twenty people was reported as zero.
 
         `/campaign … plan` has always promised the real headcount, and it used to get it from
         `self.telegram.client` — an attribute this class does not have and never did, so in a live deployment
@@ -480,16 +487,21 @@ class ControlBot:
             reader = sender.Sender(
                 client, db=None, policy=sender.WritePolicy(mode="plan", allow_peers=())
             )
+            # Bounded on purpose: a plan needs the queue's size, which the channel's own counters answer in
+            # the first calls, and reading 100 people per link across a dozen links could run past the time a
+            # tap is allowed to take and come back as "could not be read". The rows a plan shows are a
+            # sample, and the sentence says so.
             result, rows = await asyncio.wait_for(
-                reader.pending_requests(peer, limit=100), self._DISCOVER_TIMEOUT
+                reader.pending_requests(peer, limit=25, max_pages=1, max_links=4), self._DISCOVER_TIMEOUT
             )
         except Exception as exc:  # noqa: BLE001 - the operator needs the reason, not a traceback
-            return None, f"{type(exc).__name__}: {str(exc)[:160]}"
+            return None, None, f"{type(exc).__name__}: {str(exc)[:160]}"
         finally:
             await wrapper.stop()
         if not result.ok:
-            return None, str(result.detail)[:200]
-        return len([row for row in rows if not row.get("approved_by")]), None
+            return None, None, str(result.detail)[:200]
+        waiting = [row for row in rows if not row.get("approved_by")]
+        return int(getattr(result, "total", 0) or 0) or len(waiting), len(waiting), None
 
     async def _discover(self, update: Update, args: list[str]) -> list[Reply]:
         """``/discover`` — what this account can see, and the tap that files it.
@@ -2364,16 +2376,22 @@ class ControlBot:
                 return [Reply(f"no campaign called `{name}` for that channel. /campaign {handle} list")]
 
             if action == "plan":
-                count, why = await self._pending_requests(
+                total, listed, why = await self._pending_requests(
                     str(destination.get("telegram_channel_id") or "")
                 )
-                pending = (
-                    f"\n\n{count} request(s) are pending right now"
-                    if count is not None
-                    else "\n\nthe pending requests could not be read from this account right now: "
-                    f"{why}\nthe job reads them again when it runs, so this plan shows the rules and not "
-                    "the headcount."
-                )
+                if total is None:
+                    pending = (
+                        "\n\nthe pending requests could not be read from this account right now: "
+                        f"{why}\nthe job reads them again when it runs, so this plan shows the rules and "
+                        "not the headcount."
+                    )
+                else:
+                    pending = f"\n\n{total} join request(s) are waiting right now"
+                    if listed is not None and listed < total:
+                        pending += (
+                            f" — this look reached {listed} of them, and the run works through the queue "
+                            "in batches rather than all at once"
+                        )
                 code = joinmsg.confirm_code(campaign["id"], campaign["message_template"])
                 return [Reply(
                     f"campaign `{name}` ({campaign['status']}) on "

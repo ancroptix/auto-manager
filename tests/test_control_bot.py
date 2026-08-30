@@ -3283,11 +3283,16 @@ def joinreq_bot(*, dialogs=None, campaign=...):
     # The headcount read opens a session of its own, which is the whole point of the helper — and a test
     # that let it run for real would be testing the network. The stub is explicit about the number so the
     # flow tests assert the sentence the plan prints, not the exception it used to raise.
-    async def _count(peer: str) -> tuple[int | None, str | None]:
-        return 3, None
+    # `joinreq_waiting` is module-level so one test can ask for a queue deeper than what a look reached,
+    # which is the only way the difference between the two numbers can be pinned from outside.
+    async def _count(peer: str) -> tuple[int | None, int | None, str | None]:
+        return (*joinreq_waiting, None)
 
     control._pending_requests = _count  # type: ignore[method-assign]
     return control, api, db, walk
+
+
+joinreq_waiting: tuple[int | None, int | None] = (3, 3)
 
 
 @pytest.mark.asyncio
@@ -3472,7 +3477,35 @@ async def test_the_plan_counts_the_people_waiting_now() -> None:
     }
     control, api, db, _w = joinreq_bot(campaign=campaign)
     await control.dispatch(parse_update(_press(api, "x:/joinreq start #21")))
-    assert "3 request(s) are pending right now" in api.sent[-1][1], api.sent[-1][1]
+    assert "3 join request(s) are waiting right now" in api.sent[-1][1], api.sent[-1][1]
+
+
+@pytest.mark.asyncio
+async def test_the_plan_shows_the_queue_and_not_just_the_page(monkeypatch) -> None:
+    """The number the operator decides on is the channel's total, and the second number says so honestly.
+
+    A queue of 250 in which this look reached 3 people prints both, because both are true. Printing only "3"
+    reads as "only three people want in" — which is how a campaign gets cancelled out of a page boundary —
+    and printing only "250" reads as "this run will message 250 now", which is not what the hourly ceiling
+    allows. The sentence has to carry the whole fact; two halves of it are each a wrong answer.
+    """
+    campaign = {
+        "id": 7,
+        "name": "default",
+        "status": "draft",
+        "message_template": "{name}, aapka request dekh liya jaa raha hai",
+        "rate_per_hour": 20,
+        "confirm_required": True,
+    }
+    monkeypatch.setitem(globals(), "joinreq_waiting", (250, 3))
+    control, api, db, _w = joinreq_bot(campaign=campaign)
+
+    await control.dispatch(parse_update(_press(api, "x:/joinreq start #21")))
+    text = api.sent[-1][1]
+
+    assert "250 join request(s) are waiting right now" in text, text
+    assert "this look reached 3 of them" in text, text
+    assert "in batches rather than all at once" in text, text
 
 
 @pytest.mark.asyncio
@@ -3493,8 +3526,8 @@ async def test_a_plan_that_cannot_read_the_list_says_so_instead_of_showing_zero(
     }
     control, api, db, _w = joinreq_bot(campaign=campaign)
 
-    async def _broken(peer: str) -> tuple[int | None, str | None]:
-        return None, "SessionNotFoundError: no stored session for this account"
+    async def _broken(peer: str) -> tuple[int | None, int | None, str | None]:
+        return None, None, "SessionNotFoundError: no stored session for this account"
 
     control._pending_requests = _broken  # type: ignore[method-assign]
     await control.dispatch(parse_update(_press(api, "x:/joinreq start #21")))

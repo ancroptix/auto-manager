@@ -934,18 +934,56 @@ async def join_request_campaign(self: Writers, job: dict[str, Any], ctx: Any) ->
         raise NeedsInput("the campaign text breaks a rule: " + " / ".join(problems))
 
     peer = self._peer(campaign)
-    reader = self._writer([peer], max_writes=0)
-    found, requests = await reader.pending_requests(peer, limit=100)
-    if not found.ok:
-        return {"campaign_id": int(campaign_id), "blocked": found.detail}
     already = {
         int(row["telegram_user_id"])
         for row in await self.db.fetch(
             "select telegram_user_id from app.join_campaign_contact where campaign_id = $1", int(campaign_id)
         )
     }
+
+    async def _next_run() -> bool:
+        """Hand the queue to the next run, under the key that says how far this one got. See `apply_pair`
+        in `app/discover.py` for the same shape: a run bounded by the job lease, a key that only a real
+        advance changes."""
+        recorded = int(
+            await self.db.fetchval(
+                "select count(*) from app.join_campaign_contact where campaign_id = $1", int(campaign_id)
+            )
+            or 0
+        )
+        queued = await self.db.enqueue(
+            JobKind.JOIN_REQUEST_CAMPAIGN.value,
+            keys.campaign_run_key(int(campaign_id), recorded),
+            stage=JobStage.DISCOVERED,
+            payload={"campaign_id": int(campaign_id), "destination_id": campaign.get("destination_id")},
+            destination_id=campaign.get("destination_id"),
+        )
+        return bool(queued)
+
+    reader = self._writer([peer], max_writes=0)
+    # `skip` is the whole reason the read can move: the queue is newest-first and does not shrink while a
+    # campaign works through it, because nothing here approves anybody. Without it, a run that had written
+    # to the first hundred would read those same hundred, find them known, and be tempted to call the
+    # campaign finished with two thousand nine hundred still waiting.
+    found, requests = await reader.pending_requests(peer, limit=JOIN_MAX_PER_RUN * 2, skip=already)
+    if not found.ok:
+        return {"campaign_id": int(campaign_id), "blocked": found.detail}
     waiting = [entry for entry in requests if int(entry.get("user_id") or 0) and int(entry["user_id"]) not in already]
     if not waiting:
+        waiting_too = int(getattr(found, "total", 0) or 0) - len(already)
+        if waiting_too > 0:
+            # People are waiting and this run could not reach them — the read walked its pages, the offset
+            # ran out, or a link refused. Closing the campaign here would be the loudest kind of wrong, so
+            # the run asks for the next one and reports the number it could not get to.
+            await _next_run()
+            return {
+                "campaign_id": int(campaign_id),
+                "waiting": waiting_too,
+                "sent": 0,
+                "failed": 0,
+                "resumed": True,
+                "why": "the queue is bigger than the pages this run could read",
+            }
         await self.db.execute(
             "update app.join_campaign set status = 'completed', finished_at = now(), updated_at = now() where id = $1",
             int(campaign_id),
@@ -1024,22 +1062,7 @@ async def join_request_campaign(self: Writers, job: dict[str, Any], ctx: Any) ->
         finished,
     )
     if not finished:
-        # Passed to the next run rather than slept through, because the next run is also what a restart or a
-        # Render spin-down resumes from — `app/handlers.py` uses the same key for the same reason, so a
-        # campaign is never sent to twice by the overlap of the two paths.
-        recorded = int(
-            await self.db.fetchval(
-                "select count(*) from app.join_campaign_contact where campaign_id = $1", int(campaign_id)
-            )
-            or 0
-        )
-        await self.db.enqueue(
-            JobKind.JOIN_REQUEST_CAMPAIGN.value,
-            keys.campaign_run_key(int(campaign_id), recorded),
-            stage=JobStage.DISCOVERED,
-            payload={"campaign_id": int(campaign_id), "destination_id": campaign.get("destination_id")},
-            destination_id=campaign.get("destination_id"),
-        )
+        await _next_run()
     return {
         "campaign_id": int(campaign_id),
         "sent": sent,

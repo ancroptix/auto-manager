@@ -100,6 +100,10 @@ class Result:
     #: Seconds Telegram asked us to wait. Present on ``blocked`` for a flood, and the caller's job
     #: is failed with it — the queue owns the delay so no loop ever owns it.
     retry_after: int | None = None
+    #: How many are waiting in total, from Telegram's own counters rather than from the length of a page.
+    #: A read that filled one page of a three-thousand-person queue reports 3 000 here and 100 rows, and
+    #: only the first number is safe to show an operator or to decide "is the campaign finished" with.
+    total: int = 0
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -110,6 +114,7 @@ class Result:
             "chars": self.chars,
             "buttons": self.buttons,
             "retry_after": self.retry_after,
+            "total": self.total,
         }
 
 
@@ -245,8 +250,16 @@ class Sender:
         log.warning("sender refused %s to %s: %s", action, peer, why)
         return Result(ok=False, action="blocked", detail=why, chars=len(text or ""))
 
-    def _gate(self, action: str, peer: Any, text: str) -> Result | None:
-        """The four refusals, before any await. Returns None when the write may go ahead."""
+    def _gate(self, action: str, peer: Any, text: str, *, read: bool = False) -> Result | None:
+        """The refusals, before any await. Returns None when the call may go ahead.
+
+        `read` is the second half of what a shadow deployment is allowed to do. The plan short-circuit is
+        there so that no *message* can leave the process while `APP_MODE` says shadow, and it is applied to
+        reads as well if the caller does not say otherwise — which is exactly how a campaign plan came to
+        print "0 request(s) are pending right now": the read was never sent, `rows` was empty by
+        construction, and an empty list of pending requests looked like a fact about the channel. A read is
+        not a write; "nothing is sent" is the promise, not "nothing is asked".
+        """
         if peer in (None, ""):
             return self._refuse(action, peer, text, "no peer named; a write without a destination is refused")
         if not self.policy.may(peer):
@@ -260,7 +273,7 @@ class Sender:
             return self._refuse(
                 action, peer, text, f"{len(text)} chars is over Telegram's {MAX_MESSAGE_CHARS}-character limit"
             )
-        if not self.policy.live:
+        if not self.policy.live and not read:
             # The plan is the answer, not an apology: it is what the operator reads before a live day.
             # A plan names the peer as it was written and resolves nothing — shadow mode must not be
             # able to fail because a connection is missing, and the two spellings read the same anyway.
@@ -273,7 +286,7 @@ class Sender:
             )
         return None
 
-    async def _target(self, peer: Any) -> tuple[Any, str | None]:
+    async def _target(self, peer: Any, *, force: bool = False) -> tuple[Any, str | None]:
         """The entity Telethon should be handed, or the reason this session cannot reach it.
 
         Two jobs, both learned from the way this deployment fails rather than from the docs: cast the
@@ -285,7 +298,7 @@ class Sender:
         target = resolve_peer(peer)
         if not target:
             return target, "no peer was named"
-        if not self.policy.live:
+        if not (self.policy.live or force):
             return target, None
         try:
             entity = await self.client.get_entity(target)
@@ -295,11 +308,16 @@ class Sender:
             return target, f"this session cannot see {peer} ({detail})"
         return entity, None
 
-    async def _call(self, action: str, peer: Any, coro: Awaitable[Any], *, text: str, buttons: int = 0) -> Result:
-        try:
-            self.policy.take()
-        except WriteBudget as exc:
-            return self._refuse(action, peer, text, str(exc))
+    async def _call(
+        self, action: str, peer: Any, coro: Awaitable[Any], *, text: str, buttons: int = 0, read: bool = False
+    ) -> Result:
+        if not read:
+            # A read spends no budget, and must not be refused for want of it: a campaign plan needs to look
+            # at the queue without touching the one number that decides whether messages go out.
+            try:
+                self.policy.take()
+            except WriteBudget as exc:
+                return self._refuse(action, peer, text, str(exc))
         try:
             sent = await asyncio.wait_for(coro, timeout=_TIMEOUT)
         except asyncio.TimeoutError:
@@ -505,51 +523,229 @@ class Sender:
                 return (Result(ok=True, action="read", detail=f"{len(seen)} message(s) read from {peer}"), seen)
             await asyncio.sleep(min(1.5, max(0.2, deadline - time.monotonic())))
 
-    async def pending_requests(self, peer: Any, *, limit: int = 50) -> tuple[Result, list[dict[str, Any]]]:
-        """Still-unanswered join requests of a channel we admin.
+    async def pending_requests(
+        self,
+        peer: Any,
+        *,
+        limit: int = 100,
+        skip: Sequence[int] = (),
+        max_pages: int = 6,
+        max_links: int = 12,
+    ) -> tuple[Result, list[dict[str, Any]]]:
+        """Who is waiting to be let in, read from the invite links the requests came through.
 
-        ``messages.getChatInviteImporters`` is the only read that answers this, and ``requested=True``
-        is the filter that keeps *approved* people out of a list whose whole purpose is "who is
-        waiting". Older pending entries are included: the point of this call is that a request from
-        last month can still be answered today.
+        ``messages.getChatInviteImporters`` answers "who is waiting **on this link**". Asked with no link
+        at all, it comes back empty for the setup almost every channel has — a private channel whose
+        requests all sit on its primary `+ABCDEF` link — and a queue of twenty people was reported to the
+        operator as "0 request(s) are pending". So the read starts from the channel's own
+        `full_chat.exported_invite` (whose `requested` field is Telegram's pending count for that link),
+        then walks the other exported links the admins made, each of which can hold its own queue. The
+        linkless query is still tried, last, because a public channel has no exported primary link and may
+        answer it; it is no longer the only thing asked.
+
+        The count the operator is shown is never the length of a page: `ChatInviteImporters.count` and the
+        per-link `requested` numbers are the totals, and they ride back on the result as ``total``.
+        Otherwise a queue of 3 000 with 100 on the first page would say "100", and "everyone is done"
+        would be inferred from a page boundary.
+
+        ``skip`` exists for the size of a real queue: a campaign that already wrote to the first hundred
+        must not read the same hundred, find them known, and conclude nobody is waiting. The read pages
+        forward past the ids it is given, up to ``max_pages`` pages per link.
         """
-        refused = self._gate("read_requests", peer, "")
-        target, problem = await self._target(peer)
+        from datetime import datetime, timezone  # noqa: PLC0415  (only the pagination offsets need it)
+
+        # `read=True` so a shadow deployment still answers, and `force=True` so the id becomes an entity
+        # this session has actually seen — an unresolvable channel must read as a sentence about the
+        # channel, not as an empty queue.
+        refused = self._gate("read_requests", peer, "", read=True)
+        target, problem = await self._target(peer, force=True)
         if refused is not None:
             return refused, []
         if problem is not None:
             return Result(ok=False, action="blocked", detail=problem), []
-        try:
-            from telethon import functions, types  # noqa: PLC0415
 
-            found = await self.client(
-                functions.messages.GetChatInviteImportersRequest(
-                    peer=await self.client.get_input_entity(target),
-                    offset_date=None,
-                    offset_user=types.InputUserEmpty(),
-                    limit=int(limit),
-                    requested=True,
-                )
+        from telethon import functions, types  # noqa: PLC0415
+
+        known: set[int] = {int(one) for one in skip}
+        want = max(1, int(limit))
+        rows: list[dict[str, Any]] = []
+        seen: set[int] = set()
+        totals: list[int] = []
+        notes: list[str] = []
+        asked = 0
+
+        try:
+            full = await asyncio.wait_for(
+                self.client(functions.channels.GetFullChannelRequest(channel=target)), timeout=_TIMEOUT
             )
-        except Exception as exc:  # noqa: BLE001
-            mapped = _map_error(exc)
-            detail = mapped[1] if mapped else f"{type(exc).__name__}: {str(exc)[:160]}"
-            return Result(ok=False, action="failed", detail=f"could not read requests of {peer}: {detail}"), []
-        rows = [
-            {
-                "user_id": int(getattr(importer, "user_id", 0) or 0),
-                "about": str(getattr(importer, "about", "") or ""),
-                "date": str(getattr(importer, "date", "") or ""),
-            }
-            for importer in list(getattr(found, "importers", []) or [])
-        ]
+        except asyncio.TimeoutError:
+            return Result(ok=False, action="failed", detail=f"the channel itself did not answer in {_TIMEOUT:.0f}s"), []
+        except Exception as exc:  # noqa: BLE001 - one unread channel is a sentence, never a crash
+            return Result(ok=False, action="failed", detail=f"the channel itself could not be read: {_reason(exc)}"), []
+        exported = getattr(getattr(full, "full_chat", None), "exported_invite", None)
+        links: list[str] = []
+        if exported is not None:
+            totals.append(int(getattr(exported, "requested", 0) or 0))
+            links.extend(_link_spellings(getattr(exported, "link", None)))
+        if not links:
+            # The links the admins made by hand. `getExportedChatInvites` needs an admin to list them
+            # *for*, which is this account, and each entry carries its own pending count.
+            try:
+                listing = await asyncio.wait_for(
+                    self.client(
+                        functions.messages.GetExportedChatInvitesRequest(
+                            peer=target, admin_id=types.InputUserSelf(), limit=max_links, revoked=False
+                        )
+                    ),
+                    timeout=_TIMEOUT,
+                )
+                for entry in list(getattr(listing, "invites", []) or []):
+                    one = getattr(entry, "invite", entry)
+                    if bool(getattr(one, "revoked", False)):
+                        continue
+                    totals.append(int(getattr(one, "requested", 0) or 0))
+                    links.extend(_link_spellings(getattr(one, "link", None)))
+            except Exception as exc:  # noqa: BLE001
+                notes.append(f"the channel's other invite links could not be listed ({_reason(exc)})")
+        # A public channel has no exported primary link, and the linkless query is what the older code
+        # relied on. Keep asking it - as the last thing, and never as the only thing.
+        links.append("")
+
+        for link in dict.fromkeys(links):
+            offset_date: datetime | None = None
+            offset_user: Any = types.InputUserEmpty()
+            for _page in range(max_pages):
+                if len(rows) >= want:
+                    break
+                args: dict[str, Any] = {
+                    "peer": target,
+                    "requested": True,
+                    "offset_date": offset_date,
+                    "offset_user": offset_user,
+                    # A page, not "what is left": the queue is ordered newest first and the caller's
+                    # `skip` set is what decides whether this page is worth anything.
+                    "limit": 100,
+                }
+                if link:
+                    args["link"] = link
+                asked += 1
+                try:
+                    found = await asyncio.wait_for(
+                        self.client(functions.messages.GetChatInviteImportersRequest(**args)), timeout=_TIMEOUT
+                    )
+                except asyncio.TimeoutError:
+                    notes.append(f"the waiting list did not answer in {_TIMEOUT:.0f}s")
+                    break
+                except Exception as exc:  # noqa: BLE001 - a link that refuses is skipped, not fatal
+                    notes.append(f"{_reason(exc)}")
+                    break
+                importers = list(getattr(found, "importers", []) or [])
+                totals.append(int(getattr(found, "count", 0) or 0))
+                if not importers:
+                    break
+                last = importers[-1]
+                for importer in importers:
+                    user_id = int(_field(importer, "user_id", 0) or 0)
+                    if not user_id or user_id in seen:
+                        continue
+                    seen.add(user_id)
+                    if user_id in known:
+                        continue
+                    rows.append(
+                        {
+                            "user_id": user_id,
+                            "about": str(_field(importer, "about", "") or ""),
+                            "date": str(_field(importer, "date", "") or ""),
+                            "approved_by": _field(importer, "approved_by", None),
+                        }
+                    )
+                if len(importers) < 100:
+                    break  # the short page is the end of this link's queue
+                # The offset has to be a date the server can encode, so a row that carries no real one (a
+                # test's dict, an old layer) is answered with "now" rather than with a string.
+                stamp = _field(last, "date", None)
+                offset_date = stamp if isinstance(stamp, datetime) else datetime.now(timezone.utc)
+                offset_user = _input_user(
+                    int(_field(last, "user_id", 0) or 0), list(getattr(found, "users", []) or [])
+                )
+                if offset_user is None:
+                    notes.append("the next page could not be asked for (the reader of the last person was unknown)")
+                    break
+        # The biggest number any of the reads claimed, and never less than the people actually looked at:
+        # a link that reports no `requested` count but hands over 40 importers is still 40 waiting.
+        total = max([one for one in totals if one] + [len(seen)])
+        detail = f"{len(rows)} request(s) read"
+        detail += f" of {total} waiting" if total else " (nothing is waiting)"
+        if notes:
+            detail += "; " + "; ".join(notes[:3])
         return (
-            Result(ok=True, action="read_requests", detail=f"{len(rows)} pending request(s) on {peer}"),
+            Result(ok=True, action="read_requests", detail=detail[:400], total=total),
             rows,
         )
 
 
+def _field(row: Any, name: str, default: Any = None) -> Any:
+    """One field of a Telegram row, whether the row is an object or a test's dict.
+
+    A real response hands over `ChatInviteImporter` instances and `getattr` would be enough; the fakes in
+    `tests/` hand over dicts, and a read that answered "nobody" to a dict would leave the paging and the
+    skipping untested. Two lines buys that difference.
+    """
+    value = getattr(row, name, None)
+    if value is None and isinstance(row, dict):
+        value = row.get(name)
+    return default if value is None else value
+
+
+def _link_spellings(link: Any) -> list[str]:
+    """The one or two strings a channel's `https://t.me/+ABC` link can be named by in `getChatInviteImporters`.
+
+    `link` is documented as the invite link, and clients pass the hash rather than the URL. Which of the two
+    a given deployment answers to is not written down anywhere honest, so both are tried - the tail after the
+    last slash, with and without the `+` - and the first one that returns people wins. Nothing is invented
+    here: it is the same value the channel's own `exported_invite.link` carries, cut two ways.
+    """
+    text = str(link or "").strip()
+    if not text:
+        return []
+    tail = text.rsplit("/", 1)[-1]
+    if not tail:
+        return []
+    return list(dict.fromkeys([tail.lstrip("+"), tail] if tail.startswith("+") else [tail]))
+
+
+def _input_user(user_id: Any, users: Sequence[Any]) -> Any:
+    """`InputUser` for the last reader on a page, because the next page has to name one to start after.
+
+    The ids Telegram returns in `users` are the only place the access hashes come from; asking with an empty
+    user would page from the start again, and a caller that read the same hundred people forever looks like a
+    campaign that finished. So no hash, no next page - the caller is told, in the result's own sentence.
+    """
+    from telethon import types  # noqa: PLC0415
+
+    wanted = int(user_id or 0)
+    for one in users:
+        # `types.User` spells the number `id`, and anything already input-shaped spells it `user_id`;
+        # `types.InputUser` itself takes `user_id`, which is not the name a response carries.
+        found_id = int(getattr(one, "id", None) or getattr(one, "user_id", 0) or 0)
+        if found_id == wanted and getattr(one, "access_hash", None) is not None:
+            return types.InputUser(user_id=wanted, access_hash=int(one.access_hash))
+    return None
+
+
 _TIMEOUT = 45.0
+
+
+def _reason(exc: Exception) -> str:
+    """One line about a failed read, in the shape a chat reply can carry.
+
+    Read paths need this and cannot use `_map_error`'s retry arithmetic: a flood wait on a *read* is still
+    just a reason the operator has to see, not a queue instruction.
+    """
+    mapped = _map_error(exc)
+    if mapped is not None and mapped[1]:
+        return str(mapped[1])[:180]
+    return f"{type(exc).__name__}: {str(exc)[:140]}"
 
 
 def _map_error(exc: Exception) -> tuple[int | None, str] | None:

@@ -264,10 +264,14 @@ class CampaignDb:
     ask for its next run, and a run that asks twice would message the same stranger twice.
     """
 
-    def __init__(self, *, waiting: int, rate: int = 100, recorded: int = 0) -> None:
+    def __init__(self, *, waiting: int, rate: int = 100, recorded: int = 0, contacts: int = 0) -> None:
         self.waiting = waiting
         self.rate = rate
-        self.recorded = recorded
+        # `contacts` is how far into the queue this campaign already is. It drives both halves of the story:
+        # the rows the read is told to skip, and the count the continuation key is named after, so a test
+        # cannot make one agree with the other by accident.
+        self.contacts = contacts
+        self.recorded = recorded if recorded else contacts
         self.sql: list[tuple[str, tuple]] = []
         self.queued: list[tuple[str, str]] = []
 
@@ -288,6 +292,8 @@ class CampaignDb:
 
     async def fetch(self, statement: str, *args):
         self.sql.append((statement, args))
+        if "join_campaign_contact" in statement and "count(*)" not in statement:
+            return [{"telegram_user_id": 900 + n} for n in range(self.contacts)]
         return []
 
     async def fetchval(self, statement: str, *args):
@@ -310,13 +316,25 @@ class CampaignDb:
 class CampaignSender:
     """The two calls the campaign makes on the session: who is waiting, and one text to one person."""
 
-    def __init__(self, *, action: str = "sent") -> None:
+    def __init__(self, *, action: str = "sent", total: int | None = None) -> None:
         self.action = action
         self.sent: list[tuple[str, str]] = []
+        self._total = total
 
-    async def pending_requests(self, peer, *, limit: int = 100):
-        rows = [{"user_id": 900 + n, "about": "", "date": ""} for n in range(self._waiting)]
-        return sender.Result(ok=True, action="read_requests", detail=f"{len(rows)} pending"), rows
+    async def pending_requests(self, peer, *, limit: int = 100, skip=(), **kwargs):
+        # `skip` is honoured the way the real read honours it: the known ids are walked past rather than
+        # handed back, so a test of a long queue cannot pass by pretending the run starts at page one
+        # every time. `total` is the queue's size, and it is deliberately larger than what a page holds.
+        known = {int(one) for one in skip}
+        rows = [
+            {"user_id": 900 + n, "about": "", "date": "", "approved_by": None}
+            for n in range(self._waiting)
+            if 900 + n not in known
+        ][:limit]
+        return (
+            sender.Result(ok=True, action="read_requests", detail=f"{len(rows)} pending", total=self._total),
+            rows,
+        )
 
     def set_waiting(self, count: int) -> None:
         self._waiting = count
@@ -326,11 +344,16 @@ class CampaignSender:
         return sender.Result(ok=True, action=self.action, detail="sent")
 
 
-def _campaign_writers(db, *, outbound: bool, action: str = "sent") -> Writers:
+def _campaign_writers(
+    db, *, outbound: bool, action: str = "sent", total: int | None = None
+) -> Writers:
     from types import SimpleNamespace
 
     writers = Writers(db=db, settings=SimpleNamespace(outbound_enabled=outbound))
-    transport = CampaignSender(action=action)
+    # `total` is the channel's own count of waiting people, which is deliberately settable apart from the
+    # rows a page returned: a queue of 250 with a page of 3 is the situation that used to be misread.
+    total = db.waiting if total is None else total
+    transport = CampaignSender(action=action, total=total)
     transport.set_waiting(db.waiting)
     writers._writer = lambda peers, **kwargs: transport  # type: ignore[assignment]
     writers.transport = transport  # type: ignore[attr-defined]
@@ -366,6 +389,33 @@ async def test_a_campaign_writes_to_one_person_every_three_seconds(monkeypatch) 
 
 
 @pytest.mark.asyncio
+async def test_a_queue_bigger_than_the_pages_is_not_reported_as_finished(monkeypatch) -> None:
+    """Nothing may be called "nobody is waiting" because this run's read came back with no new rows.
+
+    The campaign had written to two people; the channel says 250 are waiting; the read this run could make
+    returned an empty page (the offset ran out, or the queue is deeper than the pages a 120-second lease
+    allows). Marking the campaign `completed` there is the loudest kind of wrong, because the operator read
+    that number as "everyone has been told" — the exact shape of the bug that emptied a 20-person queue into
+    a `0 pending` sentence. So the run hands itself to the next one and says how many it could not reach.
+    """
+    from app import keys
+
+    db = CampaignDb(waiting=0, rate=1000, contacts=2)
+    handlers = _campaign_writers(db, outbound=True, total=250)
+
+    result = await handlers.join_request_campaign({"campaign_id": 7}, None)
+
+    assert result["waiting"] == 248, result
+    assert result["sent"] == 0 and result["resumed"] is True, result
+    assert not [
+        sql for sql, _ in db.sql if "'completed'" in sql or "status = 'completed'" in sql
+    ], "the campaign was closed while people were still waiting"
+    assert db.queued == [("join_request_campaign", keys.campaign_run_key(7, 2))], db.queued
+    assert not [
+        sql for sql, _ in db.sql if "insert into app.join_campaign_contact" in sql
+    ], "an unreachable tail is not an excuse to write to anyone twice"
+
+
 async def test_a_run_stops_at_the_lease_and_hands_the_rest_to_the_next_one(monkeypatch) -> None:
     """Twenty people per run, then the next run under a key nobody else can duplicate.
 

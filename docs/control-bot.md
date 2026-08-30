@@ -309,7 +309,11 @@ gates with a code the wizard computes instead of asking for: the plan (the exact
 waiting right now) is the screen before the start tap, so the tap is the reading of it. That headcount is
 read on a session of the bot's own (`_pending_requests`), because a plan that counts people is only worth
 tapping if the number is today's — and when the read fails the plan says what failed instead of showing `0`,
-since zero reads as "nobody is waiting" and would be the one wrong number on the screen. `app/writers.py` then
+since zero reads as "nobody is waiting" and would be the one wrong number on the screen. The number itself is
+Telegram's count of who is waiting, read per invite link (`getChatInviteImporters` answers the question
+"who is waiting **on this link**", so a query that names no link answers nothing for a private channel whose
+requests came in through its `+ABCDEF` link) and never the length of one page; a queue deeper than what this
+look could hold prints both numbers, because "250 waiting, 3 read" is true and "3 waiting" is not. `app/writers.py` then
 writes to **one person every 3 seconds** and stops at 20 per run so a run cannot outlive its job lease; the
 rest is handed to the next run under a key counted by the contacts already recorded, which is the same key the
 boot sweep uses, so a Render spin-down resumes a half-sent list instead of stranding it — and the two paths
