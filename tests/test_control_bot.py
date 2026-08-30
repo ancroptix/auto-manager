@@ -248,6 +248,22 @@ class FakeDb:
             return None
         if "from app.join_campaign" in sql:
             return dict(self.campaign) if self.campaign else None
+        if "from app.destination where telegram_channel_id" in sql:
+            # A pairing looks its rows back up by channel number, because `insert_destination` answers None
+            # when the row was already there and the link still has to be made. Without this arm the generic
+            # id below would let it link everything to row 42.
+            hit = next(
+                (row for row in self.destinations if str(row.get("telegram_channel_id")) == str(args[0])), None
+            )
+            return {"id": hit["id"]} if hit else None
+        if "select mode from app.source_channel where id" in sql:
+            hit = next((row for row in self.source_channels if row.get("id") == args[0]), None)
+            return {"mode": hit.get("mode")} if hit else None
+        if "from app.source_channel where telegram_channel_id" in sql:
+            hit = next(
+                (row for row in self.source_channels if str(row.get("telegram_channel_id")) == str(args[0])), None
+            )
+            return {"id": hit["id"]} if hit else None
         if "from app.destination" in sql:
             return dict(self.destination) if self.destination else None
         if "delete from app.telegram_session" in sql:
@@ -275,6 +291,17 @@ class FakeDb:
             row = {"id": 950 + len(self.archive_channels)}
             row.update(dict(zip(names, args)))
             self.archive_channels.append(row)
+            self.writes.append((sql, args))
+            return row["id"]
+        if "insert into app.series" in sql:
+            # `app/ingest.ensure_series`, and the only arm that may answer for a series row: the upsert's
+            # `on conflict` means a real database hands back the existing id, so a name already stored must
+            # not add a second row here or a pairing test could pass against a table the app never writes.
+            existing = next((row for row in self.series if str(row.get("title")) == str(args[0])), None)
+            if existing is not None:
+                return existing["id"]
+            row = {"id": 70 + len(self.series), "title": args[0]}
+            self.series.append(row)
             self.writes.append((sql, args))
             return row["id"]
         if "insert into app.destination" in sql:
@@ -2891,13 +2918,82 @@ def discovery_bot(*, auto: bool = False, dialogs=None):
     control, api, db = bot()
     walk = discovery_dialogs() if dialogs is None else dialogs
 
-    async def fake_walk():
+    seen: dict[str, bool] = {}
+
+    async def fake_walk(*, verify_rights: bool = False):
+        # The flag is recorded rather than ignored: whether this read asked Telegram what the account may do
+        # is the difference between "member" meaning "Telegram said member" and "member" meaning "the
+        # session's cached list had no rights on it", and a fake that dropped the argument would let the
+        # product stop asking without a single test noticing.
+        seen["verify_rights"] = verify_rights
         return list(walk)
 
     control._discover_dialogs = fake_walk  # type: ignore[method-assign]
+    control.walk_flags = seen  # type: ignore[attr-defined]
     if auto:
         db.config_rows[discover.AUTO_KEY] = True
     return control, api, db, walk
+
+
+@pytest.mark.asyncio
+async def test_the_discovery_read_asks_telegram_what_the_account_may_do() -> None:
+    """/discover verifies rights per channel; a dialog list alone is how "my own channel" read as a member.
+
+    The flag is asserted on the way out of the fake, because the whole complaint was that the bot could not
+    tell where the account is admin — and the answer to that is not in the cached dialog list.
+    """
+    control, _api, _db, _walk = discovery_bot()
+    await say(control, "/discover")
+    assert control.walk_flags.get("verify_rights") is True, control.walk_flags
+
+
+@pytest.mark.asyncio
+async def test_a_channel_whose_rights_telegram_would_not_confirm_is_said_so() -> None:
+    """An unread channel is reported as unread, not decided from the weaker source and left looking like fact."""
+    walk = discovery_dialogs()
+    walk[1]["rights_source"] = "participant"
+    walk[2]["rights_source"] = "dialog"
+    walk[2]["rights_error"] = "ChannelPrivateError: no access"
+    control, _api, _db, _w = discovery_bot(dialogs=walk)
+    (text,) = await say(control, "/discover")
+    assert "rights asked of Telegram directly for 1 channel" in text, text
+    assert "kept the session's older answer" in text
+
+
+@pytest.mark.asyncio
+async def test_one_tap_pairs_the_two_channels_by_name_and_links_them() -> None:
+    """The operator's setup, tapped: source `X`, destination `X`, one series, one link, nothing invented twice.
+
+    Every write goes through the same two modules the typed commands use, so this asserts the statements
+    rather than a paraphrase of them: a series row founded by `app/ingest.ensure_series`, a destination, a
+    source, and `destination_id` carrying the ids those two inserts just returned — which is the one
+    assertion a fake that only counts statements cannot fake.
+    """
+    walk = discovery_dialogs()
+    walk[1]["title"] = "Dekin no mogura"  # the same show, named like its source: the pairing rule
+    control, api, db, _w = discovery_bot(dialogs=walk)
+    before = len(db.destinations)
+    await control.dispatch(parse_update(_press(api, "x:/discover pair 1")))
+    text = api.sent[-1][1]
+
+    assert "publishing channel" in text, text
+    assert len(db.destinations) == before + 1, "the destination row this series did not have yet"
+    assert any("insert into app.series" in sql for sql, _ in db.writes) or db.series, "the series row exists"
+    link = [(sql, args) for sql, args in db.writes if "set destination_id" in sql]
+    assert link, "and the source was pointed at it"
+    destination_row = db.destinations[-1]
+    source_row = next(row for row in db.source_channels if row["telegram_channel_id"] == -100444555)
+    assert link[0][1] == (source_row["id"], destination_row["id"]), link[0][1]
+    assert source_row.get("declared_series") == "Dekin no mogura", "the name came from the channel, on the row"
+    assert source_row.get("declared_by") == "discovered from this channel's name"
+
+
+@pytest.mark.asyncio
+async def test_a_pair_number_that_is_not_on_the_page_writes_nothing() -> None:
+    control, _api, db, _walk = discovery_bot()
+    (text,) = await say(control, "/discover pair 9")
+    assert "nothing on this page can be paired as 9" in text, text
+    assert db.writes == []
 
 
 @pytest.mark.asyncio
@@ -2934,7 +3030,7 @@ async def test_tapping_the_menu_opens_the_same_discovery_screen_the_command_prin
     assert tapped.text == typed.text and tapped.markup == typed.markup, (tapped.text, typed.text)
     rows = typed.markup["inline_keyboard"]
     labels = [one["text"] for row in rows for one in row]
-    assert "✅ Add everything on this page" in labels and "✨ Let it switch on its own" in labels
+    assert "✅ Add the rest on this page" in labels and "✨ Let it switch on its own" in labels
     assert [one["callback_data"] for row in rows[:3] for one in row] == [
         "x:/discover add 2",
         "x:/discover add 3",
@@ -2968,18 +3064,23 @@ async def test_a_tap_files_the_channel_we_run_as_that_series_destination() -> No
 
 
 @pytest.mark.asyncio
-async def test_a_destination_is_refused_when_no_series_row_exists_to_point_at() -> None:
-    """Not "created anyway with a placeholder", because a series name on a destination is permanent.
+async def test_a_destination_with_no_series_row_yet_names_its_series_after_the_channel() -> None:
+    """The refusal this used to be is what made a fresh install undetectable, so the tap founds the row.
 
-    The fake knows one series; renaming the channel to a title with no matching row is the whole test.
+    Renaming the channel to a title the fake has no series for is still the whole test — it just asserts the
+    other half now: the series is founded by the statement the ingest pipeline files with, the reply says the
+    name came from the channel, and no channel is created in Telegram by any of it.
     """
     walk = discovery_dialogs()
     walk[2]["title"] = "Bleach Anime in Hindi"
     control, api, db, _w = discovery_bot(dialogs=walk)
     before = len(db.destinations)
     await control.dispatch(parse_update(_press(api, "x:/discover add 3")))
-    assert "no series called" in api.sent[-1][1], api.sent[-1][1]
-    assert len(db.destinations) == before, "and the row was not half-written"
+    text = api.sent[-1][1]
+
+    assert len(db.destinations) == before + 1, text
+    assert "founded from the channel's own name" in text and "'Bleach'" in text, text
+    assert "Nothing was created in Telegram" in text
 
 
 @pytest.mark.asyncio

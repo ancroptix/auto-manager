@@ -23,6 +23,7 @@ from app.probe import (
     ProbeViolation,
     _describe_buttons,
     _send,
+    collect_dialogs,
     format_report,
     run_probe,
 )
@@ -889,3 +890,108 @@ def test_a_channel_seen_by_number_is_not_also_reported_as_invisible() -> None:
         )
     )
     assert [entry["want"] for entry in missing["missing_channels"]] == ["-100999"]
+
+
+# --------------------------------------------------------------------------- asking about rights
+class _Perms:
+    """The shape `telethon.tl.custom.ParticipantPermissions` presents: flags, not a dict."""
+
+    def __init__(self, *, creator: bool = False, admin: bool = False, post: bool = True) -> None:
+        self.is_creator = creator
+        self.is_admin = admin or creator
+        self.has_left = False
+        self.post_messages = post and (admin or creator)
+        self.edit_messages = self.post_messages
+        self.delete_messages = self.post_messages
+        self.invite_users = False
+        self.add_admins = creator
+
+
+def _client(dialogs: list[Any], *, perms: Any = None, error: Exception | None = None) -> Any:
+    class Client:
+        def __init__(self) -> None:
+            self.asks = 0
+
+        def iter_dialogs(self):
+            async def walk():
+                for entity in dialogs:
+                    yield SimpleNamespace(entity=entity)
+
+            return walk()
+
+        async def get_permissions(self, entity: Any, user: Any) -> Any:
+            self.asks += 1
+            if error is not None:
+                raise error
+            return perms
+
+    return Client()
+
+
+def _entity(title: str, *, did: int = 7, admin_rights: Any = None) -> Any:
+    return SimpleNamespace(
+        title=title,
+        username=None,
+        id=did,
+        creator=False,
+        left=False,
+        participants_count=9,
+        broadcast=True,
+        admin_rights=admin_rights,
+    )
+
+
+@pytest.mark.asyncio
+async def test_verifying_rights_asks_telegram_and_that_answer_is_the_one_kept() -> None:
+    """The bug this closes, in one test: an admin channel whose cached object had no rights on it.
+
+    `collect_dialogs` used to answer from `entity.admin_rights` alone, and Telegram does not always fill that
+    in for a dialog's channel object — so an account that owns a channel read as a member, and `/discover`
+    found "nothing" in a session with a dozen channels in it. The `getParticipant` answer replaces the cached
+    flags and the entry says which one it is holding, because "Telegram said member" and "the cache was empty"
+    are different sentences and only one of them is a decision.
+    """
+    client = _client([_entity("Mob Psycho 100 Anime in Hindi")], perms=_Perms(creator=True))
+    (entry,) = await collect_dialogs(client, verify_rights=True)
+
+    assert client.asks == 1
+    assert entry["rights_source"] == "participant" and entry["rights_error"] is None
+    assert entry["mine"] is True and entry["rights"]["post_messages"] is True
+
+
+@pytest.mark.asyncio
+async def test_a_channel_that_refuses_the_ask_keeps_the_answer_the_session_had() -> None:
+    """A flood wait is not evidence. Recording the failure beats defaulting to "member" — the default that
+    would turn a destination into a source for the length of a network hiccup, which is the flip this whole
+    feature is careful enough to refuse on purpose.
+    """
+    client = _client([_entity("Mob Psycho 100")], error=RuntimeError("A wait of 32 seconds is required"))
+    (entry,) = await collect_dialogs(client, verify_rights=True)
+
+    assert entry["rights_source"] == "dialog"
+    assert "wait of 32 seconds" in entry["rights_error"]
+    assert entry["rights"] is None and entry["mine"] is False, "no verdict invented from the failure"
+
+
+@pytest.mark.asyncio
+async def test_the_rights_ask_is_capped_and_the_cap_is_visible() -> None:
+    """The cap exists so a worker loop cannot spend a minute on rights, and `rights_source` is what makes a
+    channel past the cap reportable as unread rather than silently decided from a stale flag.
+    """
+    client = _client([_entity(f"chan {n}", did=n) for n in range(1, 5)], perms=_Perms(admin=True))
+    entries = await collect_dialogs(client, verify_rights=True, rights_limit=2)
+
+    assert client.asks == 2
+    assert [one["rights_source"] for one in entries] == ["participant", "participant", "dialog", "dialog"]
+
+
+@pytest.mark.asyncio
+async def test_an_admin_who_may_not_post_is_still_not_told_they_can_post() -> None:
+    """`is_admin` alone must not become a `post_messages` flag on the way through: a "manage calls only"
+    admin is a real Telegram answer, and the flag it holds is recorded so `app/rights` can decide — without
+    the caller being handed a permission that was never granted.
+    """
+    client = _client([_entity("Announcements")], perms=_Perms(admin=True, post=False))
+    (entry,) = await collect_dialogs(client, verify_rights=True)
+
+    assert entry["rights"]["post_messages"] is False and entry["rights"]["is_admin"] is True
