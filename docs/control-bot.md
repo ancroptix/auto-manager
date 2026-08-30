@@ -306,7 +306,10 @@ from that session — and `➕ Add a channel` files one that has no row yet thro
 uses, founding the series row from the channel's own name and saying so in the reply. The campaign is drafted
 from the saved `/joinmsg` wording under one fixed name, so no name has to be invented, and what `confirm`
 gates with a code the wizard computes instead of asking for: the plan (the exact words, the ceiling, who is
-waiting right now) is the screen before the start tap, so the tap is the reading of it. `app/writers.py` then
+waiting right now) is the screen before the start tap, so the tap is the reading of it. That headcount is
+read on a session of the bot's own (`_pending_requests`), because a plan that counts people is only worth
+tapping if the number is today's — and when the read fails the plan says what failed instead of showing `0`,
+since zero reads as "nobody is waiting" and would be the one wrong number on the screen. `app/writers.py` then
 writes to **one person every 3 seconds** and stops at 20 per run so a run cannot outlive its job lease; the
 rest is handed to the next run under a key counted by the contacts already recorded, which is the same key the
 boot sweep uses, so a Render spin-down resumes a half-sent list instead of stranding it — and the two paths

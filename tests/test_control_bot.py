@@ -3280,6 +3280,13 @@ def joinreq_bot(*, dialogs=None, campaign=...):
     control, api, db, walk = discovery_bot(dialogs=dialogs) if dialogs else discovery_bot()
     if campaign is not ...:
         db.campaign = campaign
+    # The headcount read opens a session of its own, which is the whole point of the helper — and a test
+    # that let it run for real would be testing the network. The stub is explicit about the number so the
+    # flow tests assert the sentence the plan prints, not the exception it used to raise.
+    async def _count(peer: str) -> tuple[int | None, str | None]:
+        return 3, None
+
+    control._pending_requests = _count  # type: ignore[method-assign]
     return control, api, db, walk
 
 
@@ -3446,3 +3453,84 @@ async def test_an_empty_wording_is_refused_before_anybody_is_messaged() -> None:
     text = api.sent[-1][1]
     assert "no campaign" in text.casefold() or "empty" in text.casefold() or "nothing" in text.casefold(), text
     assert db.queued == []
+
+
+@pytest.mark.asyncio
+async def test_the_plan_counts_the_people_waiting_now() -> None:
+    """/campaign … plan promises a headcount, so the wizard shows the real one.
+
+    A number read from the same channel the job will read is the difference between "start it" meaning
+    three taps and "start it" meaning two hundred.
+    """
+    campaign = {
+        "id": 7,
+        "name": "default",
+        "status": "draft",
+        "message_template": "{name}, aapka request dekh liya jaa raha hai",
+        "rate_per_hour": 20,
+        "confirm_required": True,
+    }
+    control, api, db, _w = joinreq_bot(campaign=campaign)
+    await control.dispatch(parse_update(_press(api, "x:/joinreq start #21")))
+    assert "3 request(s) are pending right now" in api.sent[-1][1], api.sent[-1][1]
+
+
+@pytest.mark.asyncio
+async def test_a_plan_that_cannot_read_the_list_says_so_instead_of_showing_zero() -> None:
+    """"0 pending" and "the list could not be read" are two different decisions.
+
+    Zero tells the operator there is nobody to write to and the campaign looks pointless; the reason tells
+    them the session is not reachable and the run will read the list again when it goes out. The count is a
+    read, so it is attempted in shadow mode too — but a failed read is never reported as a number.
+    """
+    campaign = {
+        "id": 7,
+        "name": "default",
+        "status": "draft",
+        "message_template": "{name}, aapka request dekh liya jaa raha hai",
+        "rate_per_hour": 20,
+        "confirm_required": True,
+    }
+    control, api, db, _w = joinreq_bot(campaign=campaign)
+
+    async def _broken(peer: str) -> tuple[int | None, str | None]:
+        return None, "SessionNotFoundError: no stored session for this account"
+
+    control._pending_requests = _broken  # type: ignore[method-assign]
+    await control.dispatch(parse_update(_press(api, "x:/joinreq start #21")))
+    text = api.sent[-1][1]
+    assert "could not be read from this account" in text and "SessionNotFoundError" in text, text
+    assert "0 request(s)" not in text
+
+
+def test_the_control_bot_never_reaches_for_a_client_it_does_not_hold() -> None:
+    """`self.telegram` did not exist on this class, and the crash it caused was the operator's whole feature.
+
+    `/campaign … plan` read `self.telegram.client` under an `outbound_enabled` guard, so every test in
+    shadow mode took the other branch and the bug only appeared once the deployment was live — which is
+    exactly the shape this audit exists to catch: a code path that production settings enable and the suite
+    never walks. The control bot opens its own short-lived session (`_pending_requests`, `_discover_dialogs`),
+    so there is nothing to hold and nothing to reach for.
+    """
+    import ast  # noqa: PLC0415
+    from pathlib import Path  # noqa: PLC0415
+
+    from app import controlbot as module  # noqa: PLC0415
+
+    tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
+    held = [
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute)
+        and node.attr == "telegram"
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "self"
+    ]
+    assert not held, f"ControlBot holds no `telegram`; the reads build a session (lines {held})"
+    # The replacement has to stay, or the audit above would be satisfied by deleting the feature.
+    named = {
+        node.name
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef))
+    }
+    assert "_pending_requests" in named

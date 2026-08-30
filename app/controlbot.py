@@ -458,6 +458,39 @@ class ControlBot:
         finally:
             await wrapper.stop()
 
+    async def _pending_requests(self, peer: str) -> tuple[int | None, str | None]:
+        """How many join requests are waiting in a channel, on a session of the bot's own.
+
+        `/campaign … plan` has always promised the real headcount, and it used to get it from
+        `self.telegram.client` — an attribute this class does not have and never did, so in a live deployment
+        the plan answered `AttributeError: 'ControlBot' object has no attribute 'telegram'` instead of a
+        number, and every tap that planned anything died there. Reading a list is not a write, so this runs
+        in shadow mode too; what it never does is answer `0` when the read failed. The count is the same
+        thing the job will act on, so a number that is quietly unavailable would be worse than no number.
+
+        The client is opened and closed here for the same reason `app/telegram_client.probe_once` exists: a
+        read that fails must not be able to take the worker's connection down with it.
+        """
+        from . import sender  # noqa: PLC0415
+        from .telegram_client import TelegramUserClient  # noqa: PLC0415
+
+        wrapper = TelegramUserClient(settings=self.settings, db=self.db)
+        try:
+            client = await wrapper.start()
+            reader = sender.Sender(
+                client, db=None, policy=sender.WritePolicy(mode="plan", allow_peers=())
+            )
+            result, rows = await asyncio.wait_for(
+                reader.pending_requests(peer, limit=100), self._DISCOVER_TIMEOUT
+            )
+        except Exception as exc:  # noqa: BLE001 - the operator needs the reason, not a traceback
+            return None, f"{type(exc).__name__}: {str(exc)[:160]}"
+        finally:
+            await wrapper.stop()
+        if not result.ok:
+            return None, str(result.detail)[:200]
+        return len([row for row in rows if not row.get("approved_by")]), None
+
     async def _discover(self, update: Update, args: list[str]) -> list[Reply]:
         """``/discover`` — what this account can see, and the tap that files it.
 
@@ -2331,30 +2364,16 @@ class ControlBot:
                 return [Reply(f"no campaign called `{name}` for that channel. /campaign {handle} list")]
 
             if action == "plan":
-                pending = ""
-                if getattr(self.settings, "outbound_enabled", False) and self.telegram is not None:
-                    from . import sender  # noqa: PLC0415
-
-                    client = getattr(self.telegram, "client", None)
-                    if client is not None:
-                        reader = sender.Sender(
-                            client,
-                            db=None,
-                            policy=sender.WritePolicy(mode="plan", allow_peers=()),
-                        )
-                        ok, requests = await reader.pending_requests(
-                            str(destination.get("telegram_channel_id") or ""), limit=100
-                        )
-                        waiting = [row for row in requests if not row.get("approved_by")]
-                        pending = (
-                            f"\n\n{len(waiting)} request(s) are pending right now"
-                            + ("" if ok.ok else f" (the read said: {ok.detail})")
-                        )
-                else:
-                    pending = (
-                        "\n\nI cannot count the pending requests without a live session; the job reads "
-                        "them again when it runs, so this plan shows the rules and not the headcount."
-                    )
+                count, why = await self._pending_requests(
+                    str(destination.get("telegram_channel_id") or "")
+                )
+                pending = (
+                    f"\n\n{count} request(s) are pending right now"
+                    if count is not None
+                    else "\n\nthe pending requests could not be read from this account right now: "
+                    f"{why}\nthe job reads them again when it runs, so this plan shows the rules and not "
+                    "the headcount."
+                )
                 code = joinmsg.confirm_code(campaign["id"], campaign["message_template"])
                 return [Reply(
                     f"campaign `{name}` ({campaign['status']}) on "
