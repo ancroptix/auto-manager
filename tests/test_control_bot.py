@@ -509,6 +509,10 @@ class FakeDb:
                 self.campaign["status"] = value
             if "message_template = $" in sql and self.campaign is not None and args:
                 self.campaign["message_template"] = str(args[-1])
+            if "per_message_delay_seconds = $" in sql and self.campaign is not None and len(args) > 1:
+                # `gap` writes the spacing on the row, and the next read has to say the new number: the fake
+                # mirrors it so a test asserts on the row rather than on the SQL string.
+                self.campaign["per_message_delay_seconds"] = float(args[1])
             self.writes.append((sql, args))
             return 1
         if "insert into app.season" in sql:
@@ -3568,6 +3572,7 @@ CAMPAIGN_READY = {
     "status": "draft",
     "message_template": "{name}, aapka request dekh liya jaa raha hai",
     "rate_per_hour": 20,
+    "per_message_delay_seconds": 3,
     "confirm_required": True,
 }
 
@@ -3837,6 +3842,148 @@ async def test_a_campaign_with_no_run_scheduled_says_that_too() -> None:
 
 
 @pytest.mark.asyncio
+async def test_the_spacing_between_two_dm_is_the_campaigns_own_number() -> None:
+    """The operator asked to own the delay too, and the row has held it since it was created.
+
+    `app.join_campaign.per_message_delay_seconds` existed with a default of three and no reader anywhere in
+    the program — a knob welded in place. It is what paces the send loop now, it is printed from the row
+    rather than from the constant, and `⏱` taps move it. The reply also says how many people a run writes at
+    that spacing, because the batch is derived from the same number: twenty messages ten seconds apart would
+    sleep past the job's own lease and be handed to a second worker.
+    """
+    campaign = {**CAMPAIGN_READY, "status": "ready", "per_message_delay_seconds": 3}
+    control, api, db, _w = joinreq_bot(campaign=campaign)
+
+    await control.dispatch(parse_update(_press(api, "x:/joinreq open #21")))
+    labels = [str(one.get("text") or "") for row in api.markups[-1]["inline_keyboard"] for one in row]
+    assert "⏱ 1 s apart" in labels and "⏱ 30 s apart" in labels, labels
+    assert "one person every 3 seconds" in api.sent[-1][1], api.sent[-1][1]
+
+    text = text_of(await control._campaign(None, ["-1001234", "gap", "default", "10"]))
+
+    assert "one message every 10 seconds" in text, text
+    assert "A run writes up to 9 people" in text, text
+    assert db.campaign["per_message_delay_seconds"] == 10, db.campaign
+    assert "keeps the spacing it started with" in text, text
+
+    await control.dispatch(parse_update(_press(api, "x:/joinreq open #21")))
+    text = api.sent[-1][1]
+    labels = [str(one.get("text") or "") for row in api.markups[-1]["inline_keyboard"] for one in row]
+
+    assert "one person every 10 seconds" in text, text
+    assert "⏱ 10 s apart" not in labels, "the current number was offered back as a change"
+
+
+@pytest.mark.asyncio
+async def test_a_spacing_that_would_become_a_flood_is_refused_rather_than_written() -> None:
+    """0 seconds is inside the column's own check, so the refusal has to come from the program.
+
+    Back-to-back DMs to strangers is the one shape this flow must never take, whatever the row says, and a
+    five-hour gap is not a pace a pending list should be left at either. A refusal names the range and the
+    reason rather than silently writing what was typed.
+    """
+    control, api, db, _w = joinreq_bot(campaign={**CAMPAIGN_READY, "status": "ready"})
+
+    for wanted in ("0", "0.2", "5000", "soon"):
+        text = text_of(await control._campaign(None, ["-1001234", "gap", "default", wanted]))
+        assert "not something I will write" in text or "not a number of seconds" in text, (wanted, text)
+
+    assert not [sql for sql, _ in db.writes if "per_message_delay_seconds" in sql], db.writes
+    assert db.campaign["per_message_delay_seconds"] == 3, db.campaign
+
+
+@pytest.mark.asyncio
+async def test_the_gap_button_sits_beside_the_start_tap_because_a_number_is_not_a_command() -> None:
+    """"kuch bhi code likhkar ya command dekar na karna pade" — the pace is a tap like everything else."""
+    control, api, db, _w = joinreq_bot(campaign={**CAMPAIGN_READY, "status": "ready"})
+
+    await control.dispatch(parse_update(_press(api, "x:/joinreq open #21")))
+    rows = api.markups[-1]["inline_keyboard"]
+    labels = [str(one.get("text") or "") for row in rows for one in row]
+
+    assert "♾ Send the whole list" in labels, labels
+    assert any(label.startswith("⏱ ") for label in labels), labels
+    # A tapped label is only worth what the callback behind it is: the ⏱ button has to carry the same
+    # `/campaign … gap` command the typed path runs, or the screen is showing a promise the bot cannot keep.
+    taps = [str(one.get("callback_data") or "") for row in rows for one in row]
+    assert any(one.endswith("/campaign #21 gap default 1") for one in taps), taps
+    assert any(one.endswith("/campaign #21 rate default off") for one in taps), taps
+
+
+@pytest.mark.asyncio
+async def test_the_plan_prints_the_campaigns_own_spacing_and_cap() -> None:
+    """A plan that printed the constant would be a second source of truth about the pace.
+
+    The screen is the preview of what the run will do, so both numbers come off the row — and the row's
+    delay is the same number the loop sleeps on, not a copy of it.
+    """
+    control, api, db, _w = joinreq_bot(
+        campaign={**CAMPAIGN_READY, "status": "ready", "per_message_delay_seconds": 30, "rate_per_hour": 60}
+    )
+
+    text = text_of(await control._campaign(None, ["-1001234", "plan", "default"]))
+
+    assert "at most 60 people per hour" in text, text
+    assert "one message every 30 seconds" in text, text
+
+
+@pytest.mark.asyncio
+async def test_the_whole_list_tap_removes_the_hourly_stop_without_asking_for_a_number(monkeypatch) -> None:
+    """`off` is what "send until I stop" means in a column that cannot hold infinity.
+
+    `campaign_rate_check` allows 1 to 500, and this project does not rewrite a check on a database that is
+    already running. So the tap sets the number that cannot bind — everyone waiting right now — and the
+    reply says which of the two it did, and names `⏸ Stop after this one` as the only stop left.
+    """
+    monkeypatch.setitem(globals(), "joinreq_waiting", (340, 340))
+    control, api, db, _w = joinreq_bot(
+        campaign={**CAMPAIGN_READY, "status": "ready", "rate_per_hour": 20}
+    )
+
+    text = text_of(await control._campaign(None, ["-1001234", "rate", "default", "off"]))
+
+    assert db.campaign["rate_per_hour"] == 340, db.campaign
+    assert "no hourly stop for this list" in text, text
+    assert "340 people are waiting" in text, text
+    assert "\u23f8 Stop after this one is the only thing that stops it" in text, text
+
+
+@pytest.mark.asyncio
+async def test_the_whole_list_tap_refuses_to_guess_when_the_count_cannot_be_read(monkeypatch) -> None:
+    """"no limit" is a number derived from the queue, so an unreadable queue means no write."""
+    monkeypatch.setitem(globals(), "joinreq_waiting", (None, None))
+    control, api, db, _w = joinreq_bot(
+        campaign={**CAMPAIGN_READY, "status": "ready", "rate_per_hour": 20}
+    )
+
+    text = text_of(await control._campaign(None, ["-1001234", "rate", "default", "off"]))
+
+    assert "could not be read" in text, text
+    assert db.campaign["rate_per_hour"] == 20, db.campaign
+    assert not [sql for sql, _ in db.writes if "rate_per_hour" in sql], db.writes
+
+
+@pytest.mark.asyncio
+async def test_a_list_longer_than_the_column_allows_is_told_what_still_applies(monkeypatch) -> None:
+    """Nine hundred waiting at a 500-an-hour cap is not "no limit", and the screen must not claim it is.
+
+    What it is: the list empties 500 at a time, and a run that meets the cap waits for the hour and resumes
+    itself. The operator taps nothing — which was the actual complaint — but the number is the truth.
+    """
+    monkeypatch.setitem(globals(), "joinreq_waiting", (900, 900))
+    control, api, db, _w = joinreq_bot(
+        campaign={**CAMPAIGN_READY, "status": "ready", "rate_per_hour": 20}
+    )
+
+    text = text_of(await control._campaign(None, ["-1001234", "rate", "default", "off"]))
+
+    assert db.campaign["rate_per_hour"] == 500, db.campaign
+    assert "largest" in text and "500 an hour" in text, text
+    assert "waits for the hour and resumes itself" in text, text
+    assert "one message every 3 seconds" in text, text
+
+
+@pytest.mark.asyncio
 async def test_a_queued_row_that_no_worker_will_claim_is_called_what_it_is() -> None:
     """"queued" is a promise only while `app.claim_next_job` will still take the row.
 
@@ -3914,7 +4061,7 @@ async def test_the_ceiling_refuses_a_number_that_is_not_a_ceiling() -> None:
     assert db.campaign["rate_per_hour"] == 20, db.campaign
 
     huge = text_of(await control._campaign(None, ["-1001234", "rate", "default", "5000"]))
-    assert "not something I will write" in huge and "1 and 200" in huge, huge
+    assert "not something I will write" in huge and "1 and 500" in huge, huge
     assert db.campaign["rate_per_hour"] == 20, db.campaign
 
     missing_number = text_of(await control._campaign(None, ["-1001234", "rate", "default"]))

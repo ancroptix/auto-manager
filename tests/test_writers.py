@@ -271,6 +271,7 @@ class CampaignDb:
         *,
         waiting: int,
         rate: int = 100,
+        delay: float | None = None,
         recorded: int = 0,
         contacts: int = 0,
         released: int = 0,
@@ -278,6 +279,9 @@ class CampaignDb:
     ) -> None:
         self.waiting = waiting
         self.rate = rate
+        # The campaign's own spacing, as the row holds it. `None` is the "the row says nothing usable" state,
+        # which is a real one: the column's own check only refuses a negative, so zero and text both arrive.
+        self.delay = delay
         # `contacts` is how far into the queue this campaign already is. It drives both halves of the story:
         # the rows the read is told to skip, and the count the continuation key is named after, so a test
         # cannot make one agree with the other by accident.
@@ -330,6 +334,7 @@ class CampaignDb:
                 "name": "default",
                 "message_template": "{name}, aapka request dekh liya jaa raha hai",
                 "rate_per_hour": self.rate,
+                "per_message_delay_seconds": self.delay,
                 "destination_id": 21,
                 "telegram_channel_id": -1002575861262,
                 "title": "Dekin no mogura Anime in Hindi",
@@ -886,6 +891,69 @@ async def test_a_dry_run_hands_the_campaign_back_but_not_over_a_pause() -> None:
     assert result["sent"] == 0 and result["planned"] == 1, result
     assert db.status == "paused", db.applied
     assert db.applied == [], db.applied
+
+
+async def test_the_spacing_between_two_messages_comes_from_the_campaign_row(monkeypatch) -> None:
+    """The column that always held the operator's pacing is read by the loop now — and it bounds the batch.
+
+    `app.join_campaign.per_message_delay_seconds` shipped with a default of three and no reader, so changing
+    it changed nothing. The send loop sleeps the row's number now, and how many people one run may write is
+    derived from it: a run that sleeps past `claim_lease_seconds` is handed to a second worker by
+    `release_expired_locks`, and two passes over the same strangers is the one thing a DM campaign cannot be.
+    Ten seconds apart, the twenty of the old constant would be 200+ seconds of work, so the batch is nine.
+    """
+    from app import writers as writers_module
+
+    slept: list[float] = []
+    monkeypatch.setattr(writers_module.asyncio, "sleep", lambda delay: slept.append(delay) or _noop())
+
+    async def _noop():
+        return None
+
+    db = CampaignDb(waiting=12, rate=1000, delay=10)
+    handlers = _campaign_writers(db, outbound=True)
+
+    result = await handlers.join_request_campaign({"campaign_id": 7}, None)
+
+    assert result["sent"] == 9 and result["waiting_after"] == 3, result
+    assert slept == [10.0] * 8, slept
+    assert result["gap_seconds"] == 10, result
+    assert result["continued"] is True, result
+
+
+async def test_a_spacing_the_row_cannot_mean_falls_back_to_the_default() -> None:
+    """Zero, negative, text or a day: the loop sends at three seconds, not at what the row says.
+
+    A row that cannot be read as a spacing is answered by the default the operator asked for, and a huge one
+    is clamped rather than obeyed, because a pending list must not be stranded for a day and strangers must
+    not be messaged back to back.
+    """
+    from app import writers as writers_module
+
+    for raw, want in (
+        (None, writers_module.JOIN_SEND_GAP_SECONDS),
+        (0, writers_module.JOIN_SEND_GAP_SECONDS),
+        (-5, writers_module.JOIN_SEND_GAP_SECONDS),
+        ("weekly", writers_module.JOIN_SEND_GAP_SECONDS),
+        (0.2, writers_module.JOIN_GAP_MIN_SECONDS),
+        (999999, writers_module.JOIN_GAP_MAX_SECONDS),
+    ):
+        assert writers_module.campaign_gap_seconds({"per_message_delay_seconds": raw}) == want, raw
+
+
+def test_the_batch_shrinks_so_a_wide_gap_cannot_outlive_the_lease() -> None:
+    """Every spacing, from one second to an hour, has to finish its batch inside the job it holds."""
+    from app import writers as writers_module
+
+    for gap in (1.0, 3.0, 10.0, 30.0, 60.0, 600.0, 3600.0):
+        cap = writers_module.campaign_run_cap(gap, 120.0)
+        assert cap >= 1, gap
+        # The sleeps go *between* sends, and a send itself costs a round trip.
+        assert (cap - 1) * gap + cap <= 120.0, (gap, cap)
+    # The default spacing still writes the full batch, so the old promise is untouched.
+    assert writers_module.campaign_run_cap(writers_module.JOIN_SEND_GAP_SECONDS) == (
+        writers_module.JOIN_MAX_PER_RUN
+    )
 
 
 async def test_a_run_stops_at_the_lease_and_hands_the_rest_to_the_next_one(monkeypatch) -> None:

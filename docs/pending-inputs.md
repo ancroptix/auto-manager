@@ -207,8 +207,9 @@ The list below is the residual — what still stops each kind from completing, i
   on it. A second row would be swallowed by the `dedup_key` the running row already holds, which is how this
   branch once left a campaign armed, `paused`, and never started again. A spent ceiling is therefore a timer
   in Postgres — not a `paused` row nobody restarts, and not a wait in a process that Render may spin down. A campaign runs only after `/campaign … confirm <code>` — or after the plan and the start tap on
-  `/joinreq`, which computes that code instead of asking you to type it, and paces one person every 3
-  seconds so a restart can resume the list. A shadow run plans and records **nobody**: `app.join_campaign_contact`
+  `/joinreq`, which computes that code instead of asking you to type it, and paces one person every
+  `per_message_delay_seconds` (the campaign row's own number, 3 by default, floored at one second so a DM list
+  can never be turned into a back-to-back flood) so a restart can resume the list. A shadow run plans and records **nobody**: `app.join_campaign_contact`
   is the promise that a person is not written to twice, so writing it for a message that never left the
   account would take those people out of every later live run. The queue row a finished run leaves behind is
   put back on the queue by the next start (`app.writers.queue_campaign_run`), because `app/job` dedupes on a

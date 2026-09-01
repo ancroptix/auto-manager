@@ -900,6 +900,45 @@ async def season_sticker(self: Writers, job: dict[str, Any], ctx: Any) -> dict[s
 #: nothing here sleeps to dodge a flood wait (`app/sender.py` holds that rule where a wait is real).
 JOIN_SEND_GAP_SECONDS = 3.0
 
+#: What `app.join_campaign.per_message_delay_seconds` is allowed to say. The column has always been there and
+#: has always had a check of `>= 0`, which is how a row can hold a number that turns a DM campaign into a
+#: flood: zero spacing means the sends are back to back, and the account — not the strangers — is what eats
+#: that. One second is the floor, and an hour is the ceiling, so a typo cannot strand a list for a day.
+JOIN_GAP_MIN_SECONDS = 1.0
+JOIN_GAP_MAX_SECONDS = 3600.0
+
+
+def campaign_gap_seconds(campaign: Mapping[str, Any]) -> float:
+    """How far apart this campaign's messages go, read from its own row.
+
+    The row is the truth and the constant above is only the fallback: a row that says nothing usable (null,
+    zero, text, a negative) is answered with the default rather than with the operator's typo, because this
+    number decides how fast a stranger is contacted.
+    """
+    try:
+        value = float(campaign.get("per_message_delay_seconds"))
+    except (TypeError, ValueError):
+        return JOIN_SEND_GAP_SECONDS
+    if not value > 0:
+        return JOIN_SEND_GAP_SECONDS
+    return max(JOIN_GAP_MIN_SECONDS, min(value, JOIN_GAP_MAX_SECONDS))
+
+
+def campaign_run_cap(gap_seconds: float, lease_seconds: float = 120.0) -> int:
+    """How many people fit in one run at this spacing, inside the job lease.
+
+    `JOIN_MAX_PER_RUN` is the upper bound and the lease is the real one: a run sleeps the gap *between*
+    sends and a send itself costs a round trip, so at ten seconds apart twenty people are 200+ seconds of
+    work against a 120-second lease. Overrun and `release_expired_locks` hands the same row to a second
+    worker while the first is still dialling — two passes over the same strangers. Shrinking the batch is
+    the fix that keeps that impossible; the list still empties, in more runs.
+    """
+    # A send is the gap plus the round trip it costs, and the run has to be inside ninety percent of its
+    # lease so the hand-off has time to be written before `release_expired_locks` could offer the row away.
+    per_person = max(0.2, float(gap_seconds)) + 1.0
+    room = int((float(lease_seconds) * 0.9) / per_person)
+    return max(1, min(JOIN_MAX_PER_RUN, room))
+
 #: How many people one run may contact. `app.enqueue_job` gives a claimed job a 120-second lease and
 #: `release_expired_locks` hands a stale one to whoever asks next, so a run that sleeps past its lease would
 #: be claimed a second time while the first is still dialling — two passes over the same strangers, which is
@@ -1104,6 +1143,9 @@ async def join_request_campaign(self: Writers, job: dict[str, Any], ctx: Any) ->
       (``app.joinmsg.refusals``), because a DM that admits someone past a pending approval is a hole;
     * one contact per (campaign, person), recorded *before* the send and updated after, so a crash in
       the middle becomes "already contacted" rather than a second message to the same stranger;
+    * the spacing between two messages is the campaign's own ``per_message_delay_seconds`` (1 second to one
+      hour, ``JOIN_SEND_GAP_SECONDS`` when the row says nothing usable), and how many people one run writes
+      is derived from it so a batch cannot outlive its lease;
     * ``rate_per_hour`` is honoured by *waiting*: the run puts its own queue row back with the minute the
       oldest send of the hour ages out, and the campaign stays armed. Never by sleeping through the wait,
       never by shaving the interval, and no longer by pausing the campaign and calling that a plan — a
@@ -1117,7 +1159,8 @@ async def join_request_campaign(self: Writers, job: dict[str, Any], ctx: Any) ->
     if campaign_id is None:
         raise ValueError("join_request_campaign needs a campaign_id")
     campaign = await self.db.fetchrow(
-        "select c.id, c.status, c.name, c.message_template, c.rate_per_hour, c.destination_id,"
+        "select c.id, c.status, c.name, c.message_template, c.rate_per_hour,"
+        " c.per_message_delay_seconds, c.destination_id,"
         " d.telegram_channel_id, d.title"
         " from app.join_campaign c join app.destination d on d.id = c.destination_id where c.id = $1",
         int(campaign_id),
@@ -1133,6 +1176,11 @@ async def join_request_campaign(self: Writers, job: dict[str, Any], ctx: Any) ->
     if problems:
         raise NeedsInput("the campaign text breaks a rule: " + " / ".join(problems))
 
+    # The two numbers that bound this run, both from the campaign's own row: how far apart two messages go,
+    # and how many people fit in one run at that spacing. Read once, here, so the loop below and the
+    # sentences it returns all speak the same pair.
+    gap = campaign_gap_seconds(campaign)
+    run_cap = campaign_run_cap(gap, float(getattr(self.settings, "claim_lease_seconds", 120) or 120))
     peer = self._peer(campaign)
     # `skipped` is the one status that means "this person is owed a message": an earlier run wrote the row and
     # never sent it, and the operator has since said so out loud. Everything else counts as dealt with,
@@ -1181,7 +1229,7 @@ async def join_request_campaign(self: Writers, job: dict[str, Any], ctx: Any) ->
     # campaign works through it, because nothing here approves anybody. Without it, a run that had written
     # to the first hundred would read those same hundred, find them known, and be tempted to call the
     # campaign finished with two thousand nine hundred still waiting.
-    found, requests = await reader.pending_requests(peer, limit=JOIN_MAX_PER_RUN * 2, skip=already)
+    found, requests = await reader.pending_requests(peer, limit=run_cap * 2, skip=already)
     if not found.ok:
         return {"campaign_id": int(campaign_id), "blocked": found.detail}
     waiting = [entry for entry in requests if int(entry.get("user_id") or 0) and int(entry["user_id"]) not in already]
@@ -1277,7 +1325,7 @@ async def join_request_campaign(self: Writers, job: dict[str, Any], ctx: Any) ->
     # No peer allowlist for the people themselves: they are named by Telegram's own list of pending
     # requests for this channel, which is as close to "this account asked to be contacted" as a
     # campaign gets. The ceiling and the one-per-person rule are what bound it.
-    batch = waiting[: min(budget, JOIN_MAX_PER_RUN)]
+    batch = waiting[: min(budget, run_cap)]
     writer = self._writer([], max_writes=len(batch))
     sent = failed = planned = 0
     stopped_early = False
@@ -1294,7 +1342,7 @@ async def join_request_campaign(self: Writers, job: dict[str, Any], ctx: Any) ->
             # Between sends, never before the first, and not at all in shadow mode: a planned message puts
             # nothing on the wire, so making a dry run of this take a minute per twenty people would be a
             # slow test, not a safe one.
-            await asyncio.sleep(JOIN_SEND_GAP_SECONDS)
+            await asyncio.sleep(gap)
         user_id = int(entry["user_id"])
         if batch_real_send:
             # The row is written *before* the send, so a crash between the two leaves "already contacted"
@@ -1363,7 +1411,7 @@ async def join_request_campaign(self: Writers, job: dict[str, Any], ctx: Any) ->
             "failed": failed,
             "waiting_after": max(0, len(waiting) - position),
             "stopped": "the campaign was paused or aborted while this run was working",
-            "gap_seconds": JOIN_SEND_GAP_SECONDS,
+            "gap_seconds": gap,
             "continued": False,
             "held_back": unreleased,
         }
@@ -1375,7 +1423,7 @@ async def join_request_campaign(self: Writers, job: dict[str, Any], ctx: Any) ->
             "failed": failed,
             "waiting_after": max(0, remaining),
             "stopped": "the campaign was paused or aborted while this run was working",
-            "gap_seconds": JOIN_SEND_GAP_SECONDS,
+            "gap_seconds": gap,
             "continued": False,
             "held_back": unreleased,
         }
@@ -1402,7 +1450,7 @@ async def join_request_campaign(self: Writers, job: dict[str, Any], ctx: Any) ->
         "sent": sent,
         "failed": failed,
         "waiting_after": max(0, remaining),
-        "gap_seconds": JOIN_SEND_GAP_SECONDS,
+        "gap_seconds": gap,
         "continued": not finished,
         # Named rather than folded into `failed`: these are rows this run did not touch because a record of
         # them already exists, and the operator has to be able to tell "nobody is left" from "nobody is left
