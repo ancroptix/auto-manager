@@ -29,8 +29,6 @@ __all__ = [
     "inplace_key",
     "screening_key",
     "reconciliation_key",
-    "campaign_key",
-    "campaign_run_key",
 ]
 
 _WS = re.compile(r"\s+")
@@ -154,20 +152,3 @@ def inplace_key(destination_id: int, message_id: int) -> str:
 
 def sticker_key(season_id: int) -> str:
     return f"sticker:season:{int(season_id)}"
-
-
-def campaign_key(destination_id: int, name: str) -> str:
-    return f"campaign:{int(destination_id)}:{_slug(name)}"
-
-
-def campaign_run_key(campaign_id: int, contacts: int) -> str:
-    """`campaign:<id>:run<contacts so far>` — the key one *run* of a campaign is queued under.
-
-    A campaign that is not finished needs to be queued again, and `app.enqueue_job` dedupes on
-    `campaign_key` for as long as that row lives, so a second "keep going" would be swallowed by the first
-    run's own row. Counting the contacts recorded so far fixes that with no new column: the key advances
-    whenever real progress was made, and two callers that resume the same campaign at the same count ask for
-    the same key — which is the point. A worker boot and a campaign that just paused can both reach for the
-    next run, and the second one has to be the no-op.
-    """
-    return f"campaign:{int(campaign_id)}:run{max(0, int(contacts))}"

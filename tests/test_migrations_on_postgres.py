@@ -2829,17 +2829,21 @@ def test_the_writers_refuse_what_only_a_human_can_supply(conn, seed, episode):
                     (seed["destination_id"], f"unconfirmed-{episode}"),
                 )
                 campaign_id = cur.fetchone()[0]
-            with pytest.raises(NeedsInput, match=r"confirm") as exc:
-                await handlers[JobKind.JOIN_REQUEST_CAMPAIGN.value]({"payload": {"campaign_id": campaign_id}}, None)
+            # A campaign that is not `ready` is not an error the queue has to be told about: the sender asks
+            # every campaign that looks on to do a pass, and this one says "not now". The real database is the
+            # only place to prove the enum cast in that answer works, so it is proved here rather than in a
+            # fake that would accept any string.
+            skip = await handlers[JobKind.JOIN_REQUEST_CAMPAIGN.value](
+                {"payload": {"campaign_id": campaign_id}}, None
+            )
             with conn.cursor() as cur:
                 cur.execute("delete from app.join_campaign where id = %s", (campaign_id,))
-            campaign_refusal = str(exc.value)
-            assert "ready" in campaign_refusal, campaign_refusal
+            assert str(skip["skipped"]).startswith("the campaign is draft"), skip
+            assert "not sending" in str(skip["skipped"]), skip
 
             for kind, refusal in (
                 (JobKind.SEASON_STICKER, sticker_refusal),
                 (JobKind.PUBLISH_POST, card_refusal),
-                (JobKind.JOIN_REQUEST_CAMPAIGN, campaign_refusal),
             ):
                 documented = DEPENDENCIES[kind.value]
                 # The command the operator has to run is named in both places; that is the whole test.

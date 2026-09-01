@@ -85,6 +85,29 @@ async def run_briefly(worker: Worker, seconds: float = 0.15) -> None:
 
 
 @pytest.mark.asyncio
+async def test_the_campaign_sender_starts_and_stops_with_the_worker(make_settings) -> None:
+    """One switch for both halves of the service, which is what "on/off for sending" means in practice.
+
+    `/worker off` is the operator's emergency stop, so a campaign loop that kept dialling afterwards would be
+    worse than the queue it replaced. The wiring is asserted rather than the sending: the worker builds the
+    loop when it starts, publishes what it says in its own `snapshot()`, and throws it away when it stops, so
+    a `/worker on` later gets a fresh one instead of a task that belongs to a dead worker. `make_settings()` is
+    shadow mode, which is what keeps this test from starting a real sender on a real timer.
+    """
+    db = FakeDB()
+    worker = make_worker(make_settings(), db)
+    assert worker.snapshot()["sending"] is None, "no sender before the worker runs"
+
+    worker.start()
+    sending = worker.snapshot()["sending"]
+    assert sending is not None and sending["shadow"] is True, sending
+    assert sending["running"] is False, "a shadow service must not be sending anybody"
+
+    await worker.stop(drain_seconds=1)
+    assert worker.snapshot()["sending"] is None, "the sender is gone with the worker"
+
+
+@pytest.mark.asyncio
 async def test_paused_service_claims_nothing(make_settings) -> None:
     db = FakeDB(jobs=[{"id": 1, "kind": "ingest_media", "stage": "discovered"}], paused=True)
     worker = make_worker(make_settings(), db)

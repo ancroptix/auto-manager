@@ -162,8 +162,9 @@ session at boot, if it restarts on its own.
 | `/joinmsg [show\|options\|use <n>\|set <text>\|clear]` | what a join requester is told, when you later run a campaign at them. `options` lists three drafts with the promise each one makes; `use 2` saves one, `set …` saves your own words (`{name}` and `{series}` are filled at send time), `clear` empties it so the app may contact nobody. Saving is not sending, and the reply says so — sending is a campaign per channel, started from `/joinreq`. It cannot approve or decline anyone, and it refuses a message that carries an invite link |
 | `/joinreq [plan\|open <ref>\|start <ref>\|go <ref>\|stop <ref>\|free <ref>\|add\|file <n>]` | the join-request campaign by button: the channels this account can **post in** (rights asked of Telegram on the spot, not read from a cached list), the exact words and who is waiting, then one tap to start. Sending goes to one person every **`⏱`-chosen number of seconds** (the campaign's own `per_message_delay_seconds`,
 three by default), nobody twice, and with **no hourly stop at all** — `⏱ Set delay (3 s)` is the one pace
-control on that screen: it asks for the number and the number sent back is what the run sleeps between two
-messages, which is the whole pace conversation an operator needs to have; a run that does not finish hands the rest to the next one, so a restart or a spin-down resumes the list instead of stranding it. `add` lists the postable channels that have no row yet and `file <n>` writes one through discovery's writer (founding the series row from the channel's own name when nothing else names it). `free <ref>` releases the contacts a run recorded but never sent (status `skipped`, the row and its history
+control on that screen: it asks for the number and the number sent back is what the sender sleeps between two
+messages, which is the whole pace conversation an operator needs to have. Sending is a loop the service owns: it works
+the list to the end, a restart resumes it by itself, and `⏸` is the only thing that stops it early. `add` lists the postable channels that have no row yet and `file <n>` writes one through discovery's writer (founding the series row from the channel's own name when nothing else names it). `free <ref>` releases the contacts a run recorded but never sent (status `skipped`, the row and its history
   staying put) so a later run owes them a message again — the state an older shadow run left behind, which
   made a campaign look finished while its strangers were never told; the bot cannot tell that from a send cut
   off mid-flight, so it shows the count on the channel's screen and asks for one tap instead of guessing. It
@@ -174,23 +175,28 @@ messages, which is the whole pace conversation an operator needs to have; a run 
 | `/sticker <series> <season> from <channel> <message id>` | which sticker opens a season. Telegram addresses a sticker by the message carrying it, so a pack name or an install link is not an address; the job forwards that message into the destination before the season's first episode post |
 | `/campaign <channel> [new\|text\|plan\|confirm\|gap\|pause\|abort] <name>` | a join-request campaign, in two
   deliberate steps: `new` drafts it from the saved `/joinmsg` wording (or `text` writes its own), `plan` shows the
-  rules, the spacing and the pending count and prints a code, `confirm <name> <code>` makes it `ready` and queues
-  the job. The code is derived from the row and its exact text, so editing the wording invalidates an old
+  rules, the spacing and the pending count and prints a code, `confirm <name> <code>` makes it `ready`, which is
+  what switches sending on. The code is derived from the row and its exact text, so editing the wording invalidates an old
   confirmation. `gap <name> <seconds>` is the whole pace control — how far apart two messages go, 1 second to
   9999 — and the channel's screen asks for it as `⏱ Set delay (3 s)`, one tap and one typed number, because a
-  row of preset buttons is how a simple thing gets complicated. The number also sets how many people a run may
-  write before it hands the list to the next run: a batch has to fit inside `claim_lease_seconds`, because
-  `release_expired_locks` would otherwise hand the same strangers to a second worker, and two passes over the
-  same people is the one thing a DM campaign must not do. There is **no hourly stop**: the campaign sends until
-  the list is empty, until `⏸ Stop after this one` is tapped (the campaign row is re-read before every person,
-  so the tap lands within one message), or until Telegram's own flood wait says so. `campaign.rate_per_hour`
-  no longer bounds it — that default of twenty is what stopped 340 people at twenty and then parked the
-  campaign as `paused` with nothing scheduled, which read as a dead bot. The screen still prints where the
-  queue is (`next batch: job #20 wakes in about 40 minutes`, read from `app.job` by campaign rather than by
-  key, because a count the operator changed does not move the row), and a row that has spent its tries says so
-  with the one tap that re-arms it, because a wait nobody wrote down is indistinguishable from a dead bot. 
-`abort` stops it
-  and leaves every row in place. Confirm never says "queued" without checking what the queue did with it: `app/job` dedupes on a **globally unique** `dedup_key`, so the row a finished run leaves behind used to swallow every later start of the same campaign — the reply read "the job is already queued" and no DM ever went out. `app.writers.queue_campaign_run` now answers in four parts: a new row (`queued`), the closed row put back on the queue (`restarted`, and it names what it was), a live job left alone because it *is* the run (`held`), and a `blocked` job that stays a question until a person taps (`waiting`). A start tap also resets a `queued` row that had spent all its `max_attempts`, which otherwise sits in the queue looking like work no worker will ever claim. Every one of those replies ends with the four switches that can each silence a campaign on their own — the pause flag, `APP_MODE`, `WORKER_ENABLED`, and an account with no stored session — printed only when they are actually wrong, each with the command that fixes it |
+  row of preset buttons is how a simple thing gets complicated. There is **no queue row for a campaign at all**. `app/campaignloop.py` is a task the
+  worker owns: every few seconds it asks `app.join_campaign` which campaigns are on and gives each one a pass
+  over the next page of the pending list (`JOIN_MAX_PER_RUN`, twenty people, which is the size of a page and
+  not a limit on the run), then comes straight back for the following page. That is what makes "it sends until
+  you stop it" a property of the code rather than a sentence on a screen: there is no `dedup_key` to be
+  swallowed by, no `max_attempts` to run out, no wake-up time to wait for, and a re-tap of start cannot be a
+  no-op. A campaign's work ends at an empty list (`completed`), at `⏸ Stop after this one` — the campaign row
+  is re-read before every person, so the tap lands within one message — or at Telegram's own flood wait, which
+  the loop sleeps out where it stands rather than parking the campaign somewhere.
+  `campaign.rate_per_hour` is not read at all: that default of twenty is what stopped 340 people at twenty and
+  then left the campaign looking dead. What the screen prints instead is what the sender last did for that
+  campaign (`sending: 20 sent in its last batch, 320 still waiting, one message every 3 s`), read from the
+  loop's own memory, because the loop is the thing that either is or is not sending. When it is not — no worker
+  in this service, shadow mode, a fault in the last pass — each of those is on the screen with the one tap that
+  exists for it, and each is stated as a fact rather than a promise.
+  `abort` stops it
+  and leaves every row in place; nothing is deleted, and the contacts already written stay written,
+because un-sending is not this program's verb.
 | `/sessions` | name, kind, account, age, character count — never contents |
 | `/use backup` | make another stored session the live one |
 | `/forget spare` | delete the row |
@@ -339,18 +345,19 @@ since zero reads as "nobody is waiting" and would be the one wrong number on the
 Telegram's count of who is waiting, read per invite link (`getChatInviteImporters` answers the question
 "who is waiting **on this link**", so a query that names no link answers nothing for a private channel whose
 requests came in through its `+ABCDEF` link) and never the length of one page; a queue deeper than what this
-look could hold prints both numbers, because "250 waiting, 3 read" is true and "3 waiting" is not. `app/writers.py` then
-writes to **one person every `per_message_delay_seconds`** (three seconds when the row says nothing usable) and
-stops each run at what that spacing fits inside the job lease, so a batch cannot be handed to a second worker
-while the first is still dialling; the
-rest is handed to the next run under a key counted by the contacts already recorded, which is the same key the
-boot sweep uses, so a Render spin-down resumes a half-sent list instead of stranding it — and the two paths
-cannot queue the same send twice — and neither path is allowed to be swallowed by a key a closed run still
-holds, because both call the same `app.writers.queue_campaign_run`, which revives what nobody owns and leaves
-what a worker does own alone. That is also why the boot sweep resumes a campaign whose last run ended without
-a live job: it re-queues the *same* row instead of writing a second one. `⏸ Stop` is re-read before every person, so
-it pauses after the message in flight rather than after the batch that was already planned, and the run
-stops handing itself to a successor; what was sent stays sent, and nothing in this flow approves or declines a join request.
+look could hold prints both numbers, because "250 waiting, 3 read" is true and "3 waiting" is not. `app/campaignloop.py` then asks `app/writers.py` for
+one person every `per_message_delay_seconds` (three seconds when the row says nothing usable), a page at a
+time, for as long as the campaign's row says it is on. Twenty is what one read of Telegram's importer answers
+with and what one pass can finish without an operator staring at a screen; it does not bound the sending,
+because the loop asks for the next page as soon as the last one is done, and the per-person rules are what keep
+two passes from ever writing to the same stranger twice. Nothing is written about the
+campaign to `app.job`, so a Render spin-down has nothing to lose: the resume is a `select` over
+`app.join_campaign`, not a row that a key, an attempt counter or a timer can strand. `⏸ Stop` is re-read before
+every person, so it lands after the message in flight rather than after a batch that was already planned; what
+was sent stays sent, the rows stay, and nothing in this flow approves or declines a join request. A
+shadow-mode service never starts the loop at all, which is why the same screen says "plans and blocks" instead
+of counting DMs that nobody received.
+
 
 A destination's own screen is where the announcement is built: what it publishes, the card post a shareable
 link is made from and whether one was ever returned, the three in-place taps, `📣 Campaigns` and

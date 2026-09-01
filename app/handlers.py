@@ -29,27 +29,9 @@ from . import ingest, storagebot, thumbnails
 from .db import Database
 from . import discover
 
-#: Campaigns the boot sweep picks up again. A run of `app/writers.py`'s campaign handler stops after what
-#: fits inside its job lease and asks for its next run under `keys.campaign_run_key`, counted by the contacts
-#: already recorded — so this query asks for the *same* key, and `app.enqueue_job`'s unique dedup key
-#: swallows one of the two. `queued` and `running` are the states in which a job already exists, and a
-#: `blocked` campaign is left alone on purpose: that status means a human has to answer something.
-RESUMABLE_CAMPAIGNS_SQL = (
-    "select c.id, c.destination_id,"
-    " (select count(*) from app.join_campaign_contact k where k.campaign_id = c.id) as contacts"
-    " from app.join_campaign c"
-    " where c.status in ('ready', 'running')"
-    " and c.message_template is not null and btrim(c.message_template) <> ''"
-    " and not exists ("
-    "   select 1 from app.job j"
-    "    where j.kind = 'join_request_campaign'"
-    "      and j.status in ('queued', 'running')"
-    "      and (j.payload ->> 'campaign_id')::int = c.id"
-    " ) order by c.id limit 10"
-)
 from .keys import archive_key
 from .stages import JobKind, JobStage
-from .writers import FeatureNotImplemented, NeedsInput, build_writers, queue_campaign_run
+from .writers import FeatureNotImplemented, NeedsInput, build_writers
 
 log = logging.getLogger("auto_manager.handlers")
 
@@ -125,8 +107,10 @@ DEPENDENCIES: dict[str, str] = {
     JobKind.JOIN_REQUEST_CAMPAIGN.value: (
         "the campaign text (app/joinmsg.py, /joinmsg) and a campaign row set to ready by "
         "/campaign … confirm with the code that command shows. The text is refused if it carries an "
-        "invite link or reads like a decision about the request, and the per-hour ceiling is waited out: "
-        "the next run is written with its wake-up time in the queue row rather than pushing past it"
+        "invite link or reads like a decision about the request. Nothing is waited out and nothing is "
+        "queued by the run itself: a pass works one page of the pending list, and the campaign loop in "
+        "`app/campaignloop.py` comes straight back for the next page until the list is empty or the "
+        "operator switches the campaign off"
     ),
 }
 
@@ -194,30 +178,11 @@ async def reconciliation(job: dict[str, Any], ctx: Context) -> dict[str, Any]:
                 )
     except Exception as exc:  # noqa: BLE001 - a sweep that fails must not fail the reconciliation
         log.warning("reconciliation: channel roles could not be re-read (%s)", str(exc)[:160])
-    # A campaign that was half-sent when the instance stopped. Render's free tier spins down, and a
-    # join-request campaign that quietly stays at `running` with nobody assigned to it is the worst of both:
-    # the operator believes people are being written to, and they are not. Same key as the runner's own
-    # hand-off, so the two paths cannot queue the same run twice.
-    try:
-        resumed = 0
-        for row in list(await ctx.db.fetch(RESUMABLE_CAMPAIGNS_SQL) or []):
-            # Through `app.writers.queue_campaign_run` rather than a bare `enqueue`, because the query above
-            # asks only whether a *live* job exists: a campaign whose last run closed with the same key would
-            # otherwise be skipped forever, and "the service restarted and now it will never send" is the
-            # silence this whole path exists to prevent. A boot does not reopen a `blocked` job — that is the
-            # operator's tap, not the scheduler's.
-            run = await queue_campaign_run(
-                ctx.db,
-                campaign_id=int(row["id"]),
-                destination_id=row.get("destination_id"),
-                contacts=int(row.get("contacts") or 0),
-            )
-            resumed += 1 if run["how"] in ("queued", "restarted") else 0
-        if resumed:
-            log.info("reconciliation: %s join-request campaign run(s) queued", resumed)
-            result["campaigns_resumed"] = resumed
-    except Exception as exc:  # noqa: BLE001 - a resume that fails must not fail the reconciliation
-        log.warning("reconciliation: join campaigns could not be re-queued (%s)", str(exc)[:160])
+    # A campaign that was half-sent when the instance stopped needs nothing queued here: `app/campaignloop.py`
+    # reads `app.join_campaign` on every round and resumes any campaign that still says it is on, which is a
+    # query rather than a job row. That is the property the queue used to need a boot sweep for — "the service
+    # restarted and now it will never send" — and it is why nothing about a campaign lives in `app.job` any
+    # more. A `blocked` row an older build left behind is a different matter, and `/status` still counts it.
         result["discover"] = {"error": f"{type(exc).__name__}: {str(exc)[:160]}"}
     return result
 

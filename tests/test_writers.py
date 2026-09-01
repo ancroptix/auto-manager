@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import asyncio
 import re
-from pathlib import Path
 from types import SimpleNamespace  # the campaign fake hands out input entities, like the real read does
 
 import pytest
@@ -463,6 +462,38 @@ def _campaign_writers(
 
 
 @pytest.mark.asyncio
+async def test_a_queue_row_left_by_an_older_build_still_does_a_real_pass() -> None:
+    """The job form of a campaign is a wrapper, and the wrapper is what their live database calls.
+
+    `app.job` may still hold a campaign row from before sending became a loop. Deleting the handler would
+    have answered it with `no handler registered for job kind 'join_request_campaign'`, which the worker turns
+    into `blocked` — a campaign that looks broken to the person who did nothing wrong. So the kind stays routed,
+    it runs the same pass the loop runs, and the row closes itself on the result like any other job. A payload
+    with no campaign in it is a ValueError rather than a silent zero, because a run that "sent nobody" would be
+    read as an empty queue.
+    """
+    db = CampaignDb(waiting=2, rate=1000)
+    handlers = _campaign_writers(db, outbound=True)
+
+    from_job = await handlers.join_request_campaign(
+        {"id": 41, "stage": "sending", "campaign_id": 7}, None
+    )
+    from_payload = await handlers.join_request_campaign(
+        {"id": 42, "stage": "sending", "payload": {"campaign_id": 7}}, None
+    )
+
+    assert from_job["sent"] == 2, from_job
+    # The second row arrived after the list had run out, and it was answered rather than raised: the campaign
+    # says `completed` now, which is a fact about the row, not a fault in the queue.
+    assert from_payload["campaign_id"] == 7 and "skipped" in from_payload, from_payload
+    assert "not sending" in from_payload["skipped"], from_payload
+    assert db.queued == [], "and a pass queues nothing, in either form"
+
+    empty = _campaign_writers(CampaignDb(waiting=0, rate=1000), outbound=True)
+    with pytest.raises(ValueError, match="campaign_id"):
+        await empty.join_request_campaign({"id": 43, "payload": {}}, None)
+
+
 async def test_a_campaign_writes_to_one_person_every_three_seconds(monkeypatch) -> None:
     """The operator's own pacing — "har 3 second me ek user ko message" — as an assertion on the sleeps.
 
@@ -488,47 +519,15 @@ async def test_a_campaign_writes_to_one_person_every_three_seconds(monkeypatch) 
     assert db.queued == [], "everyone is done, so there is no next run to ask for"
     closing = [args for sql, args in db.sql if "app.join_campaign set status" in sql]
     assert closing and closing[-1][1] == "completed" and closing[-1][2] is True, closing
-
-
-def test_the_boot_sweep_queues_through_the_same_helper() -> None:
-    """The restart path has to revive too, or a campaign stays dead until somebody edits the table.
-
-    `RESUMABLE_CAMPAIGNS_SQL` asks only whether a *live* job exists, so on its own it re-enqueues a
-    campaign whose key is held by a closed row and lets the unique index swallow it — the same silence,
-    arriving from a different direction. This asserts the call is there, because the behaviour only shows
-    up on a deployment that restarted, and a suite cannot reproduce a restart.
-    """
-    import ast
-    import inspect
-    import pathlib
-
-    from app import handlers as handlers_module
-    from app.writers import queue_campaign_run  # noqa: F401  (the symbol must exist for the name to mean anything)
-
-    tree = ast.parse(pathlib.Path(inspect.getsourcefile(handlers_module)).read_text(encoding="utf-8"))
-    wanted = next(
-        node for node in ast.walk(tree)
-        if isinstance(node, ast.AsyncFunctionDef) and node.name == "reconciliation"
-    )
-    called = {
-        node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", "")
-        for node in ast.walk(wanted)
-        if isinstance(node, ast.Call)
-    }
-    assert "queue_campaign_run" in called, sorted(called)
-    assert "enqueue" not in called, "a bare enqueue is the version that swallows a closed campaign's key"
-
-
 async def test_a_queue_bigger_than_the_pages_is_not_reported_as_finished(monkeypatch) -> None:
-    """Nothing may be called "nobody is waiting" because this run's read came back with no new rows.
+    """Nothing may be called "nobody is waiting" because one pass's read came back with no new rows.
 
-    The campaign had written to two people; the channel says 250 are waiting; the read this run could make
-    returned an empty page (the offset ran out, or the queue is deeper than the pages a 120-second lease
-    allows). Marking the campaign `completed` there is the loudest kind of wrong, because the operator read
-    that number as "everyone has been told" — the exact shape of the bug that emptied a 20-person queue into
-    a `0 pending` sentence. So the run hands itself to the next one and says how many it could not reach.
+    The campaign had written to two people; the channel says 250 are waiting; the read this pass could make
+    returned an empty page — the offset ran out, or the queue is deeper than one page. Calling the campaign
+    `completed` there is the loudest kind of wrong, because the operator would read that as "everyone has been
+    told", which is the same shape as the bug that emptied a 20-person queue into a `0 pending` sentence. So
+    the pass says there is more, and `app/campaignloop.py` comes straight back for it.
     """
-    from app import keys
 
     db = CampaignDb(waiting=0, rate=1000, contacts=2)
     handlers = _campaign_writers(db, outbound=True, total=250)
@@ -536,11 +535,10 @@ async def test_a_queue_bigger_than_the_pages_is_not_reported_as_finished(monkeyp
     result = await handlers.join_request_campaign({"campaign_id": 7}, None)
 
     assert result["waiting"] == 248, result
-    assert result["sent"] == 0 and result["resumed"] is True, result
+    assert result["sent"] == 0 and result["more"] is True, result
     assert not [
         sql for sql, _ in db.sql if "'completed'" in sql or "status = 'completed'" in sql
     ], "the campaign was closed while people were still waiting"
-    assert db.queued == [("join_request_campaign", keys.campaign_run_key(7, 2))], db.queued
     assert not [
         sql for sql, _ in db.sql if "insert into app.join_campaign_contact" in sql
     ], "an unreachable tail is not an excuse to write to anyone twice"
@@ -588,89 +586,10 @@ def _queued(status: str, *, attempts: int = 1, ceiling: int = 8, why: str = "") 
 
 
 @pytest.mark.asyncio
-async def test_a_new_run_is_queued_under_the_key_that_counts_the_contacts() -> None:
-    """The fresh case, spelled out so the other four are measured against something honest."""
-    from app.writers import queue_campaign_run
-
-    db = QueueDb()
-    out = await queue_campaign_run(db, campaign_id=7, destination_id=21, contacts=3)
-
-    assert out["how"] == "queued" and out["job_id"] == 901, out
-    assert db.queued == [("join_request_campaign", "campaign:7:run3")], db.queued
-    assert db.revived == []
-
-
 @pytest.mark.asyncio
-async def test_a_closed_run_is_put_back_on_the_queue_instead_of_swallowing_the_start() -> None:
-    """`succeeded`, `failed` and `cancelled` are all states nobody owns: a start tap may reuse the row.
-
-    Reusing rather than inserting keeps the one promise the campaign lives or dies by — nobody is messaged
-    twice — because there is still exactly one queue row per campaign run, and the contacts table is what
-    decides who has been told.
-    """
-    from app.writers import queue_campaign_run
-
-    for status in ("succeeded", "failed", "cancelled"):
-        db = _queued(status, why="the link list could not be read")
-        out = await queue_campaign_run(db, campaign_id=7, destination_id=21, contacts=0, as_start=True)
-        assert out["how"] == "restarted", (status, out)
-        assert out["was"] == status and out["job_id"] == 77, out
-        assert db.revived == [("campaign:7:run0",)], status
-
-
 @pytest.mark.asyncio
-async def test_a_blocked_run_waits_for_a_person_and_not_for_a_scheduler() -> None:
-    """`blocked` means a question was put to a human, so only the operator's own tap reopens it.
-
-    The asymmetry is the point: the boot sweep and a run's own hand-off both call the same helper, and both
-    must leave a blocked job alone, while the same state is reopened by the confirm tap. A campaign that
-    stopped because its wording broke a rule must not be running again because the service restarted.
-    """
-    from app.writers import queue_campaign_run
-
-    automatic = _queued("blocked", why="the campaign text breaks a rule")
-    out = await queue_campaign_run(automatic, campaign_id=7, contacts=0)
-    assert out["how"] == "waiting" and "breaks a rule" in out["why"], out
-    assert automatic.revived == [], "an automatic pass must not answer a question asked of a human"
-
-    started = _queued("blocked", why="the campaign text breaks a rule")
-    again = await queue_campaign_run(started, campaign_id=7, contacts=0, as_start=True)
-    assert again["how"] == "restarted", again
-    assert started.revived == [("campaign:7:run0",)], started.revived
-
-
 @pytest.mark.asyncio
-async def test_a_live_job_is_held_rather_than_hijacked() -> None:
-    """`queued` and `running` with tries left belong to the worker; a second row for the same campaign is what the key exists to stop."""
-    from app.writers import queue_campaign_run
-
-    for status in ("queued", "running"):
-        db = _queued(status)
-        out = await queue_campaign_run(db, campaign_id=7, contacts=0, as_start=True)
-        assert out["how"] == "held" and out["was"] == status, (status, out)
-        assert db.revived == [] and db.sql == [], status
-
-
 @pytest.mark.asyncio
-async def test_a_run_that_vanished_between_two_statements_promises_nothing() -> None:
-    """The key was taken a moment ago and its row is gone now: say so, rather than reporting a queue."""
-    from app.writers import queue_campaign_run
-
-    # The race, made explicit: `enqueue` is refused as if a row held the key, and that row is gone by the
-    # time it is read back (a cleanup, a replica lag). Neither "queued" nor "already running" is true.
-    db = QueueDb(holder={"id": 78, "status": "succeeded", "last_error": "", "attempts": 1, "max_attempts": 8})
-    original = db.fetchrow
-
-    async def _gone(statement, *args):
-        if "from app.job where dedup_key" in statement:
-            return None
-        return await original(statement, *args)
-
-    db.fetchrow = _gone
-    out = await queue_campaign_run(db, campaign_id=7, contacts=0, as_start=True)
-    assert out["how"] == "unknown" and out["job_id"] is None, out
-
-
 @pytest.mark.asyncio
 async def test_a_released_contact_is_owed_a_message_again(monkeypatch) -> None:
     """`skipped` is the one contact status that means "still waiting", and it is what `/joinreq free` writes.
@@ -725,7 +644,7 @@ async def test_a_campaign_addresses_people_by_the_handle_telegram_gave(monkeypat
         handlers.transport.peers
     )
     assert [peer.user_id for peer in handlers.transport.peers] == [900, 901], handlers.transport.peers
-    assert db.queued == [], "every waiting person fitted in the batch, so there is no next run"
+    assert db.queued == [], "a finished list queues nothing — there is no run to hand anything to"
 
 
 async def test_a_campaign_without_a_hash_still_uses_the_id_it_has(monkeypatch) -> None:
@@ -750,9 +669,10 @@ async def test_a_pause_tap_stops_the_batch_after_the_message_in_flight(monkeypat
     planned twenty, sent twenty, and only then would anything have noticed the pause — which is exactly the
     "I clicked pause and it sent DMs to 20 people" the operator reported.
 
-    What the run gives back is a stopped answer rather than a finished one: the messages already sent stay
-    sent (nothing un-sends), the campaign keeps the status the operator wrote, and no next run is queued,
-    because a stopped list has to be started again on purpose.
+    What the pass gives back is a stopped answer rather than a finished one: the messages already sent stay
+    sent (nothing un-sends), the campaign keeps the status the operator wrote, and the pass does not claim
+    there is more to do under that status — `app/campaignloop.py` re-reads the row before every person, so a
+    paused campaign simply stops being looked at.
     """
     from app import writers as writers_module
 
@@ -770,14 +690,14 @@ async def test_a_pause_tap_stops_the_batch_after_the_message_in_flight(monkeypat
     result = await handlers.join_request_campaign({"campaign_id": 7}, None)
 
     assert result["sent"] == 4, result
-    assert result["continued"] is False and "stopped" in result, result
+    assert result["more"] is False and "stopped" in result, result
     assert result["waiting_after"] == 4, result
     assert slept == [writers_module.JOIN_SEND_GAP_SECONDS] * 3, slept
     assert len(handlers.transport.sent) == 4, handlers.transport.sent
     assert not [
         sql for sql, _ in db.sql if "update app.join_campaign set status" in sql
-    ], "a finishing run overwrote the pause the operator just tapped"
-    assert db.queued == [], "a paused campaign is not handed to the next run by itself"
+    ], "a finishing pass overwrote the pause the operator just tapped"
+    assert db.queued == [], "a paused campaign writes no queue row of any kind"
 
 
 async def test_no_hour_window_is_read_at_all_anymore_only_the_tap_stops_a_run() -> None:
@@ -801,24 +721,23 @@ async def test_no_hour_window_is_read_at_all_anymore_only_the_tap_stops_a_run() 
         "an hour window is still being read, which is what stopped the list at twenty"
     )
     assert not [sql for sql, _ in db.sql if "status = 'paused'" in sql], db.sql
-    assert db.job_writes == [], "a run that is not waiting must not touch the queue row's clock"
-    # The list is empty, so there is no next run to hand anything to: `continued` is False and the queue
-    # stays as it was. (The hand-off over a longer list is `test_a_run_stops_at_the_lease_and_hands_the_rest`.)
-    assert result["continued"] is False and result["waiting_after"] == 0, result
+    assert db.job_writes == [], "sending touches no queue row at all"
+    # The list is empty, so there is nothing more to read: `more` is False and the campaign closes itself.
+    assert result["more"] is False and result["waiting_after"] == 0, result
     assert db.queued == [], db.queued
     assert not [sql for sql, _ in db.sql if "app.job_event" in sql], db.sql
 
 
-async def test_a_run_stops_at_the_lease_and_hands_the_rest_to_the_next_one(monkeypatch) -> None:
-    """Twenty people per run, then the next run under a key nobody else can duplicate.
+async def test_a_pass_reads_one_page_and_says_there_is_more(monkeypatch) -> None:
+    """A pass is a page of the list, not the whole of it, and it never closes the campaign over a tail.
 
-    `app.enqueue_job` gives a claimed job 120 seconds and `release_expired_locks` re-queues a stale one:
-    a handler that slept its way through 300 contacts would be handed to a second worker while the first was
-    still dialling, and two passes over the same strangers is the one thing a DM campaign must not do. The
-    continuation key counts the contacts already recorded, so the two paths that could resume this
-    campaign — the runner and the boot-time sweep in `app/handlers.py` — land on the same row.
+    The page exists for the same reason a cursor does: one long statement holding the connection while a
+    300-person list is dialled would be stale-locked by the worker and re-run underneath itself, and two
+    passes over the same strangers is the one thing a DM campaign must not do. What the page used to
+    *also* do — decide when the campaign was allowed to keep going — is gone: the pass returns `more`, and
+    `app/campaignloop.py` comes back for the next page immediately. Nothing here is queued, so nothing here
+    can be swallowed by a dedup key, which is the failure that made this feature stop working twice.
     """
-    from app import keys
     from app import writers as writers_module
 
     slept: list[float] = []
@@ -832,12 +751,10 @@ async def test_a_run_stops_at_the_lease_and_hands_the_rest_to_the_next_one(monke
 
     result = await handlers.join_request_campaign({"campaign_id": 7}, None)
 
-    assert result["sent"] == writers_module.JOIN_MAX_PER_RUN, "the batch is capped, not the list"
-    assert result["waiting_after"] == 7 and result["continued"] is True
+    assert result["sent"] == writers_module.JOIN_MAX_PER_RUN, "the page is capped, not the list"
+    assert result["waiting_after"] == 7 and result["more"] is True
     assert len(slept) == writers_module.JOIN_MAX_PER_RUN - 1
-    assert db.queued == [
-        ("join_request_campaign", keys.campaign_run_key(7, db.recorded + writers_module.JOIN_MAX_PER_RUN))
-    ]
+    assert db.queued == [], "no queue row is written, so no queue row can be swallowed"
     assert not any("'completed'" in sql for sql, _ in db.sql), "the campaign is still running"
 
 
@@ -873,27 +790,3 @@ async def test_a_shadow_run_plans_without_recording_anybody(monkeypatch) -> None
     )
     assert not [sql for sql, _ in db.sql if "'completed'" in sql], "a plan completed a campaign it only read"
     assert db.queued == [], "a shadow run must not hand itself to the next run and re-read forever"
-
-
-def test_the_resume_key_counts_contacts_instead_of_trying_again() -> None:
-    """Two callers, one key, no duplicate run — and a key that moves only when the campaign moved."""
-    from app import keys
-
-    assert keys.campaign_run_key(7, 0) == "campaign:7:run0"
-    assert keys.campaign_run_key(7, 12) == "campaign:7:run12"
-    assert keys.campaign_run_key(7, -3) == keys.campaign_run_key(7, 0), "no negative counter in a key"
-    assert keys.campaign_run_key(7, 12) != keys.campaign_key(21, "default"), "a run is not a start"
-
-
-def test_the_boot_sweep_resumes_a_campaign_that_was_left_running() -> None:
-    """Render free tier sleeps in fifteen minutes; a half-sent campaign has to be picked up, not forgotten.
-
-    Asserted on the statement and the key rather than on a mock of the loop, because the bug this guards is
-    the resume asking for a job under a key that the still-queued run already holds: that dedupes to nothing,
-    and the operator sees a campaign sitting at `running` with nobody assigned to it.
-    """
-    from app import handlers as handlers_module
-
-    source = Path(handlers_module.__file__).read_text(encoding="utf-8")
-    assert "campaign_run_key" in source, "the resume has to use the shared key, not its own spelling"
-    assert "status in ('ready', 'running')" in source

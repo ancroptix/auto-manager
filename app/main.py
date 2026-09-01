@@ -47,6 +47,19 @@ def configure_logging(level: str) -> None:
     )
 
 
+def _sender_state(state: Any) -> dict[str, Any]:
+    """What this service's campaign sender last said, or that there is nobody to ask.
+
+    `{absent: True}` is the answer when no worker is running, and the campaign screens print that as a
+    sentence, because "the campaign is on and nothing is happening" has to be visible where the operator
+    started it. `running: False` is the subtler one: a worker exists, and the loop inside it does not.
+    """
+    worker = getattr(state, "worker", None) if state is not None else None
+    if worker is None:
+        return {"absent": True}
+    return {"absent": False, **(worker.snapshot().get("sending") or {"running": False})}
+
+
 async def _build_control_bot(settings: Settings, db: Any, *, user_client: Any = None, state: Any = None) -> Any:
     """Assemble the control bot. Separate so the wiring itself can be tested.
 
@@ -155,6 +168,10 @@ async def _build_control_bot(settings: Settings, db: Any, *, user_client: Any = 
         background=lambda coro: asyncio.create_task(coro),
         on_session_stored=adopt_session,
         worker_switch=switch_worker,
+        # The campaign screens ask the same question `/worker status` answers, so they ask it through the
+        # worker's own snapshot: the loop that sends lives there, and a second holder of that answer would be
+        # a second truth about whether the operator's DMs are on their way.
+        sender_state=lambda: _sender_state(state),
         login_ttl_seconds=login_ttl,
         delete_sensitive=delete_sensitive,
     )

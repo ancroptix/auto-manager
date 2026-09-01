@@ -140,7 +140,9 @@ async def test_the_command_saves_picks_refuses_and_never_claims_it_sent() -> Non
     # fast it goes, because that is the question the operator asked when they said the button was missing —
     # and it must not read as though the wording alone wrote to anybody.
     assert any("saved" in line and "Nobody has been written to yet" in line for line in saved), saved
-    assert any("3 seconds" in line and "/joinreq" in line for line in saved), saved
+    # ...and it names the *row* the delay lives on rather than printing a number: a "3 seconds" in a reply
+    # about saving wording read as a promise about a campaign this command has not looked at.
+    assert any("the delay set on that campaign" in line and "/joinreq" in line for line in saved), saved
     assert db.config_rows["joinrequest.message"].startswith("{name}")
 
     shown = await say(control, "/joinmsg show")

@@ -265,6 +265,12 @@ class ControlBot:
     #: the same reason as `on_session_stored`: the bot must not own the connection, and a service that writes
     #: jobs it never runs needs one tap in the chat rather than an environment edit.
     worker_switch: Callable[[bool], Any] | None = None
+    #: A read of this service's campaign sender (`app/campaignloop.py`), as the worker's `snapshot()` sees
+    #: it. A callable rather than the object, because `/worker on` and `off` build and discard workers, and a
+    #: campaign screen that reported the sender of a worker that has since been stopped is the same "the
+    #: screen said it was running" mistake the queue used to be blamed for. `None` means this bot has no
+    #: service behind it to ask, which the screens say out loud rather than glossing over.
+    sender_state: Callable[[], dict[str, Any]] | None = None
     #: What this bot last asked the worker to do, or None for "whatever the service was started with". A
     #: screen that printed the environment's answer after a `/worker on` would deny what the tap just did.
     worker_running: bool | None = None
@@ -467,70 +473,72 @@ class ControlBot:
         finally:
             await wrapper.stop()
 
-    async def _campaign_live_job(self, campaign_id: int) -> dict[str, Any] | None:
-        """The queue row this campaign has right now, if it has one - looked up by campaign, not by key.
+    def _campaign_sending_line(self, campaign_id: int) -> str:
+        """What this service's sender last did about this campaign — or why it is doing nothing.
 
-        A run's `dedup_key` is spelled `campaign:<id>:run<how many contacts were recorded when it was
-        written>` and it keeps that spelling for its whole life, so anything that moves the count between the
-        queueing and the reading (a `/joinreq free`, an earlier batch) leaves the key naming a row that is not
-        the one waiting. The question on this screen is "is anything scheduled for this campaign, and when",
-        and `app.job.payload` carries the campaign id the row was written for, which is what the row itself
-        is about.
+        Read from the loop's memory (`app/campaignloop.py`) rather than from a queue row, because there is no
+        queue row any more, and read from the same object `/worker status` talks to, because a screen that said
+        "sending" while the sender was off is how this campaign came to look broken twice. Every branch here
+        names a tap that exists in that state, and none of them promises a message.
         """
-        try:
-            row = await self.db.fetchrow(
-                "select id, status::text as status, dedup_key, attempts, max_attempts,"
-                " extract(epoch from (next_attempt_at - now()))::int as in_seconds"
-                " from app.job where kind = 'join_request_campaign'"
-                " and (payload ->> 'campaign_id')::int = $1 and status in ('queued', 'running')"
-                " order by id desc limit 1",
-                int(campaign_id),
-            )
-        except Exception:  # noqa: BLE001  - a schedule line never outranks the answer it annotates
-            return None
-        return dict(row) if row else None
-
-    async def _campaign_schedule_line(self, campaign_id: int) -> str:
-        """One sentence about when this campaign's next run wakes up — or the fact that nothing will.
-
-        A run that has not been picked up yet is invisible in exactly the way that made this campaign look
-        broken: the row sat in the queue with a `next_attempt_at` in the future (a flood wait, or the backoff
-        after a failure), the campaign said `ready`, and every screen said either nothing or "queued". The
-        operator read that as a dead bot and tapped Start again. So the wait is printed here, in minutes,
-        read from the queue row itself rather than remembered: if the row says it wakes in four minutes, that
-        is what the chat says, and a wrong number is a lie about a timer rather than an omission.
-        """
-        row = await self._campaign_live_job(int(campaign_id))
-        if not row:
+        sending: dict[str, Any] = {}
+        if self.sender_state is not None:
+            try:
+                sending = dict(self.sender_state() or {})
+            except Exception as exc:  # noqa: BLE001 - a screen must not fail because a status read did
+                return f"\nsending: the sender could not be asked ({str(exc)[:90]})."
+        else:
             return (
-                "\nnothing is scheduled for it right now: tap ✅ Yes, start sending and it runs until the"
-                " list is empty or you tap ⏸."
+                "\nsending: this bot is not wired to a service that can send, so nothing is going out from"
+                " it. `/worker on` is the switch in a deployed service."
             )
-        status = str(row.get("status") or "")
-        seconds = int(row.get("in_seconds") or 0)
-        spent = int(row.get("attempts") or 0) >= int(row.get("max_attempts") or 0) > 0
-        if status in ("queued", "running") and spent:
-            # The queue's most misleading shape: a `queued` row with no tries left is invisible to
-            # `app.claim_next_job`, so every screen that says "queued" is true and nothing runs. Only the
-            # operator's tap resets it, so the screen names that tap rather than the number.
+        if sending.get("absent"):
             return (
-                f"\nnext batch: job #{row.get('id')} has spent its tries and no worker will claim it again."
-                " tap ✅ Yes, start sending — the same row goes back on the queue with its tries reset."
+                "\nsending: no queue worker is running in this service, and campaign sending starts with it —"
+                " so nothing goes out. `/worker on` starts both, and the list carries on from where it"
+                " stopped."
             )
-        if status in ("queued", "running") and seconds > 60:
+        if sending.get("shadow"):
             return (
-                f"\nnext batch: job #{row.get('id')} wakes in about {max(1, round(seconds / 60))} minutes"
-                " on its own; nothing has to be tapped again."
+                "\nsending: this service is in shadow mode, which is its deployment's setting and not a tap"
+                " here, so a campaign pass plans each message and blocks before it. Nothing is sent to anyone"
+                " while it stays that way."
             )
-        if status == "running":
-            return f"\nnext batch: job #{row.get('id')} is running right now."
-        return f"\nnext batch: job #{row.get('id')} is {status} and due now."
+        if not sending.get("running"):
+            return (
+                "\nsending: the sender in this service is not running, so nothing is being sent. /worker"
+                " status says what the worker is doing."
+            )
+        detail = (sending.get("campaigns") or {}).get(str(campaign_id)) or {}
+        if not detail:
+            return (
+                "\nsending: on. The sender looks at this campaign every few seconds and takes the next page"
+                " of the list — nothing has to be tapped again."
+            )
+        bits: list[str] = []
+        if detail.get("stopped"):
+            bits.append("your \u23f8 stopped the last batch")
+        if detail.get("finished"):
+            bits.append("the list was empty at its last look")
+        if detail.get("sent"):
+            bits.append(f"{detail['sent']} sent in its last batch")
+        if detail.get("planned"):
+            bits.append(f"{detail['planned']} planned, not sent")
+        if detail.get("waiting") is not None:
+            bits.append(f"{detail['waiting']} still waiting")
+        if detail.get("gap"):
+            bits.append(f"one message every {detail['gap']:g} s")
+        if detail.get("flood"):
+            bits.append(f"Telegram asked for a {detail['flood']} s pause")
+        if detail.get("error"):
+            bits.append(f"last fault: {str(detail['error'])[:90]}")
+        return "\nsending: " + (", ".join(bits) + "." if bits else "on.")
 
     async def _campaign_watch(self) -> list[str]:
-        """The reasons a queued run would still send nothing, each with the tap that fixes it.
+        """The reasons a campaign that is on would still send nothing, each with the tap that fixes it.
 
-        A start screen that says "queued" while the queue is paused is worse than one that refuses: the
-        operator waits, sees no DMs, and has no way to know that the job is sitting in a table on purpose.
+        A start screen that promises sending while the service will not send is worse than one that refuses:
+        the operator waits, sees no DMs, and has no way to know the switch is off on purpose.
         Four things can each silence a campaign on their own — the pause switch, the deployment's mode, the
         worker being off in this service, and an account with no stored session — so all four are read here,
         and the line is printed only when it is actually a problem. Nothing in this method writes anything.
@@ -552,8 +560,9 @@ class ControlBot:
         if not self._worker_is_running():
             if self.worker_switch is not None:
                 lines.append(
-                    "• this service's queue worker is OFF, so jobs are written and never run"
-                    " — tap ▶️ Run the queue below, or /worker on"
+                    "• this service's queue worker is OFF, so jobs are written and never run — and campaign"
+                    " sending runs with it, so nothing is being DM'd either. Tap ▶️ Run the queue below, or"
+                    " /worker on"
                 )
             else:
                 lines.append(
@@ -763,6 +772,8 @@ class ControlBot:
         The second one exists to stop a duplicate DM to a stranger, so it cannot be undone by a guess. What
         this writes is a status, never a deletion: the row, its id and its timestamp all stay.
         """
+        from . import writers  # noqa: PLC0415  (the pace number lives with the sender it paces)
+
         row = await self._joinreq_row(int(destination["id"]), self._JOINREQ_CAMPAIGN)
         if row is None:
             return [Reply("there is no campaign on this channel yet, so there is nothing to release.")]
@@ -781,8 +792,9 @@ class ControlBot:
             )]
         return [Reply(
             f"{moved} person(s) are released: their rows stay, and they are waiting for a message again."
-            " Tap ✅ Yes, start sending and they go out in the next batch — one person every 3 seconds,"
-            " and nobody who was already messaged is messaged again."
+            f" Tap ✅ Yes, start sending and the sender takes them on its next page — one person every"
+            f" {writers.campaign_gap_seconds(row):g} seconds, and nobody who was already messaged is messaged"
+            " again."
         )]
 
     async def _joinreq_screen(self, lines: list[str], choices: list[dict], ran: str) -> list[Reply]:
@@ -793,7 +805,7 @@ class ControlBot:
         self, destination: Mapping[str, Any], *, after: str | None = None
     ) -> list[Reply]:
         """One channel: what it will say, what it already said, and the one button that starts it."""
-        from . import joinmsg, writers  # noqa: PLC0415  (the pace constant lives with the loop it paces)
+        from . import joinmsg, writers  # noqa: PLC0415  (the pace number lives with the sender it paces)
 
         name = self._JOINREQ_CAMPAIGN
         row = await self._joinreq_row(int(destination["id"]), name)
@@ -834,10 +846,10 @@ class ControlBot:
             " this one. Nobody is written to twice."
         )
         if row is not None:
-            # Where the next batch is, in the same place the operator is looking for it. A queue row that is
-            # waiting for a reason reads as a dead campaign when the reason is not printed, and the tap that
-            # follows it then does nothing anyone can explain.
-            schedule = await self._campaign_schedule_line(int(row["id"]))
+            # Whether the sender is actually awake for this campaign, in the same place the operator is
+            # looking for it. "It is on, so why has nobody been DM'd" can only be answered by the loop that
+            # does the sending, and the tap that follows has to be the one that fixes what it reports.
+            schedule = self._campaign_sending_line(int(row["id"]))
             if schedule:
                 lines.append(schedule.strip())
         choices = []
@@ -985,10 +997,10 @@ class ControlBot:
 
         Three taps, in the order the operator described: pick the channel the requests came into (only the
         ones this account can post in are offered, and that is read from Telegram on the spot), see the exact
-        words and who is waiting, start. `app/writers.py` then sends one message every
-        the campaign's own delay (`per_message_delay_seconds`), with no hourly stop at all, and a campaign
-        that is not finished
-        is handed to the next run so a restart or a spin-down does not strand half a list.
+        words and who is waiting, start. `app/campaignloop.py` then works the pending list page by page at the
+        delay written on the campaign's own row (`per_message_delay_seconds`), with no hourly stop and
+        nothing to re-arm: the sender looks at the campaign again for as long as its row says it is on, so a
+        restart or a Render spin-down resumes the list by itself.
 
         What is deliberately kept from `/campaign`: the row is still drafted from the saved `/joinmsg` wording
         and still has to pass `confirm` — the code is computed here instead of typed, because the tap on the
@@ -1039,7 +1051,8 @@ class ControlBot:
                     return drafted
             planned = (await self._campaign(update, [handle, "plan", name]))[0].text
             return await self._joinreq_screen(
-                [planned, "", "One person every 3 seconds, and nobody is written to twice by this campaign."],
+                [planned, "", "It sends at the pace printed above, and nobody is written to twice by this"
+                              " campaign."],
                 [
                     {"label": "✅ Yes, start sending", "command": f"/joinreq go {handle}"},
                     {"label": "🧿 Not now", "command": f"/joinreq open {handle}"},
@@ -1065,9 +1078,9 @@ class ControlBot:
             [
                 replies[0].text,
                 "",
-                f"It goes out at one person every {writers.campaign_gap_seconds(after):g} seconds, and a run"
-                " that does not finish passes the rest to the next one — a restart does not strand the"
-                " list.",
+                f"It goes out at one person every {writers.campaign_gap_seconds(after):g} seconds and it does"
+                " not stop by itself: it finishes the list or you tap ⏸. A restart picks the list up again"
+                " where it left off.",
             ],
             [
                 {"label": "⏸ Stop after this one", "command": f"/joinreq stop {handle}"},
@@ -1403,8 +1416,8 @@ class ControlBot:
         "  /joinmsg set <text>   save your own words ({name} and {series} are filled in)\n"
         "  /joinmsg clear        empty it — the app may contact nobody\n\n"
         "Saving a message does not send one. This command only chooses the words; the sending is a\n"
-        "campaign per channel, started from 📨 Who is waiting (or /joinreq), one person every 3 seconds,\n"
-        "nobody twice. It never approves or declines a join request."
+        "campaign per channel, started from 📨 Who is waiting (or /joinreq), one person at a time at the\n"
+        "delay set on that campaign, and nobody twice. It never approves or declines a join request."
     )
 
     async def _joinmsg(self, update: Update, args: list[str]) -> list[Reply]:
@@ -1490,7 +1503,7 @@ class ControlBot:
             Reply(
                 f"saved ({len(' '.join(text.split()))} chars). Nobody has been written to yet — this "
                 f"only sets the words, and the sending starts per channel from 📨 Who is waiting "
-                f"(or /joinreq), one person every 3 seconds.{note}"
+                f"(or /joinreq), one person at a time at the delay set on that campaign.{note}"
             )
         ]
 
@@ -2525,13 +2538,13 @@ class ControlBot:
     async def _campaign(self, update: Update, args: list[str]) -> list[Reply]:
         """``/campaign`` — draft, plan, confirm. Two human steps before any DM goes out.
 
-        The plan is computed from the same two sources the job will use — `app.sender`'s read of the
+        The plan is computed from the same two sources the sender will use — `app.sender`'s read of the
         channel's pending requests and `app.joinmsg`'s refusal rules — so what the operator reads is
-        not a promise about the run but the first half of it. The read is real even in shadow mode,
-        because reading a list is not a write; sending still needs `confirm`, and the sending itself
+        not a promise about the sending but the first half of it. The read is real even in shadow mode,
+        because reading a list is not a write; sending still needs `confirm`, and in shadow mode it
         plans and blocks until the deployment is live.
         """
-        from . import joinmsg, writers  # noqa: PLC0415  (the pace and the per-run cap live with the loop)
+        from . import joinmsg, writers  # noqa: PLC0415  (the pace number lives with the sender)
 
         if self.db is None or not getattr(self.db, "connected", False):
             return [Reply("the database is not reachable, so I cannot draft a campaign.")]
@@ -2621,9 +2634,9 @@ class ControlBot:
 
         if action == "gap":
             # The one number the operator asked to own: how far apart two messages go. It is the campaign's
-            # own `per_message_delay_seconds`, which the send loop sleeps on, and it also decides how many
-            # people a run may write before it hands the list on — a run must not sleep past its own job
-            # lease, or `release_expired_locks` gives the same strangers to a second worker.
+            # own `per_message_delay_seconds`, which is what the sender sleeps between two people. It is the
+            # only pace number there is: nothing about it sizes a run or hands a list on, because a campaign
+            # has no queue row — `app/campaignloop.py` works the list until the row says otherwise.
             if len(rest) < 3:
                 asked = await _row(self._JOINREQ_CAMPAIGN)
                 if asked is None:
@@ -2680,9 +2693,8 @@ class ControlBot:
             return [Reply(
                 f"`{name}` on {destination.get('title') or destination['id']}: one message every {gap:g}"
                 " seconds, and the campaign keeps going until you tap ⏸ Stop after this one. Nobody who was"
-                f" sent to is sent to again. A run writes up to {writers.campaign_run_cap(gap)} people at a"
-                " time, then hands the list to the next one, so a restart resumes it rather than starting"
-                " over."
+                " sent to is sent to again, and the list is worked through page by page — a restart resumes"
+                " it rather than starting over."
                 "\n\nA run that is sending right now keeps the spacing it started with; the next one uses"
                 " this."
             )]
@@ -2699,7 +2711,7 @@ class ControlBot:
                 total, listed, why = await self._pending_requests(
                     str(destination.get("telegram_channel_id") or "")
                 )
-                schedule = await self._campaign_schedule_line(int(campaign["id"]))
+                schedule = self._campaign_sending_line(int(campaign["id"]))
                 if total is None:
                     pending = (
                         "\n\nthe pending requests could not be read from this account right now: "
@@ -2710,8 +2722,8 @@ class ControlBot:
                     pending = f"\n\n{total} join request(s) are waiting right now"
                     if listed is not None and listed < total:
                         pending += (
-                            f" — this look reached {listed} of them, and the run works through the queue "
-                            "in batches rather than all at once"
+                            f" — this look reached {listed} of them, and the sender works through the list a"
+                            " page at a time without stopping"
                         )
                 code = joinmsg.confirm_code(campaign["id"], campaign["message_template"])
                 return [Reply(
@@ -2744,8 +2756,10 @@ class ControlBot:
                     "update app.join_campaign set status = 'ready', updated_at = now() where id = $1",
                     int(campaign["id"]),
                 )
-                from .writers import queue_campaign_run  # noqa: PLC0415  (the queue row's owner is there)
-
+                # Nothing is queued, because a campaign no longer runs through the queue at all:
+                # `app/campaignloop.py` looks at `app.join_campaign` every few seconds and works on whatever
+                # says it is on. That is the whole difference for the operator — no row to be swallowed by a
+                # dedup key, no timer to re-arm, and a restart resumes from the list itself.
                 contacts = int(
                     await self.db.fetchval(
                         "select count(*) from app.join_campaign_contact where campaign_id = $1",
@@ -2753,55 +2767,23 @@ class ControlBot:
                     )
                     or 0
                 )
-                run = await queue_campaign_run(
-                    self.db,
-                    campaign_id=int(campaign["id"]),
-                    destination_id=int(destination["id"]),
-                    contacts=contacts,
-                    as_start=True,
-                )
-                how = run.get("how")
-                number = run.get("job_id")
-                who = f"job #{number}" if number else "the queue row for this campaign"
-                if how == "queued":
-                    head = f"`{name}` is ready and {who} is in the queue."
-                elif how == "restarted":
-                    head = (
-                        f"`{name}` is ready. Nothing was started earlier because {who} was still sitting in "
-                        f"the queue table as `{run.get('was')}`, and that is what was swallowing every tap. "
-                        "I put that same job back in the queue."
-                    )
-                elif how == "held":
-                    head = (
-                        f"`{name}` is ready, and {who} is `{run.get('was')}` right now — so nothing new was "
-                        "started, because that job *is* this campaign's run. /status shows what it has done."
-                    )
-                elif how == "waiting":
-                    head = (
-                        f"`{name}` is ready, but {who} stopped with a question for you: {run.get('why') or 'no reason recorded'}. "
-                        "Answer that and start it again; the job goes back in the queue by itself."
-                    )
-                else:
-                    head = (
-                        f"`{name}` is ready, and the queue row that held this campaign vanished between the "
-                        "two statements, so nothing was promised either way. Tap Start sending once more."
-                    )
-                people = (
-                    f"\n{contacts} person(s) already carry a record under this campaign, and they will not "
-                    "be written to twice."
-                    if contacts
-                    else ""
-                )
                 watch = await self._campaign_watch()
                 return [Reply(
-                    f"{head}{people}\n\n"
+                    f"`{name}` is on — ready, and sending starts within a few seconds."
+                    + (
+                        f"\n{contacts} person(s) already carry a record under this campaign, and they will"
+                        " not be written to twice."
+                        if contacts
+                        else ""
+                    )
+                    + "\n\n"
                     + (
                         "It sends one message at a time, spaced by the delay on this campaign's own row,"
                         " and it keeps going until the list is empty or you tap ⏸ Stop after this one."
                         if getattr(self.settings, "outbound_enabled", False)
                         else "In shadow mode each message plans and blocks, which is the read-only version of this run."
                     )
-                    + (await self._campaign_schedule_line(int(campaign["id"])))
+                    + self._campaign_sending_line(int(campaign["id"]))
                     + (("\n\n" + "\n".join(watch)) if watch else "")
                 )]
 
@@ -2818,8 +2800,10 @@ class ControlBot:
                 action == "abort",
             )
             return [Reply(
-                f"`{name}` is {status}. Contacts already sent stay sent — this program does not "
-                "un-send a message to a stranger, and it does not delete the record of one."
+                f"`{name}` is {status}. The sender stops at its next look, which is between two people at the"
+                " most. Contacts already sent stay sent — this program does not un-send a message to a"
+                " stranger, and it does not delete the record of one."
+                + self._campaign_sending_line(int(campaign["id"]))
             )]
 
         return [Reply(f"I do not know `/campaign {handle} {rest[0]}`.\n\n{self._CAMPAIGN_USAGE}")]

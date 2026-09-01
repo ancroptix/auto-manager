@@ -55,6 +55,10 @@ class Worker:
     _last_job_at: float | None = None
     _started_at: float = field(default_factory=time.monotonic)
     _boot_reconciled: bool = False
+    #: The campaign sender, built on first use. It lives here because it should start and stop with exactly
+    #: one switch — the worker's — and a second "is sending?" flag in the service would be a second answer
+    #: to a question the operator can already see on `/worker status`.
+    _campaign: Any = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if not self.handlers:
@@ -77,14 +81,44 @@ class Worker:
         return telegram.client if getattr(telegram, 'connected', False) else None
 
     # ------------------------------------------------------------ public API
+    def campaign_loop(self) -> Any:
+        """The sender for campaigns that are on, built once and started with this worker.
+
+        `app/campaignloop.py` owns why a loop and not the queue; what belongs here is only the fact that the
+        two share a switch. `/worker off` stops claiming jobs *and* stops sending, and `/worker on` starts
+        both again, because an operator who has just been told "nothing runs in this service" should not have
+        to learn that a second half of the service kept running.
+        """
+        if self._campaign is None and self.db is None:
+            # No pool, nothing to read the campaign list from. `Worker` survives this on its own — it reports
+            # the database as unavailable instead of pretending to run — and the sender says the same thing
+            # by not existing, which is what the campaign screens then print.
+            return None
+        if self._campaign is None:
+            from .campaignloop import CampaignLoop  # noqa: PLC0415  (only the loop needs the writers)
+            from .writers import Writers  # noqa: PLC0415
+
+            self._campaign = CampaignLoop(
+                db=self.db,
+                settings=self.settings,
+                writers=Writers(db=self.db, settings=self.settings, client_factory=self._outbound_client),
+            )
+        return self._campaign
+
     def start(self) -> None:
         if self._task is None or self._task.done():
             self._stop.clear()
             self._task = asyncio.create_task(self.run(), name="auto-manager-worker")
+            loop = self.campaign_loop()
+            if loop is not None:
+                loop.start()
 
     async def stop(self, drain_seconds: float | None = None) -> None:
         grace = drain_seconds or self.settings.graceful_shutdown_seconds
         self._stop.set()
+        if self._campaign is not None:
+            await self._campaign.stop(grace)
+            self._campaign = None
         task = self._task
         self._task = None
         if task and not task.done():
@@ -103,9 +137,11 @@ class Worker:
         return self._task is not None and not self._task.done()
 
     def snapshot(self) -> dict[str, Any]:
+        loop = self._campaign
         return {
             "worker_id": self.worker_id,
             "alive": self.alive,
+            "sending": loop.snapshot() if loop is not None else None,
             "processed": self._processed,
             "errors": self._errors,
             "idle_rounds": self._idle_rounds,

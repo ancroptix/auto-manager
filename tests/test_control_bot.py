@@ -94,12 +94,6 @@ class FakeDb:
         self.blocked = blocked or []
         self.audit: list[tuple[str, tuple]] = []
         self.paused: list[tuple[bool, str | None]] = []
-        # `app.job` as the campaign queue sees it: one row holding one dedup key. Setting it is how a test
-        # says "the key is taken", and it changes `enqueue`'s answer too, because in the real schema the
-        # unique constraint is what makes the insert a no-op — a fake that let both be true at once would
-        # let a test pass on a state the database cannot be in.
-        self.job_row: dict | None = None
-        self.revived: list[tuple] = []
         self.rows_changed: int | None = None
         self.queued: list[tuple[str, Any, int]] = []
         self.leases_released = 0
@@ -297,28 +291,11 @@ class FakeDb:
             return {"paused": paused[0], "reason": paused[1] or "", "last_reconcile_at": None}
         if "insert into app.telegram_session" in sql:
             return dict(self.stored[-1]) if self.stored else None
-        if "from app.job where kind = 'join_request_campaign'" in sql:
-            # "what does this campaign have on the queue" - the fake hands over the same row either way,
-            # because which of the two spellings the code asked with is exactly the bug this read avoids.
-            return dict(self.job_row) if self.job_row else None
-        if "from app.job where dedup_key" in sql:
-            return dict(self.job_row) if self.job_row else None
-        if "set next_attempt_at" in sql:
-            # Waking a waiting run early is a write on the queue row, and it is recorded as one so a test can
-            # see it happened with the campaign's key rather than on some other row.
-            self.writes.append((sql, args))
-            return {"id": int((self.job_row or {}).get("id") or 42)}
-        if "update app.job set status = 'queued'" in sql:
-            # The UPDATE carries its own guard (`not live, or out of tries`) for the race between the two
-            # statements, and the fake honours it: a live row is not revived by a start tap.
-            self.writes.append((sql, args))
-            if self.job_row and (
-                str(self.job_row.get("status")) not in ("queued", "running")
-                or int(self.job_row.get("attempts") or 0) >= int(self.job_row.get("max_attempts") or 0) > 0
-            ):
-                self.revived.append(args)
-                return {"id": int(self.job_row.get("id") or 7), "status": "queued"}
-            return None
+        if "join_request_campaign" in sql or "campaign:" in str(args):
+            # A campaign has no `app.job` row to ask about: sending is a loop over `app.join_campaign`, so
+            # any read that mentions the old shape is the queue design creeping back. The fake refuses it
+            # loudly, because an answer of `None` here would let a leftover path look like a working one.
+            raise AssertionError(f"a campaign touched app.job again: {sql[:90]}")
         return {"id": 42}
 
     @staticmethod
@@ -563,9 +540,9 @@ class FakeDb:
         return 2
 
     async def enqueue(self, kind: str, dedup_key: str, *, stage=None, payload=None, priority=100, **kw):
+        # Every queue write in the product lands here, so `db.queued` is the one place a test can check that
+        # starting a campaign wrote nothing: the list has to stay empty for the loop design to be true.
         self.queued.append((kind, payload, priority))
-        if self.job_row and str(self.job_row.get("dedup_key") or dedup_key) == dedup_key:
-            return None  # `on conflict (dedup_key) do nothing`: the row that holds the key wins
         return {"id": 42}
 
 
@@ -1855,7 +1832,7 @@ async def test_card_records_the_post_the_announcement_is_built_from(make_setting
 
 @pytest.mark.asyncio
 async def test_a_campaign_needs_the_code_that_the_plan_printed(make_settings) -> None:
-    """`/campaign … confirm` refuses without the code, and queues the job with it.
+    """`/campaign … confirm` refuses without the code, and switches the campaign on with it.
 
     The code is derived from the campaign row and its exact text, so the test asserts the mismatch
     first (nothing queued) and then the match (the job is queued, status ready). A campaign that could
@@ -1883,7 +1860,7 @@ async def test_a_campaign_needs_the_code_that_the_plan_printed(make_settings) ->
 
     confirmed = text_of(await control._campaign(None, ["-1001234", "confirm", "wave1", code.lower()]))
     assert "ready" in confirmed, confirmed
-    assert [row[0] for row in db.queued] == ["join_request_campaign"], db.queued
+    assert db.queued == [], "starting a campaign writes no job row — the loop reads the campaign table"
     assert db.campaign["status"] == "ready", db.campaign
     assert any("status = 'ready'" in sql for sql, _ in db.writes), db.writes
 
@@ -3344,6 +3321,11 @@ def joinreq_bot(*, dialogs=None, campaign=...):
         return (*joinreq_waiting, None)
 
     control._pending_requests = _count  # type: ignore[method-assign]
+    # The campaign screens ask the service whether its sender is awake. A bot assembled in a test has no
+    # service, and "no sender" is the wrong default for a screen test: it would hide every sentence the
+    # operator sees when things are fine. So the helper says "awake", and the tests that want the broken
+    # answer overwrite this one line.
+    control.sender_state = lambda: {"absent": False, "running": True}  # type: ignore[attr-defined]
     return control, api, db, walk
 
 
@@ -3452,7 +3434,7 @@ async def test_add_a_channel_files_the_destination_row_through_the_same_writer_a
 
 
 @pytest.mark.asyncio
-async def test_start_shows_the_words_then_the_tap_queues_the_run() -> None:
+async def test_start_shows_the_words_then_the_tap_switches_it_on() -> None:
     """Two taps, no typing: the plan on screen, then ✅ Yes — and the code that gates `ready` is computed.
 
     `/campaign` keeps its own confirm step for the operator who types it; what the wizard removes is the
@@ -3474,11 +3456,13 @@ async def test_start_shows_the_words_then_the_tap_queues_the_run() -> None:
     labels = [one["text"] for row in api.markups[-1]["inline_keyboard"] for one in row]
     assert "aapka request dekh liya jaa raha hai" in planned, planned
     assert "✅ Yes, start sending" in labels, labels
-    assert db.queued == [], "the plan alone queued nothing"
+    assert db.queued == [], "the plan alone started nothing"
 
     await control.dispatch(parse_update(_press(api, "x:/joinreq go #21")))
-    assert [one[0] for one in db.queued] == ["join_request_campaign"], db.queued
-    assert db.queued[0][1] == {"campaign_id": 7, "destination_id": 21}, db.queued[0][1]
+    started = api.sent[-1][1]
+    assert db.queued == [], "the start tap queues nothing, so nothing can swallow it"
+    assert "is on" in started and "ready" in started, started
+    assert "sending: on" in started, started
     assert db.campaign["status"] == "ready"
     assert "one person every 3 seconds" in api.sent[-1][1].casefold() or "3 seconds" in api.sent[-1][1]
 
@@ -3560,7 +3544,7 @@ async def test_the_plan_shows_the_queue_and_not_just_the_page(monkeypatch) -> No
 
     assert "250 join request(s) are waiting right now" in text, text
     assert "this look reached 3 of them" in text, text
-    assert "in batches rather than all at once" in text, text
+    assert "a page at a time without stopping" in text, text
 
 
 CAMPAIGN_READY = {
@@ -3572,40 +3556,6 @@ CAMPAIGN_READY = {
     "per_message_delay_seconds": 3,
     "confirm_required": True,
 }
-
-
-@pytest.mark.asyncio
-async def test_a_start_tap_revives_the_run_that_stole_its_own_key() -> None:
-    """**The silence this pins: "the job is already queued", and no DM ever goes out.**
-
-    `app.enqueue_job` collapses on a globally unique `dedup_key`, so the row a finished run leaves behind
-    keeps that key for good. The campaign's own start used the same key every time, which made every start
-    after the first one a no-op with a reassuring sentence on top — the operator saw the waiting count,
-    tapped Start, and the spare account stayed quiet forever. A closed row is therefore put back on the
-    queue, and the reply names the job and what it was before.
-    """
-    from app import joinmsg
-
-    control, api, db, _w = joinreq_bot(campaign=dict(CAMPAIGN_READY))
-    db.job_row = {
-        "id": 501,
-        "dedup_key": None,  # any key: the fake's `job_row` means "this insert is the one being swallowed"
-        "status": "succeeded",
-        "last_error": "",
-        "attempts": 2,
-        "max_attempts": 8,
-    }
-    code = joinmsg.confirm_code(7, CAMPAIGN_READY["message_template"])
-
-    text = "\n".join(r.text for r in await control._campaign(None, ["-1001234", "confirm", "default", code]))
-
-    assert "back in the queue" in text, text
-    assert "job #501" in text, text
-    assert "already queued" not in text, "the sentence that hid the silence must not come back"
-    assert db.revived == [("campaign:7:run0",)], db.revived
-    assert db.campaign["status"] == "ready", db.campaign
-
-
 @pytest.mark.asyncio
 async def test_people_recorded_but_never_messaged_are_offered_back_one_tap() -> None:
     """The screen names the rows that make a campaign look finished, and offers exactly one decision.
@@ -3768,45 +3718,72 @@ async def test_the_campaign_screen_offers_the_tap_that_ends_the_silence() -> Non
     await control.dispatch(parse_update(_press(api, "x:/joinreq go #21")))
     reply = api.sent[-1][1]
     assert "queue worker is OFF" in reply, reply
-    assert "tap ▶️ Run the queue" in reply, reply
+    assert "▶️ Run the queue" in reply, reply
+    assert "nothing goes out" in reply or "never run" in reply, reply
 
 
 @pytest.mark.asyncio
-async def test_the_waiting_run_is_written_on_the_screen_that_shows_the_pace() -> None:
-    """A run that will not start yet is only calm if it has a time on it; "queued" alone reads as a dead bot.
+async def test_the_sender_says_what_it_last_did_about_this_campaign() -> None:
+    """"Sending" is a claim about a process, so the screen quotes the process.
 
-    The number comes from the queue row's own `next_attempt_at`, not from a remembered value, so the screen
-    and the worker cannot disagree about when the campaign wakes up.
+    The loop keeps its own tally (`CampaignLoop.snapshot()`), and the screen prints it: sent, waiting, and
+    the delay in force. The old screen quoted a queue row's `next_attempt_at`, and when the row was not the
+    campaign's the operator got a number that described nothing.
     """
     control, api, db, _w = joinreq_bot(campaign={**CAMPAIGN_READY, "status": "running", "sent": 20})
-    db.job_row = {
-        "id": 20,
-        "status": "queued",
-        "in_seconds": 2400,
-        "last_error": "",
-        "attempts": 0,
-        "max_attempts": 8,
+    control.sender_state = lambda: {
+        "absent": False,
+        "running": True,
+        "campaigns": {"7": {"sent": 20, "waiting": 320, "gap": 3.0, "more": True}},
     }
 
     await control.dispatch(parse_update(_press(api, "x:/joinreq open #21")))
     text = api.sent[-1][1]
 
-    assert "wakes in about 40 minutes" in text, text
-    assert "job #20" in text, text
-    assert "nothing has to be tapped again" in text, text
+    assert "20 sent in its last batch" in text, text
+    assert "320 still waiting" in text, text
+    assert "one message every 3 s" in text, text
+
 
 @pytest.mark.asyncio
-async def test_a_campaign_with_no_run_scheduled_says_that_too() -> None:
-    """The other half: no row, no promise. "Tap Start and it runs until the list is empty" is what the
-    operator can actually do, and it is only true because the run re-arms its own wait."""
+async def test_a_campaign_that_is_on_with_no_sender_says_that_too() -> None:
+    """The one sentence the operator needed when the run stopped at twenty and nothing said why.
+
+    A campaign row that says `ready` and a service with no worker were two facts nobody joined up. Here the
+    screen joins them and names the tap that fixes it, because the other half of "it does not stop by itself"
+    is "unless the thing that sends it is off".
+    """
     control, api, db, _w = joinreq_bot(campaign={**CAMPAIGN_READY, "status": "ready"})
-    db.job_row = None
+    control.sender_state = lambda: {"absent": True}
 
     await control.dispatch(parse_update(_press(api, "x:/joinreq open #21")))
     text = api.sent[-1][1]
 
-    assert "nothing is scheduled for it right now" in text, text
-    assert "wakes in about" not in text, text
+    assert "no queue worker is running in this service" in text, text
+    assert "`/worker on`" in text, text
+    assert "wakes in about" not in text, "there is no timer to wait for any more"
+
+
+@pytest.mark.asyncio
+async def test_a_fault_in_the_last_pass_is_printed_rather_than_swallowed() -> None:
+    """A loop that caught an exception has to say so somewhere the operator will look.
+
+    The loop never dies and never blames a person for it, which is right, and it would be quietly wrong if
+    nothing showed: "it is on, nothing is happening, and the log is on another machine" is the report that
+    started this redesign. So the last fault rides on the campaign's own screen.
+    """
+    control, api, db, _w = joinreq_bot(campaign={**CAMPAIGN_READY, "status": "ready"})
+    control.sender_state = lambda: {
+        "absent": False,
+        "running": True,
+        "campaigns": {"7": {"error": "no Telegram session is open", "waiting": 320}},
+    }
+
+    await control.dispatch(parse_update(_press(api, "x:/joinreq open #21")))
+    text = api.sent[-1][1]
+
+    assert "last fault: no Telegram session is open" in text, text
+    assert "320 still waiting" in text, text
 
 
 @pytest.mark.asyncio
@@ -3927,105 +3904,6 @@ async def test_the_plan_prints_the_spacing_and_says_what_stops_the_run() -> None
     assert "one message every 30 seconds" in text, text
     assert "until the list is empty or you tap \u23f8 Stop after this one" in text, text
     assert "per hour" not in text, text
-
-
-@pytest.mark.asyncio
-async def test_a_typed_gap_line_writes_the_same_number_the_tap_would() -> None:
-    """Typed and tapped are the same command, so the typed path cannot quietly be the stricter one."""
-    control, api, db, _w = joinreq_bot(campaign={**CAMPAIGN_READY, "status": "ready"})
-
-    typed = text_of(await control._campaign(None, ["-1001234", "gap", "default", "12"]))
-
-    assert "one message every 12 seconds" in typed, typed
-    assert "A run writes up to 8 people at a time" in typed, typed
-    assert db.campaign["per_message_delay_seconds"] == 12, db.campaign
-    assert "keeps the spacing it started with" in typed, typed
-
-    silly = text_of(await control._campaign(None, ["-1001234", "gap", "default", "later"]))
-    assert "not a number of seconds" in silly, silly
-    assert db.campaign["per_message_delay_seconds"] == 12, db.campaign
-
-
-@pytest.mark.asyncio
-async def test_a_queued_row_that_no_worker_will_claim_is_called_what_it_is() -> None:
-    """"queued" is a promise only while `app.claim_next_job` will still take the row.
-
-    A run that has spent its tries is the queue's most misleading shape: the number on screen says the work
-    is there, the worker's own predicate says it is not, and the campaign waits for a tap nobody mentions.
-    So the screen says what the row is, and names the one tap that resets it — which is the same ✅ the
-    operator already knows, not a new thing to learn.
-    """
-    control, api, db, _w = joinreq_bot(campaign={**CAMPAIGN_READY, "status": "ready"})
-    db.job_row = {
-        "id": 22,
-        "status": "queued",
-        "in_seconds": 3000,
-        "last_error": "",
-        "attempts": 8,
-        "max_attempts": 8,
-    }
-
-    await control.dispatch(parse_update(_press(api, "x:/joinreq open #21")))
-    text = api.sent[-1][1]
-
-    assert "job #22 has spent its tries" in text, text
-    assert "\u2705 Yes, start sending" in text, text
-    assert "wakes in about" not in text, text
-
-@pytest.mark.asyncio
-async def test_a_job_that_is_actually_running_is_left_alone_and_shown() -> None:
-    """`held` is a real answer, and it has to be a *useful* one: the job's number and where to look.
-
-    Two runs of the same campaign at once is the outcome the dedup key exists to prevent — nobody wants a
-    stranger messaged twice because two taps raced. So nothing is queued here, and the screen says which job
-    is the run instead of pretending a new one started.
-    """
-    from app import joinmsg
-
-    control, api, db, _w = joinreq_bot(campaign=dict(CAMPAIGN_READY))
-    db.job_row = {
-        "id": 502,
-        "status": "running",
-        "last_error": "",
-        "attempts": 1,
-        "max_attempts": 8,
-    }
-    code = joinmsg.confirm_code(7, CAMPAIGN_READY["message_template"])
-
-    text = "\n".join(r.text for r in await control._campaign(None, ["-1001234", "confirm", "default", code]))
-
-    assert "job #502" in text and "`running`" in text, text
-    assert "/status" in text, text
-    assert db.revived == [], "a live job is not yanked out from under the worker"
-
-
-@pytest.mark.asyncio
-async def test_a_queued_job_with_no_tries_left_is_revived_rather_than_waited_on() -> None:
-    """A `queued` row that has spent `max_attempts` is a corpse, not work: it must look live to nothing.
-
-    `app.claim_next_job` skips it forever, so the operator's screen says queued and the queue says never.
-    The start tap resets the tries — and only the start tap does it, because a campaign that fails on a
-    loop should not be retried on a loop by whoever happens to be next to the queue.
-    """
-    from app import joinmsg
-
-    control, api, db, _w = joinreq_bot(campaign=dict(CAMPAIGN_READY))
-    db.job_row = {
-        "id": 503,
-        "status": "queued",
-        "last_error": "no Telegram session is open",
-        "attempts": 8,
-        "max_attempts": 8,
-    }
-    code = joinmsg.confirm_code(7, CAMPAIGN_READY["message_template"])
-
-    text = "\n".join(r.text for r in await control._campaign(None, ["-1001234", "confirm", "default", code]))
-
-    assert db.revived == [("campaign:7:run0",)], db.revived
-    assert "job #503" in text, text
-    assert "8 attempt" in text, text
-
-
 @pytest.mark.asyncio
 async def test_the_start_screen_names_the_switch_that_would_silence_it() -> None:
     """A queued job in a paused queue sends nothing, and 'queued' is the most misleading word available.

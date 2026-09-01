@@ -76,6 +76,11 @@ class RetryLater(Exception):
     The worker turns it into a failure with the delay Telegram named (and nothing but that delay):
     sleeping in the handler would tie up a lease and a retry loop, and shortening the wait would be
     the evasion the operator ruled out. The queue owns the clock.
+
+    Join-request campaigns are the exception, and deliberately so: they have no queue row and no lease, so
+    `app/campaignloop.py` sleeps this wait where it stands. That is the same courtesy to Telegram's number
+    with one fewer object that can go missing, and it is not a re-armed timer, which is the thing that used to
+    strand a campaign with nobody mentioned it.
     """
 
     def __init__(self, message: str, *, retry_after: int) -> None:
