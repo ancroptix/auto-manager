@@ -164,7 +164,7 @@ session at boot, if it restarts on its own.
 | `/declare <series> <season> <episodes>` | state how long a season is — the only thing that can fill **◎ Total Episodes**, and the only thing that can make a season count as complete. It publishes nothing itself; the batch post stays the publisher's decision. `/declare bleach 2 tba` takes the claim back |
 | `/card <channel> <message id\|show\|clear>` | the post in that destination channel whose link the announcements channel carries. `show` reports whether a shareable link was ever returned; `clear` un-names it (the stored link stays, because deleting is not this program's verb). One number, per channel: without it `publish_post` blocks rather than announcing the invite |
 | `/sticker <series> <season> from <channel> <message id>` | which sticker opens a season. Telegram addresses a sticker by the message carrying it, so a pack name or an install link is not an address; the job forwards that message into the destination before the season's first episode post |
-| `/campaign <channel> [new\|text\|plan\|confirm\|pause\|abort] <name>` | a join-request campaign, in two deliberate steps: `new` drafts it from the saved `/joinmsg` wording (or `text` writes its own), `plan` shows the rules, the rate and the pending count and prints a code, `confirm <name> <code>` makes it `ready` and queues the job. The code is derived from the row and its exact text, so editing the wording invalidates an old confirmation. `abort` stops it and leaves every row in place |
+| `/campaign <channel> [new\|text\|plan\|confirm\|pause\|abort] <name>` | a join-request campaign, in two deliberate steps: `new` drafts it from the saved `/joinmsg` wording (or `text` writes its own), `plan` shows the rules, the rate and the pending count and prints a code, `confirm <name> <code>` makes it `ready` and queues the job. The code is derived from the row and its exact text, so editing the wording invalidates an old confirmation. `abort` stops it and leaves every row in place. Confirm never says "queued" without checking what the queue did with it: `app/job` dedupes on a **globally unique** `dedup_key`, so the row a finished run leaves behind used to swallow every later start of the same campaign — the reply read "the job is already queued" and no DM ever went out. `app.writers.queue_campaign_run` now answers in four parts: a new row (`queued`), the closed row put back on the queue (`restarted`, and it names what it was), a live job left alone because it *is* the run (`held`), and a `blocked` job that stays a question until a person taps (`waiting`). A start tap also resets a `queued` row that had spent all its `max_attempts`, which otherwise sits in the queue looking like work no worker will ever claim. Every one of those replies ends with the four switches that can each silence a campaign on their own — the pause flag, `APP_MODE`, `WORKER_ENABLED`, and an account with no stored session — printed only when they are actually wrong, each with the command that fixes it |
 | `/sessions` | name, kind, account, age, character count — never contents |
 | `/use backup` | make another stored session the live one |
 | `/forget spare` | delete the row |
@@ -317,8 +317,11 @@ look could hold prints both numbers, because "250 waiting, 3 read" is true and "
 writes to **one person every 3 seconds** and stops at 20 per run so a run cannot outlive its job lease; the
 rest is handed to the next run under a key counted by the contacts already recorded, which is the same key the
 boot sweep uses, so a Render spin-down resumes a half-sent list instead of stranding it — and the two paths
-cannot queue the same send twice. `⏸ Stop` pauses after the message in flight; what was sent stays sent, and
-nothing in this flow approves or declines a join request.
+cannot queue the same send twice — and neither path is allowed to be swallowed by a key a closed run still
+holds, because both call the same `app.writers.queue_campaign_run`, which revives what nobody owns and leaves
+what a worker does own alone. That is also why the boot sweep resumes a campaign whose last run ended without
+a live job: it re-queues the *same* row instead of writing a second one. `⏸ Stop` pauses after the message in
+flight; what was sent stays sent, and nothing in this flow approves or declines a join request.
 
 A destination's own screen is where the announcement is built: what it publishes, the card post a shareable
 link is made from and whether one was ever returned, the three in-place taps, `📣 Campaigns` and

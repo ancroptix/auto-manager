@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from types import SimpleNamespace  # the campaign fake hands out input entities, like the real read does
 
 import pytest
 
@@ -319,7 +320,13 @@ class CampaignSender:
     def __init__(self, *, action: str = "sent", total: int | None = None) -> None:
         self.action = action
         self.sent: list[tuple[str, str]] = []
+        self.peers: list[object] = []
         self._total = total
+        self._hash = 911
+
+    def set_hash(self, value: int | None) -> None:
+        """Whether the read hands out a usable address for the people it returns."""
+        self._hash = value
 
     async def pending_requests(self, peer, *, limit: int = 100, skip=(), **kwargs):
         # `skip` is honoured the way the real read honours it: the known ids are walked past rather than
@@ -327,7 +334,13 @@ class CampaignSender:
         # every time. `total` is the queue's size, and it is deliberately larger than what a page holds.
         known = {int(one) for one in skip}
         rows = [
-            {"user_id": 900 + n, "about": "", "date": "", "approved_by": None}
+            {
+                "user_id": 900 + n,
+                "about": "",
+                "date": "",
+                "approved_by": None,
+                **({"input_user": SimpleNamespace(user_id=900 + n, access_hash=self._hash)} if self._hash else {}),
+            }
             for n in range(self._waiting)
             if 900 + n not in known
         ][:limit]
@@ -340,6 +353,9 @@ class CampaignSender:
         self._waiting = count
 
     async def send_text(self, peer, text: str, **kwargs):
+        # `peers` keeps the object as it arrived: which spelling a campaign addresses a stranger by is a
+        # fact the string form hides, and it is the fact that decides whether the DM can be sent at all.
+        self.peers.append(peer)
         self.sent.append((str(peer), text))
         return sender.Result(ok=True, action=self.action, detail="sent")
 
@@ -388,7 +404,35 @@ async def test_a_campaign_writes_to_one_person_every_three_seconds(monkeypatch) 
     assert closing and closing[-1][1] == "completed" and closing[-1][2] is True, closing
 
 
-@pytest.mark.asyncio
+def test_the_boot_sweep_queues_through_the_same_helper() -> None:
+    """The restart path has to revive too, or a campaign stays dead until somebody edits the table.
+
+    `RESUMABLE_CAMPAIGNS_SQL` asks only whether a *live* job exists, so on its own it re-enqueues a
+    campaign whose key is held by a closed row and lets the unique index swallow it — the same silence,
+    arriving from a different direction. This asserts the call is there, because the behaviour only shows
+    up on a deployment that restarted, and a suite cannot reproduce a restart.
+    """
+    import ast
+    import inspect
+    import pathlib
+
+    from app import handlers as handlers_module
+    from app.writers import queue_campaign_run  # noqa: F401  (the symbol must exist for the name to mean anything)
+
+    tree = ast.parse(pathlib.Path(inspect.getsourcefile(handlers_module)).read_text(encoding="utf-8"))
+    wanted = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "reconciliation"
+    )
+    called = {
+        node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", "")
+        for node in ast.walk(wanted)
+        if isinstance(node, ast.Call)
+    }
+    assert "queue_campaign_run" in called, sorted(called)
+    assert "enqueue" not in called, "a bare enqueue is the version that swallows a closed campaign's key"
+
+
 async def test_a_queue_bigger_than_the_pages_is_not_reported_as_finished(monkeypatch) -> None:
     """Nothing may be called "nobody is waiting" because this run's read came back with no new rows.
 
@@ -414,6 +458,170 @@ async def test_a_queue_bigger_than_the_pages_is_not_reported_as_finished(monkeyp
     assert not [
         sql for sql, _ in db.sql if "insert into app.join_campaign_contact" in sql
     ], "an unreachable tail is not an excuse to write to anyone twice"
+
+
+class QueueDb:
+    """One `app.job` row, one unique key, and the two statements a start is made of.
+
+    The shape that matters is the one that made a campaign unstartable in production: `app.enqueue_job`
+    collides on `dedup_key text not null unique`, so the closed row a finished run leaves behind swallows
+    every later insert of the same key. A fake that always let the insert succeed could not tell "queued"
+    from "silently ignored", and that is the whole difference the operator experienced.
+    """
+
+    def __init__(self, *, holder: dict | None = None, revive_matches: bool = True) -> None:
+        self.holder = holder
+        self.revive_matches = revive_matches
+        self.queued: list[tuple[str, str]] = []
+        self.revived: list[tuple] = []
+        self.reads: list[tuple] = []
+        self.sql: list[tuple[str, tuple]] = []
+
+    async def enqueue(self, kind: str, dedup_key: str, **kwargs):
+        self.queued.append((kind, dedup_key))
+        if self.holder is not None:
+            return None
+        return {"id": 900 + len(self.queued)}
+
+    async def fetchrow(self, statement: str, *args):
+        if "from app.job where dedup_key" in statement:
+            self.reads.append(args)
+            return dict(self.holder) if self.holder else None
+        if "update app.job set status = 'queued'" in statement:
+            self.sql.append((statement, args))
+            if self.holder and self.revive_matches:
+                self.revived.append(args)
+                return {"id": int(self.holder.get("id") or 7), "status": "queued"}
+            return None
+        raise AssertionError(f"the queue helper sent SQL this fake does not model: {statement[:60]}")
+
+
+def _queued(status: str, *, attempts: int = 1, ceiling: int = 8, why: str = "") -> QueueDb:
+    return QueueDb(holder={"id": 77, "status": status, "last_error": why, "attempts": attempts,
+                           "max_attempts": ceiling})
+
+
+@pytest.mark.asyncio
+async def test_a_new_run_is_queued_under_the_key_that_counts_the_contacts() -> None:
+    """The fresh case, spelled out so the other four are measured against something honest."""
+    from app.writers import queue_campaign_run
+
+    db = QueueDb()
+    out = await queue_campaign_run(db, campaign_id=7, destination_id=21, contacts=3)
+
+    assert out["how"] == "queued" and out["job_id"] == 901, out
+    assert db.queued == [("join_request_campaign", "campaign:7:run3")], db.queued
+    assert db.revived == []
+
+
+@pytest.mark.asyncio
+async def test_a_closed_run_is_put_back_on_the_queue_instead_of_swallowing_the_start() -> None:
+    """`succeeded`, `failed` and `cancelled` are all states nobody owns: a start tap may reuse the row.
+
+    Reusing rather than inserting keeps the one promise the campaign lives or dies by — nobody is messaged
+    twice — because there is still exactly one queue row per campaign run, and the contacts table is what
+    decides who has been told.
+    """
+    from app.writers import queue_campaign_run
+
+    for status in ("succeeded", "failed", "cancelled"):
+        db = _queued(status, why="the link list could not be read")
+        out = await queue_campaign_run(db, campaign_id=7, destination_id=21, contacts=0, as_start=True)
+        assert out["how"] == "restarted", (status, out)
+        assert out["was"] == status and out["job_id"] == 77, out
+        assert db.revived == [("campaign:7:run0",)], status
+
+
+@pytest.mark.asyncio
+async def test_a_blocked_run_waits_for_a_person_and_not_for_a_scheduler() -> None:
+    """`blocked` means a question was put to a human, so only the operator's own tap reopens it.
+
+    The asymmetry is the point: the boot sweep and a run's own hand-off both call the same helper, and both
+    must leave a blocked job alone, while the same state is reopened by the confirm tap. A campaign that
+    stopped because its wording broke a rule must not be running again because the service restarted.
+    """
+    from app.writers import queue_campaign_run
+
+    automatic = _queued("blocked", why="the campaign text breaks a rule")
+    out = await queue_campaign_run(automatic, campaign_id=7, contacts=0)
+    assert out["how"] == "waiting" and "breaks a rule" in out["why"], out
+    assert automatic.revived == [], "an automatic pass must not answer a question asked of a human"
+
+    started = _queued("blocked", why="the campaign text breaks a rule")
+    again = await queue_campaign_run(started, campaign_id=7, contacts=0, as_start=True)
+    assert again["how"] == "restarted", again
+    assert started.revived == [("campaign:7:run0",)], started.revived
+
+
+@pytest.mark.asyncio
+async def test_a_live_job_is_held_rather_than_hijacked() -> None:
+    """`queued` and `running` with tries left belong to the worker; a second row for the same campaign is what the key exists to stop."""
+    from app.writers import queue_campaign_run
+
+    for status in ("queued", "running"):
+        db = _queued(status)
+        out = await queue_campaign_run(db, campaign_id=7, contacts=0, as_start=True)
+        assert out["how"] == "held" and out["was"] == status, (status, out)
+        assert db.revived == [] and db.sql == [], status
+
+
+@pytest.mark.asyncio
+async def test_a_run_that_vanished_between_two_statements_promises_nothing() -> None:
+    """The key was taken a moment ago and its row is gone now: say so, rather than reporting a queue."""
+    from app.writers import queue_campaign_run
+
+    # The race, made explicit: `enqueue` is refused as if a row held the key, and that row is gone by the
+    # time it is read back (a cleanup, a replica lag). Neither "queued" nor "already running" is true.
+    db = QueueDb(holder={"id": 78, "status": "succeeded", "last_error": "", "attempts": 1, "max_attempts": 8})
+    original = db.fetchrow
+
+    async def _gone(statement, *args):
+        if "from app.job where dedup_key" in statement:
+            return None
+        return await original(statement, *args)
+
+    db.fetchrow = _gone
+    out = await queue_campaign_run(db, campaign_id=7, contacts=0, as_start=True)
+    assert out["how"] == "unknown" and out["job_id"] is None, out
+
+
+@pytest.mark.asyncio
+async def test_a_campaign_addresses_people_by_the_handle_telegram_gave(monkeypatch) -> None:
+    """The DM goes to the `InputUser` the queue read carried, not to the bare id the contact row stores.
+
+    `get_entity(900)` answers for a person the account has met and fails for one it has not, and a join
+    request is by definition somebody the account has only seen in a queue. Sending by id worked in every
+    test because every test's fake accepts anything, so this asserts the object the transport was called
+    with — the only place the difference between the two spellings can be seen.
+    """
+    db = CampaignDb(waiting=2, rate=1000)
+    handlers = _campaign_writers(db, outbound=True)
+    handlers.transport.set_hash(911)
+
+    result = await handlers.join_request_campaign({"campaign_id": 7}, None)
+
+    assert result["sent"] == 2, result
+    assert [getattr(peer, "access_hash", None) for peer in handlers.transport.peers] == [911, 911], (
+        handlers.transport.peers
+    )
+    assert [peer.user_id for peer in handlers.transport.peers] == [900, 901], handlers.transport.peers
+    assert db.queued == [], "every waiting person fitted in the batch, so there is no next run"
+
+
+async def test_a_campaign_without_a_hash_still_uses_the_id_it_has(monkeypatch) -> None:
+    """No hash is not a crash: the id is tried, and a refusal comes back as a failed contact, not a lost row.
+
+    The contact is recorded *before* the send, so a person the account cannot address is left as `failed`
+    with the reason, rather than being retried into a second message if the session later learns them.
+    """
+    db = CampaignDb(waiting=1, rate=1000)
+    handlers = _campaign_writers(db, outbound=True)
+    handlers.transport.set_hash(None)
+
+    result = await handlers.join_request_campaign({"campaign_id": 7}, None)
+
+    assert result["sent"] == 1, result
+    assert handlers.transport.peers == [900], handlers.transport.peers
 
 
 async def test_a_run_stops_at_the_lease_and_hands_the_rest_to_the_next_one(monkeypatch) -> None:
@@ -449,11 +657,15 @@ async def test_a_run_stops_at_the_lease_and_hands_the_rest_to_the_next_one(monke
 
 
 @pytest.mark.asyncio
-async def test_a_shadow_run_does_not_pace_itself(monkeypatch) -> None:
+async def test_a_shadow_run_plans_without_recording_anybody(monkeypatch) -> None:
     """Nothing goes on the wire in shadow mode, so sleeping between plans would only make a dry run slow.
 
-    The count is still spent the way a live run spends it — the ceiling has to be honest about what this
-    plan would cost — but the gap exists to protect real messages from looking like a flood.
+    The part that matters more than the pacing: a dry run writes **no contact rows**. Those rows are what
+    promise "this person has been told, do not write again", and a campaign dry-run once in shadow mode used
+    to leave twenty strangers recorded as contacted while their inboxes stayed empty — then every later live
+    run skipped exactly those people and the operator watched a number that never moved. A plan is a plan:
+    counted in the reply, absent from the table, and the campaign goes back to `ready` for a real tap instead
+    of queueing itself around and around.
     """
     from app import writers as writers_module
 
@@ -464,12 +676,18 @@ async def test_a_shadow_run_does_not_pace_itself(monkeypatch) -> None:
         return None
 
     db = CampaignDb(waiting=4, rate=100)
-    handlers = _campaign_writers(db, outbound=False, action="planned")
+    handlers = _campaign_writers(db, outbound=False, action="planned")  # the shadow knob, not a fake
 
     result = await handlers.join_request_campaign({"campaign_id": 7}, None)
 
     assert slept == []
-    assert result["sent"] == 4, "planned sends are counted, which is what keeps the ceiling honest"
+    assert result["planned"] == 4 and result["sent"] == 0, result
+    assert result["shadow"] == "nothing was sent, so nobody is recorded as contacted", result
+    assert not [sql for sql, _ in db.sql if "insert into app.join_campaign_contact" in sql], (
+        "a dry run wrote contacts it never messaged"
+    )
+    assert not [sql for sql, _ in db.sql if "'completed'" in sql], "a plan completed a campaign it only read"
+    assert db.queued == [], "a shadow run must not hand itself to the next run and re-read forever"
 
 
 def test_the_resume_key_counts_contacts_instead_of_trying_again() -> None:

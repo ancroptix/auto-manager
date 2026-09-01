@@ -94,6 +94,12 @@ class FakeDb:
         self.blocked = blocked or []
         self.audit: list[tuple[str, tuple]] = []
         self.paused: list[tuple[bool, str | None]] = []
+        # `app.job` as the campaign queue sees it: one row holding one dedup key. Setting it is how a test
+        # says "the key is taken", and it changes `enqueue`'s answer too, because in the real schema the
+        # unique constraint is what makes the insert a no-op — a fake that let both be true at once would
+        # let a test pass on a state the database cannot be in.
+        self.job_row: dict | None = None
+        self.revived: list[tuple] = []
         self.queued: list[tuple[str, Any, int]] = []
         self.leases_released = 0
         self.review_count = 2
@@ -290,6 +296,19 @@ class FakeDb:
             return {"paused": paused[0], "reason": paused[1] or "", "last_reconcile_at": None}
         if "insert into app.telegram_session" in sql:
             return dict(self.stored[-1]) if self.stored else None
+        if "from app.job where dedup_key" in sql:
+            return dict(self.job_row) if self.job_row else None
+        if "update app.job set status = 'queued'" in sql:
+            # The UPDATE carries its own guard (`not live, or out of tries`) for the race between the two
+            # statements, and the fake honours it: a live row is not revived by a start tap.
+            self.writes.append((sql, args))
+            if self.job_row and (
+                str(self.job_row.get("status")) not in ("queued", "running")
+                or int(self.job_row.get("attempts") or 0) >= int(self.job_row.get("max_attempts") or 0) > 0
+            ):
+                self.revived.append(args)
+                return {"id": int(self.job_row.get("id") or 7), "status": "queued"}
+            return None
         return {"id": 42}
 
     @staticmethod
@@ -516,6 +535,8 @@ class FakeDb:
 
     async def enqueue(self, kind: str, dedup_key: str, *, stage=None, payload=None, priority=100, **kw):
         self.queued.append((kind, payload, priority))
+        if self.job_row and str(self.job_row.get("dedup_key") or dedup_key) == dedup_key:
+            return None  # `on conflict (dedup_key) do nothing`: the row that holds the key wins
         return {"id": 42}
 
 
@@ -3506,6 +3527,123 @@ async def test_the_plan_shows_the_queue_and_not_just_the_page(monkeypatch) -> No
     assert "250 join request(s) are waiting right now" in text, text
     assert "this look reached 3 of them" in text, text
     assert "in batches rather than all at once" in text, text
+
+
+CAMPAIGN_READY = {
+    "id": 7,
+    "name": "default",
+    "status": "draft",
+    "message_template": "{name}, aapka request dekh liya jaa raha hai",
+    "rate_per_hour": 20,
+    "confirm_required": True,
+}
+
+
+@pytest.mark.asyncio
+async def test_a_start_tap_revives_the_run_that_stole_its_own_key() -> None:
+    """**The silence this pins: "the job is already queued", and no DM ever goes out.**
+
+    `app.enqueue_job` collapses on a globally unique `dedup_key`, so the row a finished run leaves behind
+    keeps that key for good. The campaign's own start used the same key every time, which made every start
+    after the first one a no-op with a reassuring sentence on top — the operator saw the waiting count,
+    tapped Start, and the spare account stayed quiet forever. A closed row is therefore put back on the
+    queue, and the reply names the job and what it was before.
+    """
+    from app import joinmsg
+
+    control, api, db, _w = joinreq_bot(campaign=dict(CAMPAIGN_READY))
+    db.job_row = {
+        "id": 501,
+        "dedup_key": None,  # any key: the fake's `job_row` means "this insert is the one being swallowed"
+        "status": "succeeded",
+        "last_error": "",
+        "attempts": 2,
+        "max_attempts": 8,
+    }
+    code = joinmsg.confirm_code(7, CAMPAIGN_READY["message_template"])
+
+    text = "\n".join(r.text for r in await control._campaign(None, ["-1001234", "confirm", "default", code]))
+
+    assert "back in the queue" in text, text
+    assert "job #501" in text, text
+    assert "already queued" not in text, "the sentence that hid the silence must not come back"
+    assert db.revived == [("campaign:7:run0",)], db.revived
+    assert db.campaign["status"] == "ready", db.campaign
+
+
+@pytest.mark.asyncio
+async def test_a_job_that_is_actually_running_is_left_alone_and_shown() -> None:
+    """`held` is a real answer, and it has to be a *useful* one: the job's number and where to look.
+
+    Two runs of the same campaign at once is the outcome the dedup key exists to prevent — nobody wants a
+    stranger messaged twice because two taps raced. So nothing is queued here, and the screen says which job
+    is the run instead of pretending a new one started.
+    """
+    from app import joinmsg
+
+    control, api, db, _w = joinreq_bot(campaign=dict(CAMPAIGN_READY))
+    db.job_row = {
+        "id": 502,
+        "status": "running",
+        "last_error": "",
+        "attempts": 1,
+        "max_attempts": 8,
+    }
+    code = joinmsg.confirm_code(7, CAMPAIGN_READY["message_template"])
+
+    text = "\n".join(r.text for r in await control._campaign(None, ["-1001234", "confirm", "default", code]))
+
+    assert "job #502" in text and "`running`" in text, text
+    assert "/status" in text, text
+    assert db.revived == [], "a live job is not yanked out from under the worker"
+
+
+@pytest.mark.asyncio
+async def test_a_queued_job_with_no_tries_left_is_revived_rather_than_waited_on() -> None:
+    """A `queued` row that has spent `max_attempts` is a corpse, not work: it must look live to nothing.
+
+    `app.claim_next_job` skips it forever, so the operator's screen says queued and the queue says never.
+    The start tap resets the tries — and only the start tap does it, because a campaign that fails on a
+    loop should not be retried on a loop by whoever happens to be next to the queue.
+    """
+    from app import joinmsg
+
+    control, api, db, _w = joinreq_bot(campaign=dict(CAMPAIGN_READY))
+    db.job_row = {
+        "id": 503,
+        "status": "queued",
+        "last_error": "no Telegram session is open",
+        "attempts": 8,
+        "max_attempts": 8,
+    }
+    code = joinmsg.confirm_code(7, CAMPAIGN_READY["message_template"])
+
+    text = "\n".join(r.text for r in await control._campaign(None, ["-1001234", "confirm", "default", code]))
+
+    assert db.revived == [("campaign:7:run0",)], db.revived
+    assert "job #503" in text, text
+    assert "8 attempt" in text, text
+
+
+@pytest.mark.asyncio
+async def test_the_start_screen_names_the_switch_that_would_silence_it() -> None:
+    """A queued job in a paused queue sends nothing, and 'queued' is the most misleading word available.
+
+    Four settings can each stop a campaign on its own — the pause switch, the mode, the worker being off in
+    this service, and an account with no stored session. The screen reads all four, and prints only the ones
+    that are actually wrong, each with the tap that fixes it.
+    """
+    from app import joinmsg
+
+    control, api, db, _w = joinreq_bot(campaign=dict(CAMPAIGN_READY))
+    await db.set_paused(True, "nightly maintenance")
+    code = joinmsg.confirm_code(7, CAMPAIGN_READY["message_template"])
+
+    text = "\n".join(r.text for r in await control._campaign(None, ["-1001234", "confirm", "default", code]))
+
+    assert "queue is PAUSED (nightly maintenance)" in text, text
+    assert "/resume" in text, text
+    assert "no Telegram session is active" in text, text
 
 
 @pytest.mark.asyncio

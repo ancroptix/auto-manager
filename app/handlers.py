@@ -49,7 +49,7 @@ RESUMABLE_CAMPAIGNS_SQL = (
 )
 from .keys import archive_key
 from .stages import JobKind, JobStage
-from .writers import FeatureNotImplemented, NeedsInput, build_writers
+from .writers import FeatureNotImplemented, NeedsInput, build_writers, queue_campaign_run
 
 log = logging.getLogger("auto_manager.handlers")
 
@@ -199,19 +199,20 @@ async def reconciliation(job: dict[str, Any], ctx: Context) -> dict[str, Any]:
     # the operator believes people are being written to, and they are not. Same key as the runner's own
     # hand-off, so the two paths cannot queue the same run twice.
     try:
-        from . import keys  # noqa: PLC0415
-        from .stages import JobKind, JobStage  # noqa: PLC0415
-
         resumed = 0
         for row in list(await ctx.db.fetch(RESUMABLE_CAMPAIGNS_SQL) or []):
-            queued = await ctx.db.enqueue(
-                JobKind.JOIN_REQUEST_CAMPAIGN.value,
-                keys.campaign_run_key(int(row["id"]), int(row.get("contacts") or 0)),
-                stage=JobStage.DISCOVERED,
-                payload={"campaign_id": int(row["id"]), "destination_id": row.get("destination_id")},
+            # Through `app.writers.queue_campaign_run` rather than a bare `enqueue`, because the query above
+            # asks only whether a *live* job exists: a campaign whose last run closed with the same key would
+            # otherwise be skipped forever, and "the service restarted and now it will never send" is the
+            # silence this whole path exists to prevent. A boot does not reopen a `blocked` job — that is the
+            # operator's tap, not the scheduler's.
+            run = await queue_campaign_run(
+                ctx.db,
+                campaign_id=int(row["id"]),
                 destination_id=row.get("destination_id"),
+                contacts=int(row.get("contacts") or 0),
             )
-            resumed += 1 if queued else 0
+            resumed += 1 if run["how"] in ("queued", "restarted") else 0
         if resumed:
             log.info("reconciliation: %s join-request campaign run(s) queued", resumed)
             result["campaigns_resumed"] = resumed

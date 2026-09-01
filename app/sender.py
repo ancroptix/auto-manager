@@ -295,6 +295,14 @@ class Sender:
         sentence about the channel instead of a Telethon ValueError deep inside a send — and it is a
         read, so it costs no write budget and never happens in shadow mode.
         """
+        # An object that already carries an access hash *is* an input entity, and looking one up again is
+        # how a campaign dies in the middle of a stranger list: the queue read is the only place Telegram
+        # hands the hash out, and `get_entity(900123)` on a person this account has never otherwise met
+        # answers "Cannot find any entity corresponding to …" — twenty of those, one per contact.
+        if getattr(peer, "access_hash", None) is not None and (
+            getattr(peer, "user_id", None) is not None or getattr(peer, "channel_id", None) is not None
+        ):
+            return peer, None
         target = resolve_peer(peer)
         if not target:
             return target, "no peer was named"
@@ -641,6 +649,9 @@ class Sender:
                     break
                 importers = list(getattr(found, "importers", []) or [])
                 totals.append(int(getattr(found, "count", 0) or 0))
+                # Whoever this page mentioned, by id: the hashes come back with the rows so a caller can
+                # address the person instead of hoping the session remembers them.
+                hashes = _access_hashes(list(getattr(found, "users", []) or []))
                 if not importers:
                     break
                 last = importers[-1]
@@ -651,14 +662,18 @@ class Sender:
                     seen.add(user_id)
                     if user_id in known:
                         continue
-                    rows.append(
-                        {
-                            "user_id": user_id,
-                            "about": str(_field(importer, "about", "") or ""),
-                            "date": str(_field(importer, "date", "") or ""),
-                            "approved_by": _field(importer, "approved_by", None),
-                        }
-                    )
+                    row: dict[str, Any] = {
+                        "user_id": user_id,
+                        "about": str(_field(importer, "about", "") or ""),
+                        "date": str(_field(importer, "date", "") or ""),
+                        "approved_by": _field(importer, "approved_by", None),
+                    }
+                    stamp = hashes.get(user_id)
+                    if stamp is not None:
+                        from telethon import types as _types  # noqa: PLC0415
+
+                        row["input_user"] = _types.InputUser(user_id=user_id, access_hash=stamp)
+                    rows.append(row)
                 if len(importers) < 100:
                     break  # the short page is the end of this link's queue
                 # The offset has to be a date the server can encode, so a row that carries no real one (a
@@ -714,6 +729,22 @@ def _link_spellings(link: Any) -> list[str]:
     return list(dict.fromkeys([tail.lstrip("+"), tail] if tail.startswith("+") else [tail]))
 
 
+def _access_hashes(users: Sequence[Any]) -> dict[int, int]:
+    """The access hashes a response carried, by user id — the only spelling Telegram addresses a stranger by.
+
+    `ChatInviteImporters.users` and `ExportedChatInvites.users` exist for this purpose: the rows name people
+    by id, and an id alone is neither a peer you can message nor a page you can continue after. The response
+    that answers the query is the one that knows who those people are.
+    """
+    out: dict[int, int] = {}
+    for one in users:
+        found_id = int(getattr(one, "id", None) or getattr(one, "user_id", 0) or 0)
+        stamp = getattr(one, "access_hash", None)
+        if found_id and stamp is not None:
+            out[found_id] = int(stamp)
+    return out
+
+
 def _input_user(user_id: Any, users: Sequence[Any]) -> Any:
     """`InputUser` for the last reader on a page, because the next page has to name one to start after.
 
@@ -724,13 +755,10 @@ def _input_user(user_id: Any, users: Sequence[Any]) -> Any:
     from telethon import types  # noqa: PLC0415
 
     wanted = int(user_id or 0)
-    for one in users:
-        # `types.User` spells the number `id`, and anything already input-shaped spells it `user_id`;
-        # `types.InputUser` itself takes `user_id`, which is not the name a response carries.
-        found_id = int(getattr(one, "id", None) or getattr(one, "user_id", 0) or 0)
-        if found_id == wanted and getattr(one, "access_hash", None) is not None:
-            return types.InputUser(user_id=wanted, access_hash=int(one.access_hash))
-    return None
+    stamp = _access_hashes(users).get(wanted)
+    if stamp is None:
+        return None
+    return types.InputUser(user_id=wanted, access_hash=stamp)
 
 
 _TIMEOUT = 45.0

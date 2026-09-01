@@ -458,6 +458,46 @@ class ControlBot:
         finally:
             await wrapper.stop()
 
+    async def _campaign_watch(self) -> list[str]:
+        """The reasons a queued run would still send nothing, each with the tap that fixes it.
+
+        A start screen that says "queued" while the queue is paused is worse than one that refuses: the
+        operator waits, sees no DMs, and has no way to know that the job is sitting in a table on purpose.
+        Four things can each silence a campaign on their own — the pause switch, the deployment's mode, the
+        worker being off in this service, and an account with no stored session — so all four are read here,
+        and the line is printed only when it is actually a problem. Nothing in this method writes anything.
+        """
+        lines: list[str] = []
+        state = None
+        try:
+            state = await self.db.fetchrow(_SERVICE_STATE_SQL)
+        except Exception:  # noqa: BLE001  - a screen must not die over a status read
+            state = None
+        if state and state.get("paused"):
+            reason = str(state.get("reason") or "").strip()
+            lines.append(
+                "• the queue is PAUSED" + (f" ({reason[:80]})" if reason else "") + " — no job is claimed."
+                " /resume starts claiming again"
+            )
+        if not getattr(self.settings, "outbound_enabled", False):
+            lines.append("• mode: shadow — nothing is sent from this service, only planned")
+        if not bool(getattr(self.settings, "worker_enabled", True)):
+            lines.append(
+                "• this service has its queue worker OFF, so jobs are written and never run"
+                " (WORKER_ENABLED is what turns it on)"
+            )
+        rows: list = []
+        try:
+            rows = list(await list_sessions(self.db) or [])
+        except Exception:  # noqa: BLE001  - same reason: a status read
+            rows = []
+        if not any(bool(row.get("active")) for row in rows):
+            lines.append(
+                "• no Telegram session is active for this service, so a send has nothing to go out on."
+                " /sessions shows them, /login <name> +<phone> adds one"
+            )
+        return lines
+
     async def _pending_requests(self, peer: str) -> tuple[int | None, int | None, str | None]:
         """How many join requests are waiting, how many this look could read, and why if neither.
 
@@ -2282,8 +2322,7 @@ class ControlBot:
         because reading a list is not a write; sending still needs `confirm`, and the sending itself
         plans and blocks until the deployment is live.
         """
-        from . import joinmsg, keys  # noqa: PLC0415
-        from .stages import JobKind, JobStage  # noqa: PLC0415
+        from . import joinmsg  # noqa: PLC0415
 
         if self.db is None or not getattr(self.db, "connected", False):
             return [Reply("the database is not reachable, so I cannot draft a campaign.")]
@@ -2421,21 +2460,63 @@ class ControlBot:
                     "update app.join_campaign set status = 'ready', updated_at = now() where id = $1",
                     int(campaign["id"]),
                 )
-                queued = await self.db.enqueue(
-                    JobKind.JOIN_REQUEST_CAMPAIGN.value,
-                    keys.campaign_key(int(destination["id"]), str(campaign["name"])),
-                    stage=JobStage.DISCOVERED,
-                    payload={"campaign_id": int(campaign["id"]), "destination_id": int(destination["id"])},
-                    destination_id=int(destination["id"]),
-                )
-                return [Reply(
-                    f"`{name}` is ready and the job is {'queued' if queued else 'already queued'}. "
-                    + (
-                        "In shadow mode each message plans and blocks, which is the read-only version "
-                        "of this run."
-                        if not getattr(self.settings, "outbound_enabled", False)
-                        else "It will send at the campaign's own rate and stop at the ceiling."
+                from .writers import queue_campaign_run  # noqa: PLC0415  (the queue row's owner is there)
+
+                contacts = int(
+                    await self.db.fetchval(
+                        "select count(*) from app.join_campaign_contact where campaign_id = $1",
+                        int(campaign["id"]),
                     )
+                    or 0
+                )
+                run = await queue_campaign_run(
+                    self.db,
+                    campaign_id=int(campaign["id"]),
+                    destination_id=int(destination["id"]),
+                    contacts=contacts,
+                    as_start=True,
+                )
+                how = run.get("how")
+                number = run.get("job_id")
+                who = f"job #{number}" if number else "the queue row for this campaign"
+                if how == "queued":
+                    head = f"`{name}` is ready and {who} is in the queue."
+                elif how == "restarted":
+                    head = (
+                        f"`{name}` is ready. Nothing was started earlier because {who} was still sitting in "
+                        f"the queue table as `{run.get('was')}`, and that is what was swallowing every tap. "
+                        "I put that same job back in the queue."
+                    )
+                elif how == "held":
+                    head = (
+                        f"`{name}` is ready, and {who} is `{run.get('was')}` right now — so nothing new was "
+                        "started, because that job *is* this campaign's run. /status shows what it has done."
+                    )
+                elif how == "waiting":
+                    head = (
+                        f"`{name}` is ready, but {who} stopped with a question for you: {run.get('why') or 'no reason recorded'}. "
+                        "Answer that and start it again; the job goes back in the queue by itself."
+                    )
+                else:
+                    head = (
+                        f"`{name}` is ready, and the queue row that held this campaign vanished between the "
+                        "two statements, so nothing was promised either way. Tap Start sending once more."
+                    )
+                people = (
+                    f"\n{contacts} person(s) already carry a record under this campaign, and they will not "
+                    "be written to twice."
+                    if contacts
+                    else ""
+                )
+                watch = await self._campaign_watch()
+                return [Reply(
+                    f"{head}{people}\n\n"
+                    + (
+                        "It will send at the campaign's own rate and stop at the ceiling."
+                        if getattr(self.settings, "outbound_enabled", False)
+                        else "In shadow mode each message plans and blocks, which is the read-only version of this run."
+                    )
+                    + (("\n\n" + "\n".join(watch)) if watch else "")
                 )]
 
             status = {"pause": "paused", "abort": "aborted"}[action]

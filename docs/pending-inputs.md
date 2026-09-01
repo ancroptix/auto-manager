@@ -203,7 +203,11 @@ The list below is the residual — what still stops each kind from completing, i
   `/joinmsg`, and stops at `campaign.rate_per_hour` by pausing the campaign rather than pushing past
   it. A campaign runs only after `/campaign … confirm <code>` — or after the plan and the start tap on
   `/joinreq`, which computes that code instead of asking you to type it, and paces one person every 3
-  seconds so a restart can resume the list.
+  seconds so a restart can resume the list. A shadow run plans and records **nobody**: `app.join_campaign_contact`
+  is the promise that a person is not written to twice, so writing it for a message that never left the
+  account would take those people out of every later live run. The queue row a finished run leaves behind is
+  put back on the queue by the next start (`app.writers.queue_campaign_run`), because `app/job` dedupes on a
+  globally unique key and a closed row used to swallow every retry.
 
 Three config rows carry the switches that decide the rest: `publish.route` (who presses send),
 `announcement.style` (how the notice is rendered, because the sampled posts were read and not asked

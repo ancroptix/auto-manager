@@ -896,6 +896,133 @@ JOIN_SEND_GAP_SECONDS = 3.0
 JOIN_MAX_PER_RUN = 20
 
 
+#: The job states that mean "this row is done with". `queued` and `running` are the two that mean a worker
+#: still owns it, and the difference decides whether a new run can be written at all.
+CLOSED_JOB_STATES: tuple[str, ...] = ("succeeded", "failed", "cancelled")
+
+#: What holds a campaign's key, and how tired it is. `attempts`/`max_attempts` belong in this read because
+#: a `queued` row that has spent its tries is invisible in every other way: it looks like work waiting for a
+#: worker, and no worker will ever take it.
+CAMPAIGN_JOB_BY_KEY_SQL = (
+    "select id, status::text as status, coalesce(last_error, '') as last_error, attempts, max_attempts"
+    " from app.job where dedup_key = $1"
+)
+
+#: Puts a closed run back on the queue rather than writing a second row for the same campaign. The guard is
+#: "not live, or spent its tries": `attempts = 0` has to come with it, or the revived row keeps the number
+#: that made `app.claim_next_job` skip it and the queue looks busy while nothing runs. `finished_at` goes
+#: back to null with `started_at`, because a row that is waiting for a worker again is not finished.
+#: There is no `updated_at` to touch: `app.job` carries created/started/finished only, and this statement was
+#: written with one anyway — `tests/test_migrations_on_postgres.py` is what found it, on the real schema,
+#: before a deploy found it as an UndefinedColumnError on the operator's first retry.
+REVIVE_JOB_SQL = (
+    "update app.job set status = 'queued', attempts = 0, next_attempt_at = now(), locked_by = null,"
+    " locked_until = null, started_at = null, finished_at = null, last_error = null"
+    " where dedup_key = $1 and (status not in ('queued', 'running') or (attempts >= max_attempts"
+    " and max_attempts > 0)) returning id, status::text as status"
+)
+
+
+def _job_id(row: Any) -> int | None:
+    """The id out of whatever `app.enqueue_job` handed back: a jsonb row, a json string, or a bare id.
+
+    Three shapes because the pool hands jsonb back differently in a test, in the API process and in a job,
+    and a number printed to an operator has to be the job's own id or nothing else on that screen is
+    checkable. Anything that is not a number is reported as unknown rather than guessed at.
+    """
+    if isinstance(row, dict):
+        row = row.get("id")
+    elif isinstance(row, str):
+        try:
+            import json  # noqa: PLC0415  (only the one path that needs a parser)
+
+            row = json.loads(row).get("id")
+        except (ValueError, AttributeError):
+            pass
+    try:
+        return int(row)
+    except (TypeError, ValueError):
+        return None
+
+
+async def queue_campaign_run(
+    db: Any,
+    *,
+    campaign_id: int,
+    destination_id: Any = None,
+    contacts: int = 0,
+    as_start: bool = False,
+) -> dict[str, Any]:
+    """Queue the next run of a campaign, and say which of four things actually happened.
+
+    `app.enqueue_job` collapses duplicates on a **globally unique** key (`dedup_key text not null unique`),
+    so a key stays taken for as long as the closed row lives. That is right for a file scan and fatal here:
+    an operator starts a campaign, the run finishes or fails, and every later start is swallowed by the
+    first run's own row — the bot says "the job is already queued" and no DM ever goes out. Which is exactly
+    what this deployment showed: the count was on screen, the start tap was accepted, and the spare account
+    sat silent.
+
+    So the queue is asked for the run by key, and a key held by a row nobody owns any more is put back on
+    the queue instead of answered with a shrug. `as_start` is the operator's own tap, and it is the only
+    thing that reopens a `blocked` job: that status means a question was asked of a human, and starting
+    again is the answer to it. The automatic hand-off at the end of a run never reopens one, so a campaign
+    that needs a decision keeps needing it.
+
+    Returns `{"how": ..., "key": ..., "job_id": ..., "was": ..., "why": ...}` and `how` is one of:
+
+    * ``queued`` — a new row was written;
+    * ``restarted`` — the row that held the key was closed (or out of tries) and is queued again;
+    * ``held`` — a live row owns the key, so nothing was started and nothing needs to be;
+    * ``waiting`` — a blocked row is holding the key and only a start tap can move it;
+    * ``unknown`` — the key was taken a moment ago and its row is gone now; no promise either way.
+    """
+    key = keys.campaign_run_key(int(campaign_id), int(contacts))
+    row = await db.enqueue(
+        JobKind.JOIN_REQUEST_CAMPAIGN.value,
+        key,
+        stage=JobStage.DISCOVERED,
+        payload={"campaign_id": int(campaign_id), "destination_id": destination_id},
+        destination_id=destination_id,
+    )
+    if row:
+        return {"how": "queued", "key": key, "job_id": _job_id(row)}
+
+    holder = await db.fetchrow(CAMPAIGN_JOB_BY_KEY_SQL, key)
+    if holder is None:
+        return {"how": "unknown", "key": key, "job_id": None}
+    status = str(holder.get("status") or "")
+    attempts = int(holder.get("attempts") or 0)
+    ceiling = int(holder.get("max_attempts") or 0)
+    exhausted = attempts >= ceiling > 0
+    reopenable = status in CLOSED_JOB_STATES or (as_start and status == "blocked") or (
+        # A `queued` row with no tries left is not work waiting for a worker, it is a corpse the worker is
+        # skipping. The operator's tap buries it and writes the run again; an automatic hand-off leaves it,
+        # because a queue that retried a forever-failing campaign would be retrying it forever.
+        exhausted
+        and status in ("queued", "running")
+        and as_start
+    )
+    if reopenable:
+        revived = await db.fetchrow(REVIVE_JOB_SQL, key)
+        if revived:
+            return {
+                "how": "restarted",
+                "key": key,
+                "job_id": _job_id(revived) or holder.get("id"),
+                "was": f"{status} after {attempts} attempt(s)" if exhausted else status,
+                "why": str(holder.get("last_error") or "")[:300],
+            }
+    if status == "blocked" and not as_start:
+        return {
+            "how": "waiting",
+            "key": key,
+            "job_id": holder.get("id"),
+            "was": status,
+            "why": str(holder.get("last_error") or "")[:300],
+        }
+    return {"how": "held", "key": key, "job_id": holder.get("id"), "was": status, "why": ""}
+
+
 async def join_request_campaign(self: Writers, job: dict[str, Any], ctx: Any) -> dict[str, Any]:
     """Answer the still-pending join requests of one channel with the operator's own sentence.
 
@@ -951,14 +1078,16 @@ async def join_request_campaign(self: Writers, job: dict[str, Any], ctx: Any) ->
             )
             or 0
         )
-        queued = await self.db.enqueue(
-            JobKind.JOIN_REQUEST_CAMPAIGN.value,
-            keys.campaign_run_key(int(campaign_id), recorded),
-            stage=JobStage.DISCOVERED,
-            payload={"campaign_id": int(campaign_id), "destination_id": campaign.get("destination_id")},
+        run = await queue_campaign_run(
+            self.db,
+            campaign_id=int(campaign_id),
             destination_id=campaign.get("destination_id"),
+            contacts=recorded,
         )
-        return bool(queued)
+        # `restarted` is included on purpose: this run just closed its own row, so a campaign whose contacts
+        # did not move (a read that failed, a ceiling hit on the first pass) would otherwise strand itself
+        # with nobody able to start it again short of a database edit.
+        return run["how"] in ("queued", "restarted")
 
     reader = self._writer([peer], max_writes=0)
     # `skip` is the whole reason the read can move: the queue is newest-first and does not shrink while a
@@ -1014,7 +1143,7 @@ async def join_request_campaign(self: Writers, job: dict[str, Any], ctx: Any) ->
     # campaign gets. The ceiling and the one-per-person rule are what bound it.
     batch = waiting[: min(budget, JOIN_MAX_PER_RUN)]
     writer = self._writer([], max_writes=len(batch))
-    sent = failed = 0
+    sent = failed = planned = 0
     for position, entry in enumerate(batch):
         if position and batch_real_send:
             # Between sends, never before the first, and not at all in shadow mode: a planned message puts
@@ -1022,14 +1151,25 @@ async def join_request_campaign(self: Writers, job: dict[str, Any], ctx: Any) ->
             # slow test, not a safe one.
             await asyncio.sleep(JOIN_SEND_GAP_SECONDS)
         user_id = int(entry["user_id"])
-        await self.db.execute(
-            "insert into app.join_campaign_contact (campaign_id, telegram_user_id, status, attempts)"
-            " values ($1, $2, 'queued', 1) on conflict (campaign_id, telegram_user_id) do update"
-            " set attempts = app.join_campaign_contact.attempts + 1",
-            int(campaign_id),
-            user_id,
+        if batch_real_send:
+            # The row is written *before* the send, so a crash between the two leaves "already contacted"
+            # rather than an invitation to message the same stranger a second time. In shadow mode nothing is
+            # written, because a plan is not a contact: the rows are the one thing that decides who never
+            # gets a message, and recording a dry run there strands those people out of every later live run.
+            await self.db.execute(
+                "insert into app.join_campaign_contact (campaign_id, telegram_user_id, status, attempts)"
+                " values ($1, $2, 'queued', 1) on conflict (campaign_id, telegram_user_id) do update"
+                " set attempts = app.join_campaign_contact.attempts + 1",
+                int(campaign_id),
+                user_id,
+            )
+        # Addressed by the input entity the queue read carried, when it carried one: an id this account has
+        # no reason to have cached is a `Cannot find any entity` per contact, and the contact is then marked
+        # failed for a reason that has nothing to do with the person.
+        result = await writer.send_text(
+            entry.get("input_user") or user_id,
+            joinmsg.render(message, name=f"user {user_id}", series=series),
         )
-        result = await writer.send_text(user_id, joinmsg.render(message, name=f"user {user_id}", series=series))
         if result.ok and result.action == "sent":
             await self.db.execute(
                 "update app.join_campaign_contact set status = 'sent', sent_at = now() where campaign_id = $1 and telegram_user_id = $2",
@@ -1038,8 +1178,7 @@ async def join_request_campaign(self: Writers, job: dict[str, Any], ctx: Any) ->
             )
             sent += 1
         elif result.action == "planned":
-            # Counted, so the ceiling stays honest about what a live run of this plan would spend.
-            sent += 1
+            planned += 1
         else:
             failed += 1
             await self.db.execute(
@@ -1048,6 +1187,23 @@ async def join_request_campaign(self: Writers, job: dict[str, Any], ctx: Any) ->
                 user_id,
                 result.detail[:400],
             )
+    if not batch_real_send:
+        # A dry run plans a batch and stops there: it hands the campaign back as `ready`, waiting for the tap
+        # that sends for real. The two alternatives are both traps — `running` with a queued continuation
+        # would have this shadow service re-read the whole queue forever, and `completed` would tell the
+        # operator that strangers had been told when no message had left the account.
+        await self.db.execute(
+            "update app.join_campaign set status = 'ready', updated_at = now() where id = $1", int(campaign_id)
+        )
+        return {
+            "campaign_id": int(campaign_id),
+            "planned": planned,
+            "sent": 0,
+            "failed": failed,
+            "waiting_after": max(0, len(waiting) - len(batch)),
+            "shadow": "nothing was sent, so nobody is recorded as contacted",
+        }
+
     remaining = len(waiting) - len(batch)
     finished = remaining <= 0
     # The status is passed as text and cast, and the "did we run out of people" flag is its own

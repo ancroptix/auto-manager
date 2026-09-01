@@ -281,6 +281,50 @@ def test_a_shadow_deployment_still_reads_and_still_never_sends() -> None:
     assert len(client.requests) == asked, "a shadow plan reached Telegram with a write after all"
 
 
+def test_a_waiting_person_comes_back_addressable() -> None:
+    """An id is not a peer: Telegram's rows name strangers by id, and the hash that addresses them rides in the response's `users`.
+
+    A campaign that DMs by bare id works only while the session happens to remember the person, and the
+    people in a pending-request queue are exactly the ones it does not. Every contact then fails with
+    "Cannot find any entity" — twenty failures that look like privacy walls. So the read hands the hash on,
+    and a writer that has one uses it.
+    """
+    page = ({"user_id": 41, "about": None, "date": None, "approved_by": None},)
+    client = ReadClient(
+        exported=SimpleNamespace(link="https://t.me/+AbCdEf", requested=1, revoked=False),
+        pages=(page,),
+        count=1,
+        users=(SimpleNamespace(id=41, access_hash=911),),
+    )
+
+    _result, rows = _read(client)
+
+    assert len(rows) == 1, rows
+    peer = rows[0]["input_user"]
+    assert type(peer).__name__ == "InputUser", peer
+    assert (peer.user_id, peer.access_hash) == (41, 911), peer
+
+
+def test_an_input_entity_is_not_asked_of_the_session_again() -> None:
+    """`_target` resolves ids because a string id is a *username* to Telethon; an input entity needs nothing.
+
+    The lookup is the fragile half, and for a peer that arrived with its own access hash it is also
+    pointless: re-asking is where a campaign loses the person it was told to write to.
+    """
+    from telethon import types
+
+    from app.sender import Sender, WritePolicy
+
+    client = Client()
+    writer = Sender(client, policy=WritePolicy(mode="live", allow_peers=(), max_writes=4))
+
+    result = asyncio.run(writer.send_text(types.InputUser(user_id=41, access_hash=911), "hello"))
+
+    assert result.ok, result
+    assert not [c for c in client.calls if c[0] == "entity"], client.calls
+    assert client.calls, "the message still has to be sent"
+
+
 def test_a_channel_the_account_cannot_read_says_so_instead_of_being_empty() -> None:
     """Every failure the read can meet leaves the result not-ok with a reason; none of them may come back as
     `ok=True, rows=[]`, because that is the sentence the operator acts on."""
