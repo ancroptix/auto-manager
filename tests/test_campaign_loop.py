@@ -37,10 +37,17 @@ class LoopDb:
     keeping its own state is where a "the screen and the database disagree" report begins.
     """
 
-    def __init__(self, on: list[dict]) -> None:
+    def __init__(self, on: list[dict], *, paused: bool = False) -> None:
         self.on = list(on)
         self.sql: list[tuple[str, tuple]] = []
         self.reads = 0
+        # The service-wide pause flag, which the loop obeys before it reads anything. It is on this fake
+        # because "a paused service must not DM strangers" is the one thing the loop is allowed to check by
+        # itself, and a fake that could not say "paused" would let that rule go untested.
+        self.paused = paused
+
+    async def is_paused(self) -> bool:
+        return self.paused
 
     async def fetch(self, sql: str, *args):
         self.sql.append((sql, args))
@@ -236,6 +243,15 @@ async def test_a_campaign_that_says_not_now_is_left_alone() -> None:
     assert loop.errors == 0, "and it is not a fault, because the operator is the one who said not now"
     seen = loop.snapshot()["campaigns"]["7"]
     assert seen["sent"] == 0 and "error" not in seen, seen
+    assert seen["skipped"] == "the campaign is paused, which is not sending", seen
+
+    from app.controlbot import ControlBot  # noqa: PLC0415  (the screen's half of the same sentence)
+
+    bot = ControlBot.__new__(ControlBot)
+    bot.sender_state = lambda: {"absent": False, "running": True, "campaigns": {"7": seen}}  # type: ignore[attr-defined]
+    assert "the campaign is paused, which is not sending" in bot._campaign_sending_line(7), (
+        "the reason the pass gave is the reason the operator reads"
+    )
 
 
 @pytest.mark.asyncio
@@ -281,6 +297,9 @@ async def test_a_round_that_cannot_read_the_list_is_retried_not_fatal() -> None:
     class Unreadable:
         def __init__(self) -> None:
             self.calls = 0
+
+        async def is_paused(self) -> bool:
+            return False
 
         async def fetch(self, sql: str, *args):
             self.calls += 1

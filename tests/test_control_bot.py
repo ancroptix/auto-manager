@@ -3462,7 +3462,7 @@ async def test_start_shows_the_words_then_the_tap_switches_it_on() -> None:
     started = api.sent[-1][1]
     assert db.queued == [], "the start tap queues nothing, so nothing can swallow it"
     assert "is on" in started and "ready" in started, started
-    assert "sending: on" in started, started
+    assert "sending: awake" in started, started
     assert db.campaign["status"] == "ready"
     assert "one person every 3 seconds" in api.sent[-1][1].casefold() or "3 seconds" in api.sent[-1][1]
 
@@ -3557,13 +3557,16 @@ CAMPAIGN_READY = {
     "confirm_required": True,
 }
 @pytest.mark.asyncio
-async def test_people_recorded_but_never_messaged_are_offered_back_one_tap() -> None:
-    """The screen names the rows that make a campaign look finished, and offers exactly one decision.
+async def test_people_recorded_but_never_messaged_are_released_by_starting() -> None:
+    """The screen names the rows that make a campaign look finished, and the ✅ tap clears them.
 
-    An older shadow run wrote contact rows for people it only planned, and those rows are what tells a later
-    run to skip them — so the operator saw a count that never moved and a queue that stayed full. The bot
+    An older build wrote contact rows for people it only planned, and those rows are what tells every later
+    pass to skip them — so the operator saw "0 still waiting" while nobody had been messaged at all. The bot
     cannot tell that state from a live run killed between the row and the send (the second is why the row is
-    written first at all), so it does not guess: it shows the number, and one tap releases them.
+    written first at all), so a machine never decides it. But asking the operator for a *second* tap about the
+    same list was its own confusion, and starting a campaign is already a human saying "send to these people":
+    so ✅ does the release, says how many it released, and no row is deleted. `free` stays for the case where
+    the operator wants them released without starting.
     """
     campaign = dict(CAMPAIGN_READY)
     campaign["unreleased"] = 2
@@ -3571,23 +3574,25 @@ async def test_people_recorded_but_never_messaged_are_offered_back_one_tap() -> 
 
     await control.dispatch(parse_update(_press(api, "x:/joinreq open #21")))
     text = api.sent[-1][1]
-    assert "2 person(s) have a row but were never sent a message" in text, text
+    assert "2 person(s) have a row and no message from an earlier attempt" in text, text
+    assert "✅ below includes them" in text, text
     labels = [
         str(one.get("text") or one.get("label") or "")
         for row in api.markups[-1]["inline_keyboard"]
         for one in row
     ]
-    assert any(label.startswith("🔁 Send to those 2") for label in labels), labels
+    assert not any(label.startswith("🔁") for label in labels), labels
 
-    await control.dispatch(parse_update(_press(api, "x:/joinreq free #21")))
+    await control.dispatch(parse_update(_press(api, "x:/joinreq go #21")))
     reply = api.sent[-1][1]
-    assert "2 person(s) are released" in reply, reply
+    assert "2 of them had a row and no message" in reply, reply
     release = [sql for sql, _ in db.writes if "update app.join_campaign_contact set" in sql]
     assert release, db.writes
     assert "status = 'skipped'" in release[0], release[0]
     assert "delete from" not in release[0].lower(), "nobody is deleted from this history"
 
 
+@pytest.mark.asyncio
 @pytest.mark.asyncio
 async def test_the_release_tap_says_nothing_changed_when_nothing_matched() -> None:
     """A tap that changes nothing has to say so, in the same breath it would have promised a send."""
@@ -3697,31 +3702,35 @@ async def test_the_worker_command_refuses_a_word_it_does_not_know() -> None:
 
 
 @pytest.mark.asyncio
-async def test_the_campaign_screen_offers_the_tap_that_ends_the_silence() -> None:
-    """A start screen that only *names* a broken switch leaves the operator reading; this one hands over the tap.
+async def test_the_campaign_screen_has_no_queue_button_on_it() -> None:
+    """**The operator's rule, pinned: a screen about DMs does not offer a queue control.**
 
-    The button is offered only when the service has a switch at all — otherwise it would be a button that
-    ends in a refusal, which is the thing this interface was built to stop.
+    `▶️ Run the queue` was added when campaign sending still ran through `app.job`, and once it did not the
+    button stayed on the screen with a sentence about workers next to it. Every "nothing is sending" report
+    since has had one of two causes: a queue row that swallowed the start, or an operator who was shown a
+    control they did not ask for and had to understand anyway. So the campaign screen is the campaign's own:
+    start, stop, the delay, the wording, the channel list — and the sender that obeys none of the queue's
+    switches.
     """
-    switch = WorkerSwitch(running=False)
-    campaign = dict(CAMPAIGN_READY)
-    control, api, db, _w = joinreq_bot(campaign=campaign)
-    control.worker_switch = switch  # type: ignore[attr-defined]
+    control, api, db, _w = joinreq_bot(campaign=dict(CAMPAIGN_READY))
     control.settings = control.settings.model_copy(update={"worker_enabled": False})
 
     await control.dispatch(parse_update(_press(api, "x:/joinreq open #21")))
     labels = [
         str(one.get("text") or "") for row in api.markups[-1]["inline_keyboard"] for one in row
     ]
-    assert any(label.startswith("▶️ Run the queue") for label in labels), labels
+    assert not any("queue" in label.casefold() for label in labels), labels
+    assert not any("worker" in label.casefold() for label in labels), labels
+    text = api.sent[-1][1]
+    assert "queue worker is OFF" not in text, text
 
     await control.dispatch(parse_update(_press(api, "x:/joinreq go #21")))
     reply = api.sent[-1][1]
-    assert "queue worker is OFF" in reply, reply
-    assert "▶️ Run the queue" in reply, reply
-    assert "nothing goes out" in reply or "never run" in reply, reply
+    assert "is on" in reply, reply
+    assert "queue" not in reply.casefold(), reply
 
 
+@pytest.mark.asyncio
 @pytest.mark.asyncio
 async def test_the_sender_says_what_it_last_did_about_this_campaign() -> None:
     """"Sending" is a claim about a process, so the screen quotes the process.
@@ -3740,8 +3749,9 @@ async def test_the_sender_says_what_it_last_did_about_this_campaign() -> None:
     await control.dispatch(parse_update(_press(api, "x:/joinreq open #21")))
     text = api.sent[-1][1]
 
-    assert "20 sent in its last batch" in text, text
-    assert "320 still waiting" in text, text
+    assert "20 sent in its last pass" in text, text
+    assert "320 people are past what one read can reach" in text, text
+    assert "it goes back for them" in text, text
     assert "one message every 3 s" in text, text
 
 
@@ -3759,9 +3769,10 @@ async def test_a_campaign_that_is_on_with_no_sender_says_that_too() -> None:
     await control.dispatch(parse_update(_press(api, "x:/joinreq open #21")))
     text = api.sent[-1][1]
 
-    assert "no queue worker is running in this service" in text, text
-    assert "`/worker on`" in text, text
+    assert "no sender running" in text, text
+    assert "/status" in text, text
     assert "wakes in about" not in text, "there is no timer to wait for any more"
+    assert "queue" not in text.casefold(), "and the reason is not explained with the queue's vocabulary"
 
 
 @pytest.mark.asyncio
@@ -3782,8 +3793,11 @@ async def test_a_fault_in_the_last_pass_is_printed_rather_than_swallowed() -> No
     await control.dispatch(parse_update(_press(api, "x:/joinreq open #21")))
     text = api.sent[-1][1]
 
-    assert "last fault: no Telegram session is open" in text, text
-    assert "320 still waiting" in text, text
+    assert "the last pass faulted: no Telegram session is open" in text, text
+    # Two short lines, not one run-on sentence: whether the sender is awake and what its last pass did, then
+    # the reason nothing moved. The screen has already printed the headcounts and the delay above, so a third
+    # copy of them here is what made these screens unreadable.
+    assert "sending: awake, nothing went out in its last pass." in text, text
 
 
 @pytest.mark.asyncio
@@ -3906,11 +3920,13 @@ async def test_the_plan_prints_the_spacing_and_says_what_stops_the_run() -> None
     assert "per hour" not in text, text
 @pytest.mark.asyncio
 async def test_the_start_screen_names_the_switch_that_would_silence_it() -> None:
-    """A queued job in a paused queue sends nothing, and 'queued' is the most misleading word available.
+    """A campaign that is on in a service that will not send needs the reason on the same screen.
 
-    Four settings can each stop a campaign on its own — the pause switch, the mode, the worker being off in
-    this service, and an account with no stored session. The screen reads all four, and prints only the ones
-    that are actually wrong, each with the tap that fixes it.
+    Three settings can each stop a campaign on their own — the service-wide pause, the deployment's mode, and
+    an account with no stored session. The screen reads all three and prints only the ones that are actually
+    wrong, each with the tap that fixes it. The queue worker is not on this list any more, because sending
+    does not go through the queue: an operator who had to start a worker to make their DMs move was shown a
+    control that belonged to another feature.
     """
     from app import joinmsg
 
@@ -3920,7 +3936,7 @@ async def test_the_start_screen_names_the_switch_that_would_silence_it() -> None
 
     text = "\n".join(r.text for r in await control._campaign(None, ["-1001234", "confirm", "default", code]))
 
-    assert "queue is PAUSED (nightly maintenance)" in text, text
+    assert "service is PAUSED (nightly maintenance)" in text, text
     assert "/resume" in text, text
     assert "no Telegram session is active" in text, text
 

@@ -203,9 +203,11 @@ The list below is the residual — what still stops each kind from completing, i
   `/joinmsg`, one message every `per_message_delay_seconds` — the campaign row's own number, three by default,
   floored at one second, because messages sent back to back are what gets an account restricted and the account
   is what has to keep working. There is no hourly stop and **no queue row**: the sender is
-  `app/campaignloop.py`, a task the worker owns, which asks `app.join_campaign` which campaigns are on, gives
-  each one a page of the list (20 people, the size of a read and not a limit on the run) and then asks for the
-  next page. So the only things that end a campaign are an empty list, the operator's `⏸ Stop after this one`
+  `app/campaignloop.py`, a task the *service* owns (started when the service starts, stopped on shutdown, and
+  not behind `WORKER_ENABLED` or `/worker on`, so nothing on a campaign screen mentions the queue), which asks
+  `app.join_campaign` which campaigns are on and gives each one **the whole list its read can reach** — the
+  page size belongs to Telegram's importer, not to the campaign. The service's own `/pause` is obeyed between
+  rounds. So the only things that end a campaign are an empty list, the operator's `⏸ Stop after this one`
   (re-read before every person, so a tap mid-page lands within one message), and a flood wait Telegram itself
   named, which the loop sleeps out where it stands rather than shaves.
   `campaign.rate_per_hour` used to bound the run by *waiting* an hour, and before that by writing `paused`: a
@@ -215,7 +217,12 @@ The list below is the residual — what still stops each kind from completing, i
   campaign nobody could re-start once its own run had closed. Both are now impossible, because there is no row
   to swallow and nothing to re-arm — and a leftover `join_request_campaign` row written by an older build still
   does real work rather than blocking, because `Writers.join_request_campaign` is a thin wrapper over the same
-  pass and closes itself.
+  pass and closes itself. One more thing happens on that same start tap: `app.writers.campaign_release_unsent`
+  marks the contacts that have a row and no `sent_at` as `skipped`, which is the status that means "owed a
+  message". Those rows are how a campaign can sit at "0 still waiting" forever without a single DM going out,
+  and only a human can tell a killed send from a dry run's leftovers — so the ✅ that shows the wording and the
+  count is what says it, and the reply counts who was included. `/joinreq free` remains for releasing them
+  without starting, and nothing is deleted either way.
   A campaign runs only after `/campaign … confirm <code>` — or after the plan and the start tap on
   `/joinreq`, which computes that code instead of asking you to type it. A service in shadow mode never starts
   the loop at all, and a shadow pass records **nobody**: `app.join_campaign_contact` is the promise that a

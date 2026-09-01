@@ -27,7 +27,9 @@ from .api import PauseBody, control_dependency, router
 from .config import Settings, load_settings
 from .db import Database
 from .stages import LADDER, stage_labels
+from .campaignloop import CampaignLoop
 from .worker import Worker
+from .writers import Writers
 
 log = logging.getLogger("auto_manager")
 
@@ -54,10 +56,10 @@ def _sender_state(state: Any) -> dict[str, Any]:
     sentence, because "the campaign is on and nothing is happening" has to be visible where the operator
     started it. `running: False` is the subtler one: a worker exists, and the loop inside it does not.
     """
-    worker = getattr(state, "worker", None) if state is not None else None
-    if worker is None:
+    loop = getattr(state, "campaign_loop", None) if state is not None else None
+    if loop is None:
         return {"absent": True}
-    return {"absent": False, **(worker.snapshot().get("sending") or {"running": False})}
+    return {"absent": False, **loop.snapshot()}
 
 
 async def _build_control_bot(settings: Settings, db: Any, *, user_client: Any = None, state: Any = None) -> Any:
@@ -168,9 +170,8 @@ async def _build_control_bot(settings: Settings, db: Any, *, user_client: Any = 
         background=lambda coro: asyncio.create_task(coro),
         on_session_stored=adopt_session,
         worker_switch=switch_worker,
-        # The campaign screens ask the same question `/worker status` answers, so they ask it through the
-        # worker's own snapshot: the loop that sends lives there, and a second holder of that answer would be
-        # a second truth about whether the operator's DMs are on their way.
+        # What the campaign screens print as "sending". It is read from the loop the service owns — not from
+        # the queue worker, which is a different half of this service and none of a DM campaign's business.
         sender_state=lambda: _sender_state(state),
         login_ttl_seconds=login_ttl,
         delete_sensitive=delete_sensitive,
@@ -225,6 +226,8 @@ def create_app(settings: Settings | None = None, *, start_worker: bool | None = 
             )
         if run_worker and app.state.worker:
             app.state.worker.start()
+        if app.state.campaign_loop is not None:
+            app.state.campaign_loop.start()
         if settings.bot_should_run:
             try:
                 app.state.control_bot = await _build_control_bot(
@@ -275,6 +278,8 @@ def create_app(settings: Settings | None = None, *, start_worker: bool | None = 
                     await task
             if app.state.worker:
                 await app.state.worker.stop()
+            if app.state.campaign_loop is not None:
+                await app.state.campaign_loop.stop()
             await db.close()
 
     app = FastAPI(
@@ -301,6 +306,33 @@ def create_app(settings: Settings | None = None, *, start_worker: bool | None = 
     app.state.worker = (
         Worker(db=app.state.db, settings=settings, telegram=app.state.user_client)
         if settings.worker_enabled
+        else None
+    )
+    def _sender_client():
+        """The live session the campaign sender may use, which is the process's one client or none.
+
+        Not a lazy connection, for the reason `Worker._outbound_client` gives: a writer that opens its own
+        session is a second connection to the same account, and the account is what has to keep working. A
+        pass that finds None reports it, and the campaign screen prints that reason.
+        """
+        telegram = app.state.user_client
+        if telegram is None:
+            return None
+        return telegram.client if getattr(telegram, "connected", False) else None
+
+    # The campaign sender: a loop over `app.join_campaign`, started with the service and stopped with it.
+    # It is deliberately not a job kind, not behind `WORKER_ENABLED`, and not behind `/worker on` — the
+    # operator asked for on/off for sending, and a DM campaign that first needs the queue to be running is a
+    # third thing to understand. `/pause` still stops it (the loop reads the flag every round), and shadow
+    # mode never starts it at all. Without a database there is nothing to read the list from, so there is no
+    # loop, and the campaign screens say exactly that rather than printing a promise.
+    app.state.campaign_loop = (
+        CampaignLoop(
+            db=app.state.db,
+            settings=settings,
+            writers=Writers(db=app.state.db, settings=settings, client_factory=_sender_client),
+        )
+        if app.state.db is not None
         else None
     )
 

@@ -265,11 +265,11 @@ class ControlBot:
     #: the same reason as `on_session_stored`: the bot must not own the connection, and a service that writes
     #: jobs it never runs needs one tap in the chat rather than an environment edit.
     worker_switch: Callable[[bool], Any] | None = None
-    #: A read of this service's campaign sender (`app/campaignloop.py`), as the worker's `snapshot()` sees
-    #: it. A callable rather than the object, because `/worker on` and `off` build and discard workers, and a
-    #: campaign screen that reported the sender of a worker that has since been stopped is the same "the
-    #: screen said it was running" mistake the queue used to be blamed for. `None` means this bot has no
-    #: service behind it to ask, which the screens say out loud rather than glossing over.
+    #: A read of this service's campaign sender (`app/campaignloop.py`), from `app/main.py`'s state. A
+    #: callable rather than the loop itself, because the loop is the service's and not the bot's: a copied
+    #: snapshot would be a remembered answer to "is it sending", which is the one question this screen is not
+    #: allowed to guess at. `None` means this bot was assembled without a service to ask, and the screens say
+    #: that instead of printing a reassuring nothing.
     sender_state: Callable[[], dict[str, Any]] | None = None
     #: What this bot last asked the worker to do, or None for "whatever the service was started with". A
     #: screen that printed the environment's answer after a `/worker on` would deny what the tap just did.
@@ -488,15 +488,16 @@ class ControlBot:
             except Exception as exc:  # noqa: BLE001 - a screen must not fail because a status read did
                 return f"\nsending: the sender could not be asked ({str(exc)[:90]})."
         else:
-            return (
-                "\nsending: this bot is not wired to a service that can send, so nothing is going out from"
-                " it. `/worker on` is the switch in a deployed service."
-            )
+            return "\nsending: this bot has no service behind it to send from."
         if sending.get("absent"):
             return (
-                "\nsending: no queue worker is running in this service, and campaign sending starts with it —"
-                " so nothing goes out. `/worker on` starts both, and the list carries on from where it"
-                " stopped."
+                "\nsending: this service has no sender running, because it has no database to read the"
+                " campaign list from. `/status` names the connection problem."
+            )
+        if sending.get("paused"):
+            return (
+                "\nsending: the service is paused, so the sender is waiting and nobody is being messaged."
+                " /resume starts it again, and the list carries on where it stopped."
             )
         if sending.get("shadow"):
             return (
@@ -506,42 +507,56 @@ class ControlBot:
             )
         if not sending.get("running"):
             return (
-                "\nsending: the sender in this service is not running, so nothing is being sent. /worker"
-                " status says what the worker is doing."
+                "\nsending: the sender in this service is not running, so nothing is being sent even"
+                " though this campaign says it is on. It starts with the service, so this means the service"
+                " came up without one — /status and /probe show what it found."
             )
         detail = (sending.get("campaigns") or {}).get(str(campaign_id)) or {}
         if not detail:
             return (
-                "\nsending: on. The sender looks at this campaign every few seconds and takes the next page"
-                " of the list — nothing has to be tapped again."
+                "\nsending: awake. It looks at this campaign every few seconds and works the list from where"
+                " it stands — nothing has to be tapped again."
             )
-        bits: list[str] = []
-        if detail.get("stopped"):
-            bits.append("your \u23f8 stopped the last batch")
-        if detail.get("finished"):
-            bits.append("the list was empty at its last look")
+        # Two short lines, because this screen has already printed the headcounts and the delay: what belongs
+        # here is whether the sender is awake and what it did last, and anything else would be the same number
+        # twice in two fonts. A long run-on sentence about a campaign is how these screens ended up unread.
+        head = ["sending: awake"]
         if detail.get("sent"):
-            bits.append(f"{detail['sent']} sent in its last batch")
+            head.append(f"{detail['sent']} sent in its last pass")
         if detail.get("planned"):
-            bits.append(f"{detail['planned']} planned, not sent")
-        if detail.get("waiting") is not None:
-            bits.append(f"{detail['waiting']} still waiting")
+            head.append(f"{detail['planned']} planned, not sent")
+        if detail.get("failed"):
+            head.append(f"{detail['failed']} could not be sent")
+        if len(head) == 1:
+            head.append("nothing went out in its last pass")
         if detail.get("gap"):
-            bits.append(f"one message every {detail['gap']:g} s")
-        if detail.get("flood"):
-            bits.append(f"Telegram asked for a {detail['flood']} s pause")
+            head.append(f"one message every {detail['gap']:g} s")
+        reason = None
+        if detail.get("stopped"):
+            reason = "your \u23f8 stopped it"
+        elif detail.get("skipped"):
+            reason = f"its last look said: {detail['skipped']}"
+        elif detail.get("waiting"):
+            reason = f"{detail['waiting']} people are past what one read can reach, and it goes back for them"
+        elif detail.get("flood"):
+            reason = f"Telegram asked for a {detail['flood']} s pause, which this service waits out"
+        elif detail.get("finished"):
+            reason = "the list was empty at its last look, so this campaign is done"
         if detail.get("error"):
-            bits.append(f"last fault: {str(detail['error'])[:90]}")
-        return "\nsending: " + (", ".join(bits) + "." if bits else "on.")
+            reason = f"the last pass faulted: {str(detail['error'])[:90]}"
+        line = ", ".join(head) + "."
+        return "\n" + line + (f"\n{reason}." if reason else "")
 
     async def _campaign_watch(self) -> list[str]:
         """The reasons a campaign that is on would still send nothing, each with the tap that fixes it.
 
         A start screen that promises sending while the service will not send is worse than one that refuses:
-        the operator waits, sees no DMs, and has no way to know the switch is off on purpose.
-        Four things can each silence a campaign on their own — the pause switch, the deployment's mode, the
-        worker being off in this service, and an account with no stored session — so all four are read here,
-        and the line is printed only when it is actually a problem. Nothing in this method writes anything.
+        the operator waits, sees no DMs, and has no way to know the switch is off on purpose. Three things can
+        each silence a campaign on their own — the service-wide pause, the deployment's mode, and an account
+        with no stored session — so all three are read here, and a line is printed only when it is actually a
+        problem. The queue worker is deliberately **not** one of them: sending does not go through it, and a
+        button for it on this screen was a second feature the operator had to understand in order to do the
+        first one. Nothing in this method writes anything.
         """
         lines: list[str] = []
         state = None
@@ -552,23 +567,11 @@ class ControlBot:
         if state and state.get("paused"):
             reason = str(state.get("reason") or "").strip()
             lines.append(
-                "• the queue is PAUSED" + (f" ({reason[:80]})" if reason else "") + " — no job is claimed."
-                " /resume starts claiming again"
+                "• the service is PAUSED" + (f" ({reason[:80]})" if reason else "") + " — no job is claimed"
+                " and nobody is being messaged. /resume starts both again"
             )
         if not getattr(self.settings, "outbound_enabled", False):
             lines.append("• mode: shadow — nothing is sent from this service, only planned")
-        if not self._worker_is_running():
-            if self.worker_switch is not None:
-                lines.append(
-                    "• this service's queue worker is OFF, so jobs are written and never run — and campaign"
-                    " sending runs with it, so nothing is being DM'd either. Tap ▶️ Run the queue below, or"
-                    " /worker on"
-                )
-            else:
-                lines.append(
-                    "• this service has its queue worker OFF, so jobs are written and never run"
-                    " (WORKER_ENABLED is what turns it on)"
-                )
         rows: list = []
         try:
             rows = list(await list_sessions(self.db) or [])
@@ -837,8 +840,9 @@ class ControlBot:
             unreleased = int(row.get("unreleased") or 0)
             if unreleased:
                 lines.append(
-                    f"{unreleased} person(s) have a row but were never sent a message — an older dry run"
-                    " recorded them. The bot cannot tell that from a send that was cut off, so it asks you:"
+                    f"{unreleased} person(s) have a row and no message from an earlier attempt. Starting the"
+                    " campaign is what says they are owed one, so ✅ below includes them; nothing already sent"
+                    " is sent again."
                 )
         gap = writers.campaign_gap_seconds(row or {})
         lines.append(
@@ -867,14 +871,10 @@ class ControlBot:
         else:
             choices.append({"label": "⏸ Stop after this one", "command": f"/joinreq stop #{destination['id']}"})
             choices.append({"label": "▶️ Keep going", "command": f"/joinreq start #{destination['id']}"})
-        if unreleased:
-            choices.append(
-                {"label": f"🔁 Send to those {unreleased}", "command": f"/joinreq free #{destination['id']}"}
-            )
-        if self.worker_switch is not None and not self._worker_is_running():
-            # The tap that ends the silence. A queued job in a service that claims nothing looks identical to
-            # a campaign that is sending, from every screen that does not look at the worker.
-            choices.append({"label": "▶️ Run the queue", "command": "/worker on"})
+        # Two buttons used to live here: `🔁 Send to those N` for the contacts an earlier attempt had
+        # recorded without messaging, and `▶️ Run the queue` for a service whose worker was off. The first is
+        # what the ✅ below now does on its own, and the second was a queue control on a screen about DMs —
+        # sending does not go through the queue, so neither belongs on this screen any more.
         choices.append({"label": "✏️ Change the message", "screen": "joinmsg"})
         choices.append({"label": "📨 Other channels", "command": "/joinreq"})
         return await self._joinreq_screen(lines, choices, f"/joinreq open #{destination['id']}")
@@ -2756,6 +2756,13 @@ class ControlBot:
                     "update app.join_campaign set status = 'ready', updated_at = now() where id = $1",
                     int(campaign["id"]),
                 )
+                # The tap that starts a campaign is also the human answer to its oldest stuck state: contacts
+                # an earlier attempt wrote a row for and never messaged, which every later pass had to skip
+                # because a row is the promise that nobody is written to twice. They are owed a message, and
+                # this is the one moment that can be said out loud — the screen just showed the wording and the
+                # count, and the operator tapped ✅. So the release happens here rather than behind a second
+                # button nobody asked for, and `app/writers.py` keeps the rules about what a release is.
+                released = await writers.campaign_release_unsent(self.db, int(campaign["id"]))
                 # Nothing is queued, because a campaign no longer runs through the queue at all:
                 # `app/campaignloop.py` looks at `app.join_campaign` every few seconds and works on whatever
                 # says it is on. That is the whole difference for the operator — no row to be swallowed by a
@@ -2776,12 +2783,20 @@ class ControlBot:
                         if contacts
                         else ""
                     )
+                    + (
+                        f"\n{released} of them had a row and no message from an earlier attempt. This start"
+                        " says they are owed one, and they are in this run like anybody else."
+                        if released
+                        else ""
+                    )
                     + "\n\n"
                     + (
-                        "It sends one message at a time, spaced by the delay on this campaign's own row,"
-                        " and it keeps going until the list is empty or you tap ⏸ Stop after this one."
+                        "It sends one message at a time, spaced by the delay on this campaign's own row, and"
+                        " it works the whole list rather than a slice of it — until the list is empty or you"
+                        " tap ⏸ Stop after this one."
                         if getattr(self.settings, "outbound_enabled", False)
-                        else "In shadow mode each message plans and blocks, which is the read-only version of this run."
+                        else "In shadow mode each message plans and blocks, which is the read-only version of"
+                        " the same pass."
                     )
                     + self._campaign_sending_line(int(campaign["id"]))
                     + (("\n\n" + "\n".join(watch)) if watch else "")

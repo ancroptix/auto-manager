@@ -149,7 +149,9 @@ session at boot, if it restarts on its own.
 | `/status` | mode, queue depth, paused state, what is blocked and the first line of why, thumbnails waiting on you, the four settings that decide publishing |
 | `/pause` *(reason)* | stops claiming jobs. The reason is stored and shown in `/status` |
 | `/resume` | claims again on the next poll |
-| `/worker [on\|off\|status]` | runs or stops **this service's queue worker** — the thing `WORKER_ENABLED` decides, changed from the chat instead of the dashboard. Off is a real state with a real cost: jobs keep being written and nothing runs them, and every screen still says "queued", so `/joinreq` and `/campaign` show a `▶️ Run the queue` tap while it is off. `status` only reports, and nothing here edits the environment: a restarted service comes back with whatever `WORKER_ENABLED` says, which is why `/probe`'s documented "turn the worker off, ask your questions, turn it back on" no longer depends on remembering step three |
+| `/worker [on\|off\|status]` | runs or stops **this service's queue worker** — the thing `WORKER_ENABLED` decides, changed from the chat instead of the dashboard. Off is a real state with a real cost: jobs keep being written and nothing runs them, and every screen still says "queued". **Join-request campaigns are not one of those jobs**: their sender is `app/campaignloop.py`, started with the
+  service, so `/worker off` never pauses a DM run, and no campaign screen offers a queue button (it used to,
+  which meant an operator had to understand `app.job` in order to send a message). `status` only reports, and nothing here edits the environment: a restarted service comes back with whatever `WORKER_ENABLED` says, which is why `/probe`'s documented "turn the worker off, ask your questions, turn it back on" no longer depends on remembering step three |
 | `/reconcile` | reclaims expired leases and queues a reconciliation pass |
 | `/probe` | discovery against the storage bot and Channel Help: it opens both from the logged-in account and reads their menus back, and it posts nothing in your channels. But it *does* send, so it refuses to run in shadow mode. To probe without launching the pipeline: `APP_MODE=live` **and** `WORKER_ENABLED=false` in Render, save, `/probe`, then put `WORKER_ENABLED` back — with the worker off no job is claimed, so nothing reaches your channels while the questions are asked. The report is written to this chat, never to a channel |
 | `/source <@handle\|channel id> [series <name>] [audio <kind>] [season <n>] [title <text>]` | what a *files-only* source channel carries, stated once for the whole channel instead of guessed per file. `title` renames the row itself — what this bot calls it back to you, and, when no series is declared, one of the two signals `app/ingest.py` may read a series name out of (one signal is not two: it never founds a channel on its own). A channel added by number arrives with none, which is why the word exists here at all. With no arguments it shows what is declared **and what is switched**; `clear` stops assuming. It never re-decides a file that was already decided — parked ones are re-read on the next scan |
@@ -179,21 +181,26 @@ the list to the end, a restart resumes it by itself, and `⏸` is the only thing
   what switches sending on. The code is derived from the row and its exact text, so editing the wording invalidates an old
   confirmation. `gap <name> <seconds>` is the whole pace control — how far apart two messages go, 1 second to
   9999 — and the channel's screen asks for it as `⏱ Set delay (3 s)`, one tap and one typed number, because a
-  row of preset buttons is how a simple thing gets complicated. There is **no queue row for a campaign at all**. `app/campaignloop.py` is a task the
-  worker owns: every few seconds it asks `app.join_campaign` which campaigns are on and gives each one a pass
-  over the next page of the pending list (`JOIN_MAX_PER_RUN`, twenty people, which is the size of a page and
-  not a limit on the run), then comes straight back for the following page. That is what makes "it sends until
-  you stop it" a property of the code rather than a sentence on a screen: there is no `dedup_key` to be
-  swallowed by, no `max_attempts` to run out, no wake-up time to wait for, and a re-tap of start cannot be a
-  no-op. A campaign's work ends at an empty list (`completed`), at `⏸ Stop after this one` — the campaign row
-  is re-read before every person, so the tap lands within one message — or at Telegram's own flood wait, which
-  the loop sleeps out where it stands rather than parking the campaign somewhere.
+  row of preset buttons is how a simple thing gets complicated. There is **no queue row for a campaign at all**. `app/campaignloop.py` is a
+  task the service owns — not the queue worker's, so `/worker off` never silences a DM run and no campaign
+  screen offers a button for it. Every few seconds it asks `app.join_campaign` which campaigns are on and gives
+  each one a pass over **the whole pending list it can read** (`JOIN_READ_PAGES` pages of a hundred per invite
+  link; the number sizes the *read*, never the sending), one message per person at the campaign's own delay.
+  That is what makes "it sends until you stop it" a property of the code rather than a sentence on a screen:
+  there is no `dedup_key` to be swallowed by, no `max_attempts` to run out, no wake-up time to wait for, and a
+  re-tap of start cannot be a no-op. A campaign ends at an empty list (`completed`), at `⏸ Stop after this
+  one` — the row is re-read before every person, so the tap lands within one message — or at Telegram's own
+  flood wait, which the loop sleeps out where it stands rather than parking the campaign somewhere. A
+  service-wide `/pause` is obeyed between rounds, because a paused service must not message strangers.
   `campaign.rate_per_hour` is not read at all: that default of twenty is what stopped 340 people at twenty and
   then left the campaign looking dead. What the screen prints instead is what the sender last did for that
-  campaign (`sending: 20 sent in its last batch, 320 still waiting, one message every 3 s`), read from the
-  loop's own memory, because the loop is the thing that either is or is not sending. When it is not — no worker
-  in this service, shadow mode, a fault in the last pass — each of those is on the screen with the one tap that
-  exists for it, and each is stated as a fact rather than a promise.
+  campaign (`sending: 20 sent in its last pass, 320 the read could not reach, one message every 3 s`), read
+  from the loop's own memory, because the loop is the thing that either is or is not sending. When it is not —
+  shadow mode, a paused service, a fault in the last pass, no stored session — each of those is on the screen
+  with the tap that exists for it, stated as a fact rather than a promise. Starting a campaign also releases
+  the contacts an earlier attempt wrote a row for and never messaged (the state that lets a campaign read "0
+  still waiting" while nobody has been told anything), and the reply says how many it released, because that
+  ✅ is a human decision and a machine should not make it.
   `abort` stops it
   and leaves every row in place; nothing is deleted, and the contacts already written stay written,
 because un-sending is not this program's verb.
@@ -346,11 +353,11 @@ Telegram's count of who is waiting, read per invite link (`getChatInviteImporter
 "who is waiting **on this link**", so a query that names no link answers nothing for a private channel whose
 requests came in through its `+ABCDEF` link) and never the length of one page; a queue deeper than what this
 look could hold prints both numbers, because "250 waiting, 3 read" is true and "3 waiting" is not. `app/campaignloop.py` then asks `app/writers.py` for
-one person every `per_message_delay_seconds` (three seconds when the row says nothing usable), a page at a
-time, for as long as the campaign's row says it is on. Twenty is what one read of Telegram's importer answers
-with and what one pass can finish without an operator staring at a screen; it does not bound the sending,
-because the loop asks for the next page as soon as the last one is done, and the per-person rules are what keep
-two passes from ever writing to the same stranger twice. Nothing is written about the
+one person every `per_message_delay_seconds` (three seconds when the row says nothing usable), for as long as
+the campaign's row says it is on. It does not stop after twenty, because the pass works the whole list the read
+reaches and the loop comes back for whatever the read could not: a queue deeper than the pages walked is
+carried on the answer as `waiting_after` with `more` true, never written as "nobody is left". Two passes can
+still never write to the same stranger twice, because the contact row is written *before* the send. Nothing is written about the
 campaign to `app.job`, so a Render spin-down has nothing to lose: the resume is a `select` over
 `app.join_campaign`, not a row that a key, an attempt counter or a timer can strand. `⏸ Stop` is re-read before
 every person, so it lands after the message in flight rather than after a batch that was already planned; what

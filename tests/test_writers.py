@@ -605,15 +605,19 @@ async def test_a_released_contact_is_owed_a_message_again(monkeypatch) -> None:
 
     assert result["sent"] == 2, result
     assert [peer.user_id for peer in handlers.transport.peers] == [900, 901], handlers.transport.peers
-    assert result["held_back"] == 0, result
+    # The pass does not report how many rows it left alone: `app/controlbot.py` counts them from the campaign
+    # row, and a second copy of that figure inside a pass result is a second truth about the same table.
 
 
-async def test_the_run_reports_the_rows_it_was_not_allowed_to_send(monkeypatch) -> None:
-    """`held_back` counts rows this run skipped because a record of them exists and nobody released them.
+async def test_the_pass_leaves_alone_the_rows_nobody_released(monkeypatch) -> None:
+    """A row that exists and was never sent is not a licence to message that person again.
 
-    It is reported apart from `failed` on purpose: "nobody is left" and "nobody is left *that I have not
-    already written about*" are different facts, and the second is the one that tells an operator to go and
-    release them.
+    "nobody is left" and "nobody is left *that I have not already written about*" are different facts, and the
+    second is the one this campaign has been judged by twice: the operator saw a count that never moved and a
+    reply that said nobody was waiting. The pass may not resolve that on its own — a row written and not sent
+    is exactly the state that guards against a second DM to a stranger — so it closes the campaign with the
+    sentence the operator can act on, and the release is a human tap: `✅ Start` (which does it as part of
+    starting) or `/joinreq free` (which does it without).
     """
     db = CampaignDb(waiting=2, rate=1000, contacts=2, unsent=2)
     handlers = _campaign_writers(db, outbound=True)
@@ -621,8 +625,8 @@ async def test_the_run_reports_the_rows_it_was_not_allowed_to_send(monkeypatch) 
     result = await handlers.join_request_campaign({"campaign_id": 7}, None)
 
     assert result.get("skipped") == "nobody is waiting on this channel", result
-    assert result["held_back"] == 2, result
-    assert handlers.transport.sent == [], "a held-back row is not a licence to message whoever it was"
+    assert handlers.transport.sent == [], "a row nobody released is not a licence to message that person"
+    assert not result.get("more"), "a pass that found nobody to send to does not ask to be called again"
 
 
 async def test_a_campaign_addresses_people_by_the_handle_telegram_gave(monkeypatch) -> None:
@@ -728,15 +732,14 @@ async def test_no_hour_window_is_read_at_all_anymore_only_the_tap_stops_a_run() 
     assert not [sql for sql, _ in db.sql if "app.job_event" in sql], db.sql
 
 
-async def test_a_pass_reads_one_page_and_says_there_is_more(monkeypatch) -> None:
-    """A pass is a page of the list, not the whole of it, and it never closes the campaign over a tail.
+async def test_a_pass_works_the_whole_list_it_can_read(monkeypatch) -> None:
+    """All of it, not twenty of it — and a list deeper than the read is said, not finished.
 
-    The page exists for the same reason a cursor does: one long statement holding the connection while a
-    300-person list is dialled would be stale-locked by the worker and re-run underneath itself, and two
-    passes over the same strangers is the one thing a DM campaign must not do. What the page used to
-    *also* do — decide when the campaign was allowed to keep going — is gone: the pass returns `more`, and
-    `app/campaignloop.py` comes back for the next page immediately. Nothing here is queued, so nothing here
-    can be swallowed by a dedup key, which is the failure that made this feature stop working twice.
+    The operator's words were "it should not pick 20 people one by one, it should list all the requested users
+    at once and keep the record of who has been sent". So the pass reads as deep as the importer answers
+    (`JOIN_READ_PAGES` pages of a hundred per link) and sends to everyone it reached, one message per person,
+    spaced by the campaign's own delay. What it could not reach is reported as `waiting_after` with `more`
+    true, which the sender comes back for; what it could not reach is never written as "nobody is left".
     """
     from app import writers as writers_module
 
@@ -746,18 +749,22 @@ async def test_a_pass_reads_one_page_and_says_there_is_more(monkeypatch) -> None
     async def _noop():
         return None
 
-    db = CampaignDb(waiting=writers_module.JOIN_MAX_PER_RUN + 7, rate=1000)
-    handlers = _campaign_writers(db, outbound=True)
+    # A small ceiling rather than the production 2 000, so the fake does not build a two-thousand-person list
+    # to prove the same sentence. The constant is read when the pass runs, which is what makes this legal.
+    monkeypatch.setattr(writers_module, "JOIN_LIST_CEILING", 25)
+    db = CampaignDb(waiting=25, rate=1000)
+    handlers = _campaign_writers(db, outbound=True, total=32)
 
     result = await handlers.join_request_campaign({"campaign_id": 7}, None)
 
-    assert result["sent"] == writers_module.JOIN_MAX_PER_RUN, "the page is capped, not the list"
-    assert result["waiting_after"] == 7 and result["more"] is True
-    assert len(slept) == writers_module.JOIN_MAX_PER_RUN - 1
+    assert result["sent"] == 25, "the whole list is the batch"
+    assert result["waiting_after"] == 7 and result["more"] is True, result
+    assert len(slept) == 24, "one gap per pair of people, none before the first"
     assert db.queued == [], "no queue row is written, so no queue row can be swallowed"
-    assert not any("'completed'" in sql for sql, _ in db.sql), "the campaign is still running"
+    assert not any("'completed'" in sql for sql, _ in db.sql), "seven people short is not a finished campaign"
 
 
+@pytest.mark.asyncio
 @pytest.mark.asyncio
 async def test_a_shadow_run_plans_without_recording_anybody(monkeypatch) -> None:
     """Nothing goes on the wire in shadow mode, so sleeping between plans would only make a dry run slow.

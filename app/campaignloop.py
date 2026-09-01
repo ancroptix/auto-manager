@@ -15,8 +15,16 @@ answers with, and the per-person rules that were never about the queue are all s
 is written before the send, one person is never messaged twice, `⏸` is re-read between every two people, and a
 flood wait from Telegram is slept out rather than shaved.
 
-One service per campaign is the assumption this makes, and it is the deployment's own: one Render web service,
-`WORKER_ENABLED` as its switch, and this loop started and stopped with the worker inside it.
+One service per campaign is the assumption this makes, and it is the deployment's own: one Render web service
+running one loop.
+
+**Why the service starts this and not the queue worker.** It rode the worker for exactly one round, and the
+result was a campaign screen that needed a paragraph about `app.job` to explain why nothing was being sent: the
+operator had to start the queue before their DMs would move, and `▶️ Run the queue` sat on a screen that is
+supposed to have two controls. So `app/main.py` wakes this loop when the service comes up and stops it on
+shutdown, and the one service-wide switch it obeys is the pause flag in `app.setting` — because a paused service
+must not DM strangers while the operator is trying to make it do nothing. Everything else about sending is the
+campaign's own row: ✅ on, ⏸ off.
 """
 
 from __future__ import annotations
@@ -84,6 +92,11 @@ class CampaignLoop:
         return self._task is not None and not self._task.done()
 
     def start(self) -> None:
+        """Wake the sender. Idempotent, because the service calls it on boot and a restart calls it again.
+
+        Shadow mode is the one thing that keeps it asleep: a loop in a read-only service would read a
+        stranger queue forever and tell nobody anything, so the plan tap runs one pass instead, on purpose.
+        """
         if self.running:
             return
         if not getattr(self.settings, "outbound_enabled", False):
@@ -126,6 +139,13 @@ class CampaignLoop:
     # ------------------------------------------------------------ one round
     async def _round(self) -> None:
         self.rounds += 1
+        if await self._paused():
+            # The service-wide pause is the operator's emergency stop, and "everything stops" has to include
+            # the DMs. Nothing is skipped or lost by waiting: the campaigns keep their status, and the next
+            # round after a `/resume` reads the same list again.
+            self.detail[-2] = {"paused": True, "at": time.time()}
+            await self._pauseable(self.poll_seconds)
+            return
         rows = list(await self.db.fetch(CAMPAIGN_ON_SQL) or [])
         if not rows:
             await self._pauseable(self.poll_seconds)
@@ -135,6 +155,17 @@ class CampaignLoop:
                 return
             campaign_id = int(row["id"])
             await self._pass(campaign_id, str(row.get("name") or ""))
+
+    async def _paused(self) -> bool:
+        """Whether the whole service is paused, read fresh every round, and never assumed.
+
+        A database that cannot answer is not a licence to send: the flag exists for the moments when the
+        operator wants nothing to leave the account, so the safe answer to a failed read is "wait".
+        """
+        try:
+            return bool(await self.db.is_paused())
+        except Exception:  # noqa: BLE001 - and it is a wait, not a crash: the next round asks again
+            return True
 
     async def _pass(self, campaign_id: int, name: str) -> None:
         started = time.monotonic()
@@ -170,6 +201,11 @@ class CampaignLoop:
             gap=float(result.get("gap_seconds") or 0.0),
             stopped=bool(result.get("stopped")),
             finished=not more,
+            # The pass's own sentence for "there was nothing for me to do", carried to the operator's screen
+            # verbatim. It matters more than it looks: "I tapped Start and no DM went out" is usually this
+            # branch — the channel's list is empty, or everybody on it already has a row — and a screen that
+            # answers "on" to that is the silence with a smile on it.
+            skipped=str(result["skipped"]) if result.get("skipped") else None,
             seconds=round(time.monotonic() - started, 1),
         )
         if sent + planned + failed == 0:
@@ -211,6 +247,7 @@ class CampaignLoop:
         """
         return {
             "running": self.running,
+            "paused": bool(self.detail.get(-2, {}).get("paused")),
             "shadow": bool(self.detail.get(-1, {}).get("shadow")),
             "rounds": self.rounds,
             "passes": self.passes,

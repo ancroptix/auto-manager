@@ -85,26 +85,25 @@ async def run_briefly(worker: Worker, seconds: float = 0.15) -> None:
 
 
 @pytest.mark.asyncio
-async def test_the_campaign_sender_starts_and_stops_with_the_worker(make_settings) -> None:
-    """One switch for both halves of the service, which is what "on/off for sending" means in practice.
+async def test_the_campaign_sender_starts_with_the_service_and_not_with_the_worker(make_settings) -> None:
+    """The DMs do not wait for the queue. `create_app` owns the sender, `WORKER_ENABLED` does not.
 
-    `/worker off` is the operator's emergency stop, so a campaign loop that kept dialling afterwards would be
-    worse than the queue it replaced. The wiring is asserted rather than the sending: the worker builds the
-    loop when it starts, publishes what it says in its own `snapshot()`, and throws it away when it stops, so
-    a `/worker on` later gets a fresh one instead of a task that belongs to a dead worker. `make_settings()` is
-    shadow mode, which is what keeps this test from starting a real sender on a real timer.
+    The loop rode the worker for one round, and the campaign screen had to explain a second switch to an
+    operator who had asked for one: `▶️ Run the queue` on a screen about messaging strangers. So the sender is
+    built with the service, is there when the worker is off, and is the thing `/pause` stops. A worker being
+    off means jobs are not claimed — it has not meant "no DMs" since, and this is the test that keeps it that
+    way.
     """
-    db = FakeDB()
-    worker = make_worker(make_settings(), db)
-    assert worker.snapshot()["sending"] is None, "no sender before the worker runs"
+    app = create_app(make_settings(worker_enabled=False), start_worker=False)
+    state = app.state
+    assert state.worker is None, "the settings say no queue worker, and that is what they mean"
+    assert state.campaign_loop is not None, "the sender exists anyway, because the campaign is not a job"
 
-    worker.start()
-    sending = worker.snapshot()["sending"]
-    assert sending is not None and sending["shadow"] is True, sending
-    assert sending["running"] is False, "a shadow service must not be sending anybody"
-
-    await worker.stop(drain_seconds=1)
-    assert worker.snapshot()["sending"] is None, "the sender is gone with the worker"
+    loop = state.campaign_loop
+    assert loop.running is False, "building the service does not start a task"
+    loop.start()
+    assert loop.running is False, "and a shadow service refuses to run one"
+    assert loop.snapshot()["shadow"] is True, "which is the answer the campaign screens print"
 
 
 @pytest.mark.asyncio

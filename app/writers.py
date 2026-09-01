@@ -38,7 +38,14 @@ from .stages import JobKind, JobStage
 
 log = logging.getLogger("auto_manager.writers")
 
-__all__ = ["FeatureNotImplemented", "NeedsInput", "Writers", "build_writers"]
+__all__ = [
+    "FeatureNotImplemented",
+    "NeedsInput",
+    "Writers",
+    "build_writers",
+    "campaign_gap_seconds",
+    "campaign_release_unsent",
+]
 
 
 class FeatureNotImplemented(NotImplementedError):
@@ -894,7 +901,14 @@ JOIN_SEND_GAP_SECONDS = 3.0
 #: empties seventeen pages later with no clock on it and no queue row to wait for. Twenty is what one read of
 #: the importer answers comfortably, and it keeps a pass short enough that a stop the operator taps lands on
 #: the next person rather than after a thousand.
-JOIN_MAX_PER_RUN = 20
+#: How deep one read of the waiting list goes. `app/sender.py` walks Telegram's 100-row pages per invite
+#: link, so this is the number of pages it may ask for: twenty pages is two thousand people, which is more
+#: than a private channel's request queue holds in practice and is not a *limit on the campaign* — a pass
+#: sends to everyone the read reaches. A list deeper than the read gets `more` back from the pass, and
+#: `app/campaignloop.py` comes around again; that is the difference between this and the run that stopped at
+#: twenty and called it finished.
+JOIN_READ_PAGES = 20
+JOIN_LIST_CEILING = JOIN_READ_PAGES * 100
 
 #: What a campaign's own status has to say for it to be sending. `ready` is "started and not yet finished",
 #: `running` is "in the middle of the list"; anything else — `paused`, `aborted`, `completed`, `draft` — is a
@@ -926,6 +940,29 @@ def campaign_gap_seconds(campaign: Mapping[str, Any]) -> float:
     return max(JOIN_GAP_MIN_SECONDS, min(value, JOIN_GAP_MAX_SECONDS))
 
 
+async def campaign_release_unsent(db: Any, campaign_id: int) -> int:
+    """Hand back the people a campaign wrote a row for and never messaged, and say how many there were.
+
+    A contact row is written *before* the send, so anything left at `queued` with no `sent_at` is one of two
+    things: a run killed between the two statements (whose person must not be messaged, because nobody can
+    prove the message did not go), or a row an older build left behind from a dry run that recorded people it
+    only planned. The second one is the state this deployment is full of, and it is why a campaign can read
+    "0 still waiting" while nobody has been sent anything: those ids are in the `already` set, so every later
+    pass skips them and the list looks empty.
+
+    This is not decided by a guess. It is written by the operator's own ✅, which is a human saying "send to
+    the people on this list" — so the release happens there, in `app/controlbot.py`, on the screen that shows
+    the wording and the count. The rows and their history stay; only the status moves, to the one value that
+    means "owed a message", and the next pass sends to them like anyone else.
+    """
+    moved = await db.execute(
+        "update app.join_campaign_contact set status = 'skipped' where campaign_id = $1"
+        " and status = 'queued' and sent_at is null returning telegram_user_id",
+        int(campaign_id),
+    )
+    return len(moved or []) if isinstance(moved, list) else int(moved or 0)
+
+
 async def campaign_status(db: Any, campaign_id: int) -> str:
     """What the campaign says right now — read again between sends, not remembered from the batch plan."""
     return str(await db.fetchval("select status from app.join_campaign where id = $1", int(campaign_id)) or "")
@@ -943,11 +980,11 @@ async def campaign_pass(self: Writers, campaign_id: int, *, ctx: Any = None) -> 
       the middle becomes "already contacted" rather than a second message to the same stranger;
     * the spacing between two messages is the campaign's own ``per_message_delay_seconds`` (1 second to
       ``JOIN_GAP_MAX_SECONDS``, ``JOIN_SEND_GAP_SECONDS`` when the row says nothing usable);
-    * a pass is one page of the list (``JOIN_MAX_PER_RUN`` people) and nothing more. It stops at an empty
-      list, when the operator taps `⏸ Stop after this one` (re-read before every person, so it lands within
-      one message), or when a flood wait says so. There is no hourly ceiling and no next run to hand the
-      list to: `app/campaignloop.py` asks for the next page the moment this one finishes, so "it keeps going
-      until you stop it" is a property of the loop rather than a promise in a sentence.
+    * a pass works **the whole list it can read**: everyone the waiting-list read reaches, one message each,
+      spaced by the gap above. There is no batch size, no hourly ceiling and no next run to hand anything to;
+      a list deeper than the read can walk comes back as `more`, and `app/campaignloop.py` asks for the rest.
+      It stops when the list is empty, when the operator taps `⏸ Stop after this one` (the campaign row is
+      re-read before every person, so the tap lands within one message), or when a flood wait says so.
       `campaign.rate_per_hour` is not read at all — it was a number the operator never chose and it stopped
       their list invisibly at twenty;
     * a privacy refusal marks the contact ``failed`` and is not retried into a second attempt.
@@ -977,13 +1014,13 @@ async def campaign_pass(self: Writers, campaign_id: int, *, ctx: Any = None) -> 
         raise NeedsInput("the campaign text breaks a rule: " + " / ".join(problems))
 
     # One number, from the campaign's own row: how far apart two messages go. There is no second limit any
-    # more — no hour to stop at, no lease to fit inside — because a pass is one page of the queue, not a job
-    # with a clock on it. The page size is `JOIN_MAX_PER_RUN`, and `app/campaignloop.py` asks for the next
-    # page as soon as this one is done, which is what "it keeps going until I stop it" is made of.
+    # more — no hour to stop at, no lease to fit inside, no batch to size — because a pass is the list itself
+    # and not a job with a clock on it. What the read cannot reach, it says so.
     gap = campaign_gap_seconds(campaign)
     peer = self._peer(campaign)
-    # `skipped` is the one status that means "this person is owed a message": an earlier run wrote the row and
-    # never sent it, and the operator has since said so out loud. Everything else counts as dealt with,
+    # `skipped` is the one status that means "this person is owed a message": an earlier attempt wrote the row
+    # and never sent it, and a human has since said so out loud — which is what `campaign_release_unsent`
+    # below does at the operator's own start tap. Everything else counts as dealt with,
     # `queued` included — the row is written *before* the send so a crash between the two cannot become a second DM,
     # and only a human can tell that state from a plan that was never a message at all.
     already = {
@@ -994,37 +1031,42 @@ async def campaign_pass(self: Writers, campaign_id: int, *, ctx: Any = None) -> 
             int(campaign_id),
         )
     }
-    unreleased = int(
-        await self.db.fetchval(
-            "select count(*) from app.join_campaign_contact where campaign_id = $1 and status = 'queued'"
-            " and sent_at is null",
-            int(campaign_id),
-        )
-        or 0
-    )
+    # How many of those known rows were written and never sent is deliberately **not** counted here. The
+    # operator's screen gets that number from the campaign row itself (`app/controlbot.py`), and the one place
+    # this pass may act on it is the ✅ that starts it — `campaign_release_unsent` below. A second copy of the
+    # figure inside a pass result would be a second truth about the same rows, and this campaign has been
+    # reported to its owner with two of those before.
 
     reader = self._writer([peer], max_writes=0)
     # `skip` is the whole reason the read can move: the queue is newest-first and does not shrink while a
     # campaign works through it, because nothing here approves anybody. Without it, a pass that had written
     # to the first hundred would read those same hundred, find them known, and be tempted to call the
     # campaign finished with two thousand nine hundred still waiting.
-    found, requests = await reader.pending_requests(peer, limit=JOIN_MAX_PER_RUN * 2, skip=already)
+    found, requests = await reader.pending_requests(
+        peer, limit=JOIN_LIST_CEILING, max_pages=JOIN_READ_PAGES, skip=already
+    )
     if not found.ok:
         return {"campaign_id": int(campaign_id), "blocked": found.detail}
     waiting = [entry for entry in requests if int(entry.get("user_id") or 0) and int(entry["user_id"]) not in already]
+    # Telegram's own count of who is waiting, minus the people this campaign has a row for, minus the people
+    # this read reached. Whatever is left is a list deeper than the pages walked, and it is carried on every
+    # answer below: "nobody is waiting" and "this pass could not reach them" are two different sentences, and
+    # the operator has been told the wrong one of those twice.
+    reached = int(getattr(found, "total", 0) or 0) - len(already) - len(waiting)
+    beyond = max(0, reached)
     if not waiting:
-        waiting_too = int(getattr(found, "total", 0) or 0) - len(already)
-        if waiting_too > 0:
+        if beyond > 0:
             # People are waiting and this pass could not reach them — the read walked its pages, the offset
             # ran out, or a link refused. Closing the campaign here would be the loudest kind of wrong, so
             # the pass reports the number it could not get to and says there is more to ask for.
             return {
                 "campaign_id": int(campaign_id),
-                "waiting": waiting_too,
+                "waiting": beyond,
                 "sent": 0,
                 "failed": 0,
+                "waiting_after": beyond,
                 "more": True,
-                "why": "the queue is bigger than the pages this pass could read",
+                "why": "the queue is deeper than the pages this read walked",
             }
         await self.db.execute(
             # Guarded like every other write this function makes: "nobody is left" is a fact about the
@@ -1037,7 +1079,7 @@ async def campaign_pass(self: Writers, campaign_id: int, *, ctx: Any = None) -> 
         return {
             "campaign_id": int(campaign_id),
             "skipped": "nobody is waiting on this channel",
-            "held_back": unreleased,
+            "waiting_after": 0,
         }
 
     message = " ".join(str(campaign["message_template"]).split())
@@ -1046,7 +1088,7 @@ async def campaign_pass(self: Writers, campaign_id: int, *, ctx: Any = None) -> 
     # No peer allowlist for the people themselves: they are named by Telegram's own list of pending
     # requests for this channel, which is as close to "this account asked to be contacted" as a
     # campaign gets. The one-per-person rule and this spacing are what bound it.
-    batch = waiting[:JOIN_MAX_PER_RUN]
+    batch = waiting
     writer = self._writer([], max_writes=len(batch))
     sent = failed = planned = 0
     stopped_early = False
@@ -1101,10 +1143,12 @@ async def campaign_pass(self: Writers, campaign_id: int, *, ctx: Any = None) -> 
                 user_id,
                 result.detail[:400],
             )
-    # How many people the channel still had waiting once this page was taken. One number, used by every exit
-    # below, because "the queue is bigger than what one read fetched" is the same fact in shadow mode as in
-    # live mode and cannot be allowed to be computed two ways.
-    remaining = len(waiting) - len(batch)
+    # How many people are still owed a message when this pass stops. One number, worked out once, because "the
+    # channel has nobody left" and "this read could not reach that many" and "the operator stopped me partway"
+    # are three different sentences and the operator has been shown the wrong one of them twice.
+    # `position` is the person this pass stopped *before* sending, so the ones left are `len - position`.
+    unhandled = (len(waiting) - position) if stopped_early else 0
+    waiting_after = max(0, unhandled + beyond)
     if not batch_real_send:
         # A dry run plans a page and stops there: it hands the campaign back as `ready`, waiting for the tap
         # that sends for real. The two alternatives are both traps — leaving it `running` would give the
@@ -1122,12 +1166,12 @@ async def campaign_pass(self: Writers, campaign_id: int, *, ctx: Any = None) -> 
             "planned": planned,
             "sent": 0,
             "failed": failed,
-            "waiting_after": max(0, remaining),
+            # Everyone this pass planned is still owed: a dry run sent nothing and recorded nobody, so the
+            # honest count of what the real run has left to do is the whole list plus the depth the read could
+            # not walk. A `0` here would be the "0 pending" sentence that started this.
+            "waiting_after": len(waiting) + beyond,
             "shadow": "nothing was sent, so nobody is recorded as contacted",
-            # The page was the whole of what this look could see, so there may well be more waiting; the
-            # number is the reason, not a guess. (The sender never reads this in shadow mode — it is not
-            # started — but a shape that lies about the list would be picked up the day someone changes that.)
-            "more": remaining > 0,
+            "more": True,
         }
 
     if stopped_early:
@@ -1137,23 +1181,21 @@ async def campaign_pass(self: Writers, campaign_id: int, *, ctx: Any = None) -> 
             "campaign_id": int(campaign_id),
             "sent": sent,
             "failed": failed,
-            "waiting_after": max(0, len(waiting) - position),
+            "waiting_after": waiting_after,
             "stopped": "the campaign was paused or aborted while this pass was working",
             "gap_seconds": gap,
             "more": False,
-            "held_back": unreleased,
         }
-    finished = remaining <= 0
+    finished = waiting_after <= 0
     if await campaign_status(self.db, int(campaign_id)) not in RUNNABLE_CAMPAIGN_STATES:
         return {
             "campaign_id": int(campaign_id),
             "sent": sent,
             "failed": failed,
-            "waiting_after": max(0, remaining),
+            "waiting_after": waiting_after,
             "stopped": "the campaign was paused or aborted while this pass was working",
             "gap_seconds": gap,
             "more": False,
-            "held_back": unreleased,
         }
     # The status is passed as text and cast, and the "did we run out of people" flag is its own
     # parameter: reusing $2 for both the enum column and a `case when $2 = 'completed'` comparison makes
@@ -1163,7 +1205,7 @@ async def campaign_pass(self: Writers, campaign_id: int, *, ctx: Any = None) -> 
         "update app.join_campaign set status = $2::app.campaign_status, updated_at = now(),"
         # `and status in ('ready', 'running')`: a pause or an abort the operator tapped while this pass was
         # sending is their decision about the campaign, and a finishing pass has no business rewriting it to
-        # `running` (or, worse, `completed`) because the page it read is over. The rows this pass wrote stay,
+        # `running` (or, worse, `completed`) because the list it read is over. The rows this pass wrote stay,
         # and the contacts already sent stay sent.
         " finished_at = case when $3 then now() else finished_at end where id = $1"
         " and status in ('ready', 'running')",
@@ -1175,15 +1217,14 @@ async def campaign_pass(self: Writers, campaign_id: int, *, ctx: Any = None) -> 
         "campaign_id": int(campaign_id),
         "sent": sent,
         "failed": failed,
-        "waiting_after": max(0, remaining),
+        "waiting_after": waiting_after,
         "gap_seconds": gap,
-        # The loop's signal, and the only "next" this function knows about: the sender asks for another page
-        # itself, so nothing here writes a row for anything else to finish.
+        # The loop's signal, and the only "next" this function knows about: the sender asks for the rest of
+        # the list itself, so nothing here writes a row for anything else to finish.
         "more": not finished,
         # Named rather than folded into `failed`: these are rows this pass did not touch because a record of
         # them already exists, and the operator has to be able to tell "nobody is left" from "nobody is left
         # *that I have not already written about*".
-        "held_back": unreleased,
     }
 
 
