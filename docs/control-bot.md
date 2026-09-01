@@ -161,8 +161,9 @@ session at boot, if it restarts on its own.
 | `/archive [<@handle\|channel id> add [title <name>]]` | which private channel holds the master copy: bare `/archive` reads the list, `add` writes the missing row the archive job blocks on. The first row added is `is_primary`, because two primaries would make `app/writers.py` pick between them |
 | `/joinmsg [show\|options\|use <n>\|set <text>\|clear]` | what a join requester is told, when you later run a campaign at them. `options` lists three drafts with the promise each one makes; `use 2` saves one, `set …` saves your own words (`{name}` and `{series}` are filled at send time), `clear` empties it so the app may contact nobody. Saving is not sending, and the reply says so — sending is a campaign per channel, started from `/joinreq`. It cannot approve or decline anyone, and it refuses a message that carries an invite link |
 | `/joinreq [plan\|open <ref>\|start <ref>\|go <ref>\|stop <ref>\|free <ref>\|add\|file <n>]` | the join-request campaign by button: the channels this account can **post in** (rights asked of Telegram on the spot, not read from a cached list), the exact words and who is waiting, then one tap to start. Sending goes to one person every **`⏱`-chosen number of seconds** (the campaign's own `per_message_delay_seconds`,
-three by default), nobody twice, up to the campaign's hourly ceiling — or past it, if `♾ Send the whole list`
-has been tapped; a run that does not finish hands the rest to the next one, so a restart or a spin-down resumes the list instead of stranding it. `add` lists the postable channels that have no row yet and `file <n>` writes one through discovery's writer (founding the series row from the channel's own name when nothing else names it). `free <ref>` releases the contacts a run recorded but never sent (status `skipped`, the row and its history
+three by default), nobody twice, and with **no hourly stop at all** — `⏱ Set delay (3 s)` is the one pace
+control on that screen: it asks for the number and the number sent back is what the run sleeps between two
+messages, which is the whole pace conversation an operator needs to have; a run that does not finish hands the rest to the next one, so a restart or a spin-down resumes the list instead of stranding it. `add` lists the postable channels that have no row yet and `file <n>` writes one through discovery's writer (founding the series row from the channel's own name when nothing else names it). `free <ref>` releases the contacts a run recorded but never sent (status `skipped`, the row and its history
   staying put) so a later run owes them a message again — the state an older shadow run left behind, which
   made a campaign look finished while its strangers were never told; the bot cannot tell that from a send cut
   off mid-flight, so it shows the count on the channel's screen and asks for one tap instead of guessing. It
@@ -171,19 +172,24 @@ has been tapped; a run that does not finish hands the rest to the next one, so a
 | `/declare <series> <season> <episodes>` | state how long a season is — the only thing that can fill **◎ Total Episodes**, and the only thing that can make a season count as complete. It publishes nothing itself; the batch post stays the publisher's decision. `/declare bleach 2 tba` takes the claim back |
 | `/card <channel> <message id\|show\|clear>` | the post in that destination channel whose link the announcements channel carries. `show` reports whether a shareable link was ever returned; `clear` un-names it (the stored link stays, because deleting is not this program's verb). One number, per channel: without it `publish_post` blocks rather than announcing the invite |
 | `/sticker <series> <season> from <channel> <message id>` | which sticker opens a season. Telegram addresses a sticker by the message carrying it, so a pack name or an install link is not an address; the job forwards that message into the destination before the season's first episode post |
-| `/campaign <channel> [new\|text\|plan\|confirm\|rate\|gap\|pause\|abort] <name>` | a join-request campaign, in two deliberate steps: `new` drafts it from the saved `/joinmsg` wording (or `text` writes its own), `plan` shows the rules, the rate and the pending count and prints a code, `confirm <name> <code>` makes it `ready` and queues the job. The code is derived from the row and its exact text, so editing the wording invalidates an old confirmation. `rate <name> <n>` sets how many people an hour that campaign may hear from (1 to 200, and each run is still
-  capped at what fits in the job lease at that spacing, so the number buys more runs rather than a faster
-  flood); `rate <name> off` is "no hourly stop for this list" — the column's own check allows 1 to 500 and this
-  program does not rewrite a check on a database that is already running, so the tap writes the number that
-  cannot bind, which is everyone waiting right now, and says so; `gap <name> <seconds>` is the spacing between
-  two messages (1 to 600, and the batch shrinks with it)
-  — and it wakes the waiting run early, because the hour a spent ceiling set a timer for is shorter the moment
-  the ceiling is higher. A campaign that reaches its ceiling is not paused and not finished: it stays armed, and
-  the run that met the ceiling goes back on the queue in its own row with its wake-up time on it (`app/job`
-  dedupes on one global key, so a second row for the same run cannot be written while the first is alive). The
-  channel's screen prints that time (`next batch: job #20 wakes in about 40 minutes`, read from the row by
-  campaign rather than by key, since a count the operator changed does not move the row) because a wait nobody
-  wrote down is indistinguishable from a dead bot. `abort` stops it
+| `/campaign <channel> [new\|text\|plan\|confirm\|gap\|pause\|abort] <name>` | a join-request campaign, in two
+  deliberate steps: `new` drafts it from the saved `/joinmsg` wording (or `text` writes its own), `plan` shows the
+  rules, the spacing and the pending count and prints a code, `confirm <name> <code>` makes it `ready` and queues
+  the job. The code is derived from the row and its exact text, so editing the wording invalidates an old
+  confirmation. `gap <name> <seconds>` is the whole pace control — how far apart two messages go, 1 second to
+  9999 — and the channel's screen asks for it as `⏱ Set delay (3 s)`, one tap and one typed number, because a
+  row of preset buttons is how a simple thing gets complicated. The number also sets how many people a run may
+  write before it hands the list to the next run: a batch has to fit inside `claim_lease_seconds`, because
+  `release_expired_locks` would otherwise hand the same strangers to a second worker, and two passes over the
+  same people is the one thing a DM campaign must not do. There is **no hourly stop**: the campaign sends until
+  the list is empty, until `⏸ Stop after this one` is tapped (the campaign row is re-read before every person,
+  so the tap lands within one message), or until Telegram's own flood wait says so. `campaign.rate_per_hour`
+  no longer bounds it — that default of twenty is what stopped 340 people at twenty and then parked the
+  campaign as `paused` with nothing scheduled, which read as a dead bot. The screen still prints where the
+  queue is (`next batch: job #20 wakes in about 40 minutes`, read from `app.job` by campaign rather than by
+  key, because a count the operator changed does not move the row), and a row that has spent its tries says so
+  with the one tap that re-arms it, because a wait nobody wrote down is indistinguishable from a dead bot. 
+`abort` stops it
   and leaves every row in place. Confirm never says "queued" without checking what the queue did with it: `app/job` dedupes on a **globally unique** `dedup_key`, so the row a finished run leaves behind used to swallow every later start of the same campaign — the reply read "the job is already queued" and no DM ever went out. `app.writers.queue_campaign_run` now answers in four parts: a new row (`queued`), the closed row put back on the queue (`restarted`, and it names what it was), a live job left alone because it *is* the run (`held`), and a `blocked` job that stays a question until a person taps (`waiting`). A start tap also resets a `queued` row that had spent all its `max_attempts`, which otherwise sits in the queue looking like work no worker will ever claim. Every one of those replies ends with the four switches that can each silence a campaign on their own — the pause flag, `APP_MODE`, `WORKER_ENABLED`, and an account with no stored session — printed only when they are actually wrong, each with the command that fixes it |
 | `/sessions` | name, kind, account, age, character count — never contents |
 | `/use backup` | make another stored session the live one |
@@ -325,7 +331,7 @@ only the channels this account can post in — rights asked of Telegram on the s
 from that session — and `➕ Add a channel` files one that has no row yet through the same writer discovery
 uses, founding the series row from the channel's own name and saying so in the reply. The campaign is drafted
 from the saved `/joinmsg` wording under one fixed name, so no name has to be invented, and what `confirm`
-gates with a code the wizard computes instead of asking for: the plan (the exact words, the ceiling, who is
+gates with a code the wizard computes instead of asking for: the plan (the exact words, the spacing, who is
 waiting right now) is the screen before the start tap, so the tap is the reading of it. That headcount is
 read on a session of the bot's own (`_pending_requests`), because a plan that counts people is only worth
 tapping if the number is today's — and when the read fails the plan says what failed instead of showing `0`,

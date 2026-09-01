@@ -40,6 +40,7 @@ __all__ = [
     "NAV_PREFIX",
     "PROMPTS",
     "PROMPT_PREFIX",
+    "prompt_ref_payload",
     "ROW_PREFIX",
     "RULE",
     "RUN_PREFIX",
@@ -107,7 +108,7 @@ PROMPT_PREFIX = "p:"
 #: The slots that change a configured row, and so have to say which one. A prompt without a row id would
 #: have to guess, and the answer would land on whichever row the bot last looked at — a silent wrong turn
 #: in the one place a screen is allowed to take input.
-ROW_SLOTS = frozenset({"series", "title", "season", "audio", "card", "episodes", "campaign"})
+ROW_SLOTS = frozenset({"series", "title", "season", "audio", "card", "episodes", "campaign", "delay"})
 
 #: Which table each question can be asked about. `card` belongs to a destination and `series` to a source,
 #: and a payload that asked for one on the other would have to be refused by the translator two calls later
@@ -119,6 +120,7 @@ ROW_SLOT_TABLES: dict[str, str] = {
     "audio": "s",
     "card": "d",
     "campaign": "d",
+    "delay": "d",
     "episodes": "sd",
 }
 
@@ -133,6 +135,11 @@ PROMPTS: dict[str, str] = {
     "season": (
         "Send the season number this channel's files continue from.\n"
         "It is a numbering default, never a claim that a season has started."
+    ),
+    "delay": (
+        "Send the number of seconds to leave between two messages. One number, nothing else — `7`.\n"
+        "1 second is the fastest this bot will write, because messages sent back to back are what gets an "
+        "account restricted, and the account is the thing that has to keep working."
     ),
     "joinmsg": (
         "Write the message in your own words. {name} and {series} are filled in when it is sent.\n"
@@ -269,6 +276,15 @@ def parse_row(payload: str) -> tuple[str, int, str, str | None] | None:
 
 def prompt_payload(slot: str) -> str | None:
     return encode(f"{PROMPT_PREFIX}{slot}")
+
+
+def prompt_ref_payload(slot: str, ref: str) -> str | None:
+    """`p:<slot>:<row ref>` — a question that has to be answered about one named row.
+
+    The reference rides on the payload rather than being remembered by the bot, because the answer can
+    arrive minutes later, after the operator opened another channel and came back.
+    """
+    return encode(f"{PROMPT_PREFIX}{str(slot or '').strip()}:{str(ref or '').strip()}")
 
 
 def parse_prompt(payload: str) -> tuple[str, str | None] | None:
@@ -871,6 +887,11 @@ def joinreq_screen(
         # here rather than guessed at by the caller: a button that was meant to open the wording screen and
         # silently disappeared because its payload did not start with a slash is the failure this prevents.
         payload = payload_for(str(choice.get("command") or "")) if choice.get("command") else None
+        if payload is None and choice.get("prompt"):
+            # A choice may also ask for a number instead of running a command. `p:<slot>:<row>` is the one
+            # shape the console already knows how to arm, answer and abandon, so a screen that wants a value
+            # does not invent a second way of waiting for a reply — and the ✖ that gets out of it comes free.
+            payload = prompt_ref_payload(str(choice["prompt"]), str(choice.get("row") or ""))
         if payload is None and choice.get("screen"):
             payload = f"{NAV_PREFIX}{str(choice['screen']).strip()}"
         made = button(str(choice.get("label") or ""), payload or "")

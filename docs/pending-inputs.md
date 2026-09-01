@@ -200,16 +200,18 @@ The list below is the residual — what still stops each kind from completing, i
   <message id>`, before any episode post of that season. A pack name or an install link is not an
   address, and which sticker opens a season is not this program's call.
 - `join_request_campaign` — reads the still-pending requests of one channel, sends the wording of
-  `/joinmsg`, and stops at `campaign.rate_per_hour` by *waiting* rather than pushing past it. The wait is
-  written, not slept: the run puts **its own queue row** back on the queue with `next_attempt_at` at the
-  minute one of this hour's sends ages out (`app.writers.requeue_current_run`), and asks the worker for no
-  verdict at all (`app.writers.Requeued`), because marking that row succeeded would delete the timer sitting
-  on it. A second row would be swallowed by the `dedup_key` the running row already holds, which is how this
-  branch once left a campaign armed, `paused`, and never started again. A spent ceiling is therefore a timer
-  in Postgres — not a `paused` row nobody restarts, and not a wait in a process that Render may spin down. A campaign runs only after `/campaign … confirm <code>` — or after the plan and the start tap on
-  `/joinreq`, which computes that code instead of asking you to type it, and paces one person every
-  `per_message_delay_seconds` (the campaign row's own number, 3 by default, floored at one second so a DM list
-  can never be turned into a back-to-back flood) so a restart can resume the list. A shadow run plans and records **nobody**: `app.join_campaign_contact`
+  `/joinmsg`, one message every `per_message_delay_seconds` — the campaign row's own number, three by default,
+  floored at one second, because messages sent back to back are what gets an account restricted and the account
+  is what has to keep working. There is no hourly stop: the run empties the list, and the only things that stop
+  it are an empty list, the operator's `⏸ Stop after this one` (re-read before every person, so a tap mid-batch
+  lands within one message), and a flood wait Telegram itself named, which `app/sender.RetryLater` honours
+  rather than shaves. `campaign.rate_per_hour` used to bound the run by *waiting* an hour, and before that by
+  writing `paused`: a default of twenty stopped a 340-person list at twenty messages, scheduled nothing, and
+  answered every later start by pausing it again on the spot — the invisibility the operator reported. What is
+  left is a run that ends when the work ends.
+  A campaign runs only after `/campaign … confirm <code>` — or after the plan and the start tap on
+  `/joinreq`, which computes that code instead of asking you to type it, and sleeps between sends by the same
+  campaign row's number, so a restart can resume the list. A shadow run plans and records **nobody**: `app.join_campaign_contact`
   is the promise that a person is not written to twice, so writing it for a message that never left the
   account would take those people out of every later live run. The queue row a finished run leaves behind is
   put back on the queue by the next start (`app.writers.queue_campaign_run`), because `app/job` dedupes on a
@@ -227,9 +229,14 @@ figuring out why nothing changed, so the split is written down:
 
 - **Live knobs, read while the work runs:** `templates.*`, `branding.*`, `caption.*`, `quality.order`,
   `ingest.*`, `inplace.*`, `thumbnail.*`, `seasons.confirm_unlabelled_reset`, `publish.route`,
-  `announcement.style`, `updates.*`, `stickers.*`, `joinrequest.message`, `campaign.rate_per_hour`,
+  `announcement.style`, `updates.*`, `stickers.*`, `joinrequest.message`,
   `bots.storage_username` and `bots.channel_help_username` (the latter is the peer `/probe` stands in
   front of, so a re-cloned help bot needs no redeploy).
+- **No longer read at all:** `campaign.rate_per_hour`. It was the hourly cap a campaign run obeyed, which is
+  how a 340-person list stopped at twenty messages and then sat `paused` with nothing scheduled to restart it;
+  the operator's rule now is that a run goes on until they stop it, so the pace lives on the campaign row
+  instead (`app.join_campaign.per_message_delay_seconds`, the `⏱ Set delay` tap) and the config row is a number
+  with no reader. The column stays, and so does whatever it already holds.
 - **Read once, when the service starts:** `worker.lease_seconds` (how long a claimed job stays claimed),
   `bot.login_ttl_seconds` and `bot.delete_sensitive`. Editing one takes effect on the next boot.
 - **A record of a policy enforced elsewhere:** `jobs.max_attempts`, which lives on each `app.job` row

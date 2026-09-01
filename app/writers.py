@@ -38,7 +38,7 @@ from .stages import JobKind, JobStage
 
 log = logging.getLogger("auto_manager.writers")
 
-__all__ = ["FeatureNotImplemented", "NeedsInput", "Requeued", "Writers", "build_writers"]
+__all__ = ["FeatureNotImplemented", "NeedsInput", "Writers", "build_writers"]
 
 
 class FeatureNotImplemented(NotImplementedError):
@@ -66,18 +66,6 @@ class WriteBlocked(FeatureNotImplemented):
     silent — the exact shape of failure this project is not allowed to have. Raising the shape
     ``app/worker.py`` already parks puts the sentence in the blocked column instead. A flood is not this:
     a flood knows when it ends and arrives as :class:`app.sender.RetryLater`.
-    """
-
-
-class Requeued(Exception):
-    """The handler has put *its own row* back on the queue with a wake-up time, and wants no verdict.
-
-    It exists because a wait has to be written down rather than slept through or argued away. Marking the
-    row succeeded would delete the timer the handler just set; failing it would park it as `failed`, and
-    `app.claim_next_job` takes `queued` and `running` only, so the campaign would sit armed with nothing
-    able to wake it. So the loop counts the pass, logs this sentence, and leaves the row exactly as the
-    handler wrote it. :class:`app.sender.RetryLater` is the same shape for a wait Telegram named; this one
-    is for a wait our own arithmetic named.
     """
 
 
@@ -895,17 +883,20 @@ async def season_sticker(self: Writers, job: dict[str, Any], ctx: Any) -> dict[s
 
 
 #: One message per this many seconds, per the operator's own instruction: "har 3 second me ek user ko
-#: message." A fixed gap between sends is the *slower* choice than the queue allows, and `rate_per_hour`
-#: still stops the run at the ceiling — the gap spaces the messages out, it does not raise the ceiling, and
-#: nothing here sleeps to dodge a flood wait (`app/sender.py` holds that rule where a wait is real).
+#: message." A fixed gap between sends is the *slower* choice than the queue allows; the campaign's own row
+#: can say something else, and `campaign_gap_seconds` below is what reads it. Nothing about the spacing is
+#: a floor the campaign can raise by sending faster: a send that comes back with a flood wait is honoured,
+#: not shaved, because `app/sender.py` holds that rule where a wait is real. the campaign can raise by sending faster: a send that comes back with a flood
+#: wait is honoured, not shaved, because `app/sender.py` holds that rule where a wait is real.
 JOIN_SEND_GAP_SECONDS = 3.0
 
 #: What `app.join_campaign.per_message_delay_seconds` is allowed to say. The column has always been there and
 #: has always had a check of `>= 0`, which is how a row can hold a number that turns a DM campaign into a
 #: flood: zero spacing means the sends are back to back, and the account — not the strangers — is what eats
-#: that. One second is the floor, and an hour is the ceiling, so a typo cannot strand a list for a day.
+#: that. One second is the floor; above it the number is the operator's, whatever they type, up to what the
+#: column can hold. A five-hour spacing is a choice about their own list, not a fault to guard against.
 JOIN_GAP_MIN_SECONDS = 1.0
-JOIN_GAP_MAX_SECONDS = 3600.0
+JOIN_GAP_MAX_SECONDS = 9999.0
 
 
 def campaign_gap_seconds(campaign: Mapping[str, Any]) -> float:
@@ -959,54 +950,17 @@ CAMPAIGN_JOB_BY_KEY_SQL = (
     " from app.job where dedup_key = $1"
 )
 
-#: Pulls one waiting run forward to right now, because the operator has just changed the thing it was
-#: waiting for. `app.claim_next_job` treats a past `next_attempt_at` as "now", so nothing else has to know
-#: this happened. By `id` and only while the row is `queued`: a row a worker is inside is not a screen's to
-#: move. `app.job` has no `updated_at`, which is a column this project has already been caught inventing.
-WAKE_JOB_BY_ID_SQL = (
-    "update app.job set next_attempt_at = now() where id = $1 and status = 'queued' returning id"
+#: The job states that mean "this row is done with". `queued` and `running` are the two that mean a worker
+#: still owns it, and the difference decides whether a new run can be written at all.
+CLOSED_JOB_STATES: tuple[str, ...] = ("succeeded", "failed", "cancelled")
+
+#: What holds a campaign's key, and how tired it is. `attempts`/`max_attempts` belong in this read because
+#: a `queued` row that has spent its tries is invisible in every other way: it looks like work waiting for a
+#: worker, and no worker will ever take it.
+CAMPAIGN_JOB_BY_KEY_SQL = (
+    "select id, status::text as status, coalesce(last_error, '') as last_error, attempts, max_attempts"
+    " from app.job where dedup_key = $1"
 )
-
-
-#: A claimed row asking for its own time back. By `id`, not by `dedup_key`: the key names the row this run
-#: is sitting in, so a key-based statement could only ever touch a row that is not ours. `locked_by` and
-#: `locked_until` go back to null with it, or the next worker has to wait out a lease that nobody holds,
-#: and `finished_at` goes null because a row on the queue again is not a row that is over.
-REQUEUE_JOB_SQL = (
-    "update app.job set status = 'queued', next_attempt_at = now() + make_interval(secs => $2::int),"
-    # `last_error` goes with the lease, or a row that failed three times before it learned to wait keeps
-    # showing the old sentence next to a `queued` status — the third state that makes a queue look busy.
-    " locked_by = null, locked_until = null, finished_at = null, started_at = null, last_error = null"
-    " where id = $1 returning id"
-)
-
-#: The wait on the row's own timeline, so `/status` and the campaign screen can say why a job that has not
-#: failed is not running either. A future `next_attempt_at` is invisible unless somebody writes it down.
-JOB_WAIT_EVENT_SQL = (
-    "insert into app.job_event (job_id, stage, status, message) values ($1, $2::app.job_stage,"
-    " 'queued', $3)"
-)
-
-
-async def requeue_current_run(
-    db: Any, *, job_id: int, delay_seconds: int, note: str, stage: str = "discovered"
-) -> bool:
-    """Hand this job's own row back to the queue with a wake-up time on it. True when the row is on it.
-
-    A campaign that has spent its hour needs a timer, and the two obvious ways to give it one are both
-    wrong. A *new* row for the same run is swallowed by the globally unique key the running row already
-    holds, so the wait is never written and the run then closes the only row there was: armed campaign,
-    no wake-up, and the operator's next tap met by the same ceiling again. Leaving the row `failed` with a
-    future `next_attempt_at` is equally dead, because claiming skips every status but `queued` and
-    `running`. So the row re-queues itself. The wait is a Postgres timestamp, which is the only kind that
-    survives a service spun down in the middle of it.
-    """
-    done = await db.fetchrow(REQUEUE_JOB_SQL, int(job_id), max(60, int(delay_seconds)))
-    if done is None:
-        return False
-    await db.fetchrow(JOB_WAIT_EVENT_SQL, int(job_id), stage, note[:400])
-    return True
-
 
 #: What the campaign's own status has to say for a run to keep going. Anything else is an operator's
 #: decision, taken while this run was mid-batch, and it wins.
@@ -1146,10 +1100,10 @@ async def join_request_campaign(self: Writers, job: dict[str, Any], ctx: Any) ->
     * the spacing between two messages is the campaign's own ``per_message_delay_seconds`` (1 second to one
       hour, ``JOIN_SEND_GAP_SECONDS`` when the row says nothing usable), and how many people one run writes
       is derived from it so a batch cannot outlive its lease;
-    * ``rate_per_hour`` is honoured by *waiting*: the run puts its own queue row back with the minute the
-      oldest send of the hour ages out, and the campaign stays armed. Never by sleeping through the wait,
-      never by shaving the interval, and no longer by pausing the campaign and calling that a plan — a
-      pause nobody scheduled is a stop nobody can find;
+    * the run does not stop at an hour. It stops when the list is empty, when the operator taps `⏸ Stop
+      after this one` (re-read before every person, so it lands within one message), or when a flood wait
+      says so. `campaign.rate_per_hour` is no longer what bounds a campaign — it was a number the operator
+      never chose, and it stopped their list invisibly at twenty;
     * a privacy refusal marks the contact ``failed`` and is not retried into a second attempt.
     """
     from . import joinmsg  # noqa: PLC0415  (the wording module owns the rules, not this transport)
@@ -1159,8 +1113,7 @@ async def join_request_campaign(self: Writers, job: dict[str, Any], ctx: Any) ->
     if campaign_id is None:
         raise ValueError("join_request_campaign needs a campaign_id")
     campaign = await self.db.fetchrow(
-        "select c.id, c.status, c.name, c.message_template, c.rate_per_hour,"
-        " c.per_message_delay_seconds, c.destination_id,"
+        "select c.id, c.status, c.name, c.message_template, c.per_message_delay_seconds, c.destination_id,"
         " d.telegram_channel_id, d.title"
         " from app.join_campaign c join app.destination d on d.id = c.destination_id where c.id = $1",
         int(campaign_id),
@@ -1220,7 +1173,7 @@ async def join_request_campaign(self: Writers, job: dict[str, Any], ctx: Any) ->
             contacts=recorded,
         )
         # `restarted` is included on purpose: this run just closed its own row, so a campaign whose contacts
-        # did not move (a read that failed, a ceiling hit on the first pass) would otherwise strand itself
+        # did not move (a read that failed, an empty page) would otherwise strand itself
         # with nobody able to start it again short of a database edit.
         return run["how"] in ("queued", "restarted")
 
@@ -1262,70 +1215,13 @@ async def join_request_campaign(self: Writers, job: dict[str, Any], ctx: Any) ->
             "held_back": unreleased,
         }
 
-    rate = int(campaign.get("rate_per_hour") or 20)
-    sent_this_hour = int(
-        await self.db.fetchval(
-            "select count(*) from app.join_campaign_contact where campaign_id = $1"
-            " and status = 'sent' and sent_at > now() - interval '1 hour'",
-            int(campaign_id),
-        )
-        or 0
-    )
-    budget = max(0, rate - sent_this_hour)
-    if budget == 0:
-        # The ceiling used to answer by setting the campaign to `paused`, and that was a trap with no
-        # key: nothing was scheduled, so the campaign stayed parked until the operator came back — and
-        # every later Start tap was met by this same branch pausing it again on the spot. The hour is what
-        # has to pass, not a decision, so the campaign stays armed and this row is put back on the queue
-        # with a wake-up time. The wait is until the *oldest* send of this hour ages out of the window,
-        # which is the first moment a slot is free again - not the top of an hour, which would be a number
-        # nobody asked for and could be an hour later than it needed to.
-        wait = int(
-            await self.db.fetchval(
-                "select coalesce(extract(epoch from (min(sent_at) + interval '1 hour') - now()), 3600)::int"
-                " from app.join_campaign_contact where campaign_id = $1 and status = 'sent'"
-                " and sent_at > now() - interval '1 hour'",
-                int(campaign_id),
-            )
-            or 3600
-        )
-        # A minute is the shortest wait this branch will write: the row is put back on the queue with its
-        # own `attempts` still spent, and a wait that is shorter than the hour it is guarding against would
-        # burn all eight tries inside five minutes and leave a row no worker claims.
-        wait = max(60, min(wait, 3900))
-        minutes = max(1, round(wait / 60))
-        note = f"the {rate}/hour ceiling is spent; this run wakes again in about {minutes} minute(s)"
-        job_id = job.get("id")
-        # The row is re-queued first and the run only then raises, so a wait that was not written cannot be
-        # announced. A hand-off under this run's own key would have been swallowed as a duplicate and the
-        # campaign would have been left armed with no timer at all, which is the bug this branch replaced.
-        armed = job_id is not None and await requeue_current_run(
-            self.db, job_id=int(job_id), delay_seconds=wait, note=note,
-            stage=str(job.get("stage") or "discovered"),
-        )
-        if armed:
-            raise Requeued(note)
-        return {
-            "campaign_id": int(campaign_id),
-            "waiting": len(waiting),
-            "sent": 0,
-            "failed": 0,
-            "ceiling": f"the {rate}/hour ceiling is spent, so nobody was sent to by this run",
-            "resumes_in": wait,
-            "rescheduled": False,
-            # Only a run that started from a queue row has a row to put back on the queue, and a dry run has
-            # none. Saying so is the whole difference between "wait and tap again" and silence.
-            "why": "this was not a queue row I could re-arm, so nothing is waiting for it - tap"
-            " ✅ Yes, start sending once the hour has turned",
-        }
-
     message = " ".join(str(campaign["message_template"]).split())
     series = str(campaign.get("title") or "")
     batch_real_send = bool(getattr(self.settings, "outbound_enabled", False))
     # No peer allowlist for the people themselves: they are named by Telegram's own list of pending
     # requests for this channel, which is as close to "this account asked to be contacted" as a
-    # campaign gets. The ceiling and the one-per-person rule are what bound it.
-    batch = waiting[: min(budget, run_cap)]
+    # campaign gets. The one-per-person rule and this spacing are what bound it.
+    batch = waiting[:run_cap]
     writer = self._writer([], max_writes=len(batch))
     sent = failed = planned = 0
     stopped_early = False

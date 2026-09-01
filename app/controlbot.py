@@ -490,45 +490,21 @@ class ControlBot:
             return None
         return dict(row) if row else None
 
-    async def _wake_waiting_run(self, campaign_id: int) -> str:
-        """Pull this campaign's waiting queue row forward, and return the sentence that says whether it moved.
-
-        Raising a ceiling is only kind if the run that sat out the old hour gets to go now: the wake-up time
-        on that row was arithmetic about the number that used to be there. A `running` row is left alone,
-        because a worker is inside it, and a `blocked` one is a question rather than a timer.
-        """
-        pulled = ""
-        try:
-            from .writers import WAKE_JOB_BY_ID_SQL  # noqa: PLC0415
-
-            waiter = await self._campaign_live_job(int(campaign_id))
-            # Only a row that is sitting on the queue with a wait on it is pulled forward.
-            if (
-                waiter
-                and str(waiter.get("status")) == "queued"
-                and int(waiter.get("in_seconds") or 0) > 0
-            ):
-                if await self.db.fetchrow(WAKE_JOB_BY_ID_SQL, int(waiter["id"])):
-                    pulled = "\nthe waiting run is due now, so it does not have to sit out the old hour."
-        except Exception:  # noqa: BLE001  - the new number is the answer; the wake-up is a courtesy
-            pulled = ""
-        return pulled
-
     async def _campaign_schedule_line(self, campaign_id: int) -> str:
         """One sentence about when this campaign's next run wakes up — or the fact that nothing will.
 
-        A ceiling wait is invisible in exactly the way that made this campaign look broken: the run was
-        written to the queue with a `next_attempt_at` in the future, the campaign sat `ready`, and every
-        screen said either nothing or "queued". The operator read that as a dead bot and tapped Start again,
-        which started a run that hit the same ceiling and returned. So the wait is printed here, in minutes,
+        A run that has not been picked up yet is invisible in exactly the way that made this campaign look
+        broken: the row sat in the queue with a `next_attempt_at` in the future (a flood wait, or the backoff
+        after a failure), the campaign said `ready`, and every screen said either nothing or "queued". The
+        operator read that as a dead bot and tapped Start again. So the wait is printed here, in minutes,
         read from the queue row itself rather than remembered: if the row says it wakes in four minutes, that
         is what the chat says, and a wrong number is a lie about a timer rather than an omission.
         """
         row = await self._campaign_live_job(int(campaign_id))
         if not row:
             return (
-                "\nnothing is scheduled for it right now: tap ✅ Yes, start sending when you want the next"
-                " batch, and the run pauses itself at the ceiling."
+                "\nnothing is scheduled for it right now: tap ✅ Yes, start sending and it runs until the"
+                " list is empty or you tap ⏸."
             )
         status = str(row.get("status") or "")
         seconds = int(row.get("in_seconds") or 0)
@@ -544,7 +520,7 @@ class ControlBot:
         if status in ("queued", "running") and seconds > 60:
             return (
                 f"\nnext batch: job #{row.get('id')} wakes in about {max(1, round(seconds / 60))} minutes"
-                " (the hourly ceiling is what it is waiting for; nothing has to be tapped again)."
+                " on its own; nothing has to be tapped again."
             )
         if status == "running":
             return f"\nnext batch: job #{row.get('id')} is running right now."
@@ -763,7 +739,7 @@ class ControlBot:
     async def _joinreq_row(self, destination_id: int, name: str) -> dict | None:
         """The campaign row behind one channel, with what has been sent. A read, twice used and never written."""
         return await self.db.fetchrow(
-            "select c.id, c.name, c.status, c.message_template, c.rate_per_hour, c.per_message_delay_seconds,"
+            "select c.id, c.name, c.status, c.message_template, c.per_message_delay_seconds,"
             " (select count(*) from app.join_campaign_contact k where k.campaign_id = c.id"
             "  and k.status = 'sent') as sent,"
             " (select count(*) from app.join_campaign_contact k where k.campaign_id = c.id"
@@ -852,44 +828,28 @@ class ControlBot:
                     f"{unreleased} person(s) have a row but were never sent a message — an older dry run"
                     " recorded them. The bot cannot tell that from a send that was cut off, so it asks you:"
                 )
-        rate = int((row or {}).get("rate_per_hour") or 20)
         gap = writers.campaign_gap_seconds(row or {})
         lines.append(
-            f"pace: one person every {gap:g} seconds, at most {rate} per hour, and nobody is written"
-            " to twice"
+            f"pace: one message every {gap:g} seconds, and it keeps going until you tap \u23f8 Stop after"
+            " this one. Nobody is written to twice."
         )
         if row is not None:
-            # Where the next batch is, in the same place the operator is looking for it. A ceiling wait that
-            # is not written down reads as a dead campaign, and the tap that follows it does nothing.
+            # Where the next batch is, in the same place the operator is looking for it. A queue row that is
+            # waiting for a reason reads as a dead campaign when the reason is not printed, and the tap that
+            # follows it then does nothing anyone can explain.
             schedule = await self._campaign_schedule_line(int(row["id"]))
             if schedule:
                 lines.append(schedule.strip())
         choices = []
         if row is not None:
-            # The two numbers that decide when the next stranger hears anything — how many an hour, and how
-            # far apart two messages go — sit beside the start tap, because both are rows on this screen's
-            # campaign and neither should need a command typed. Only what differs from today is offered: a
-            # `60 an hour` button on a campaign already at 60 is a button that changes nothing.
-            for label, value in (("🐇 60 an hour", 60), ("🐇 120 an hour", 120), ("🐢 20 an hour", 20)):
-                if value != rate:
-                    choices.append({
-                        "label": label,
-                        "command": f"/campaign #{destination['id']} rate {name} {value}",
-                    })
-                    break
-            if rate < 500:
-                # 500 is not a mood, it is what `campaign_rate_check` on the campaign's own row allows, so
-                # "the whole list" is the honest label for setting the number to everyone who is waiting.
-                choices.append({
-                    "label": "♾ Send the whole list",
-                    "command": f"/campaign #{destination['id']} rate {name} off",
-                })
-            for label, value in (("⏱ 1 s apart", 1), ("⏱ 10 s apart", 10), ("⏱ 30 s apart", 30)):
-                if abs(gap - value) >= 0.001:
-                    choices.append({
-                        "label": label,
-                        "command": f"/campaign #{destination['id']} gap {name} {value}",
-                    })
+            # The one knob this screen offers. It asks for a number rather than carrying one, because the
+            # value is the operator's to type — a row of preset buttons is how a simple thing gets
+            # complicated, and the label says what is set today so the tap is never a guess.
+            choices.append({
+                "label": f"⏱ Set delay ({writers.campaign_gap_seconds(row):g} s)",
+                "prompt": "delay",
+                "row": console.row_ref("d", int(destination["id"])),
+            })
         if row is None or str(row.get("status")) in {"draft", "paused", "failed"}:
             choices.append({"label": "▶️ Start sending", "command": f"/joinreq start #{destination['id']}"})
         else:
@@ -1026,7 +986,8 @@ class ControlBot:
         Three taps, in the order the operator described: pick the channel the requests came into (only the
         ones this account can post in are offered, and that is read from Telegram on the spot), see the exact
         words and who is waiting, start. `app/writers.py` then sends one message every
-        `JOIN_SEND_GAP_SECONDS` up to the campaign's own hourly ceiling, and a campaign that is not finished
+        the campaign's own delay (`per_message_delay_seconds`), with no hourly stop at all, and a campaign
+        that is not finished
         is handed to the next run so a restart or a spin-down does not strand half a list.
 
         What is deliberately kept from `/campaign`: the row is still drafted from the saved `/joinmsg` wording
@@ -2550,15 +2511,13 @@ class ControlBot:
 
     _CAMPAIGN_USAGE = (
         "usage: /campaign <channel> [new <name> | text <name> <words…> | plan <name> |"
-        " confirm <name> <code> | rate <name> <n|off> | gap <name> <seconds> | pause <name> | abort <name>]\n"
+        " confirm <name> <code> | gap <name> <seconds> | pause <name> | abort <name>]\n"
         "  /campaign @bleach_hindi new wave1      draft it from the saved /joinmsg wording\n"
         "  /campaign @bleach_hindi plan wave1       who would be contacted, and the code\n"
         "  /campaign @bleach_hindi confirm wave1 4F2A   let it run\n"
-        "  /campaign @bleach_hindi rate wave1 60        how many an hour, 1 to 500, or `off` for the whole"
-        " list\n"
-        "  /campaign @bleach_hindi gap wave1 1          how far apart two messages go, 1 to 600 seconds\n\n"
-        "a campaign messages people whose join request is still pending, one message each, spaced by the"
-        " campaign's own delay and at campaign.rate_per_hour an hour at most. It is the only job kind here that contacts a stranger, so it "
+        "  /campaign @bleach_hindi gap wave1 7          how far apart two messages go, in seconds\n\n"
+        "a campaign messages people whose join request is still pending, one message each, at the delay the"
+        " campaign's own row says, and it goes on until the list is empty or `⏸ Stop` is tapped. It is the only job kind here that contacts a stranger, so it "
         "takes two deliberate steps and an unreadable-by-accident code; aborting leaves every row in "
         "place, and a contact is never contacted twice."
     )
@@ -2590,7 +2549,7 @@ class ControlBot:
 
         async def _row(name: str) -> dict | None:
             return await self.db.fetchrow(
-                "select id, name, status, message_template, rate_per_hour, per_message_delay_seconds,"
+                "select id, name, status, message_template, per_message_delay_seconds,"
                 " confirm_required"
                 " from app.join_campaign where destination_id = $1 and lower(name) = lower($2)",
                 int(destination["id"]),
@@ -2601,7 +2560,7 @@ class ControlBot:
             from . import writers  # noqa: PLC0415  (the pace default lives with the loop it paces)
 
             rows = await self.db.fetch(
-                "select c.name, c.status, c.rate_per_hour, c.per_message_delay_seconds,"
+                "select c.name, c.status, c.per_message_delay_seconds,"
                 " (select count(*) from app.join_campaign_contact k where k.campaign_id = c.id"
                 "   and k.status = 'sent') as sent"
                 " from app.join_campaign c where c.destination_id = $1 order by c.id",
@@ -2610,8 +2569,8 @@ class ControlBot:
             if not rows:
                 return [Reply(f"no campaigns for {destination.get('title') or destination['id']} yet.")]
             lines = [
-                f"• {row['name']}: {row['status']}, {row['sent']} sent, {row['rate_per_hour']}/hour,"
-                f" one every {writers.campaign_gap_seconds(row):g} s"
+                f"• {row['name']}: {row['status']}, {row['sent']} sent, one message every"
+                f" {writers.campaign_gap_seconds(row):g} s"
                 for row in rows
             ]
             return [Reply("\n".join(lines))]
@@ -2661,15 +2620,35 @@ class ControlBot:
             )]
 
         if action == "gap":
-            # How far apart two DMs go. The operator asked to own this number as well, and the row has always
-            # been able to hold it: `app.join_campaign.per_message_delay_seconds` existed with a default of
-            # three and no reader, which is a knob welded in place. It is read by the send loop now, and the
-            # per-run batch is derived from it, because a run must not sleep past its own job lease.
+            # The one number the operator asked to own: how far apart two messages go. It is the campaign's
+            # own `per_message_delay_seconds`, which the send loop sleeps on, and it also decides how many
+            # people a run may write before it hands the list on — a run must not sleep past its own job
+            # lease, or `release_expired_locks` gives the same strangers to a second worker.
             if len(rest) < 3:
-                return [Reply(
-                    f"`gap` needs the campaign and the seconds, e.g. `gap {self._JOINREQ_CAMPAIGN} 1`."
-                    f"\n\n{self._CAMPAIGN_USAGE}"
-                )]
+                asked = await _row(self._JOINREQ_CAMPAIGN)
+                if asked is None:
+                    return [Reply(
+                        "there is no campaign on that channel yet, so there is no delay to set. `/joinreq"
+                        " open` starts one from the saved wording."
+                    )]
+                question = (
+                    "how far apart should two messages go?\n\nSend the number of seconds on its own — 7 is"
+                    f" seven seconds. Right now it is {writers.campaign_gap_seconds(asked):g} seconds.\n\n"
+                    "One second is the fastest I will write: messages sent back to back are what gets an"
+                    " account restricted, and the account is what has to keep working.\n\n"
+                    "✖ /cancel leaves it as it is."
+                )
+                if update is None:
+                    # No chat to hold a question for, so the number goes on the command instead. The typing
+                    # path and the tap path are the same command either way; only the asking differs.
+                    return [Reply(
+                        f"{question}\n\nor type it out: /campaign {handle} gap {self._JOINREQ_CAMPAIGN} 7"
+                    )]
+                self.console_owed[int(update.chat_id)] = (
+                    "delay",
+                    console.row_ref("d", int(destination["id"])),
+                )
+                return [Reply(question)]
             name = rest[1]
             campaign = await _row(name)
             if campaign is None:
@@ -2677,120 +2656,35 @@ class ControlBot:
                     f"there is no campaign `{name}` on {destination.get('title') or destination['id']}, so"
                     " there is no spacing to set. `/joinreq open` starts one from the saved wording."
                 )]
+            typed = str(rest[2]).strip().lower().removesuffix("s").strip()
             try:
-                value = float(rest[2].strip().removesuffix("s").strip())
+                value = float(typed)
             except ValueError:
                 return [Reply(
-                    f"`{rest[2]}` is not a number of seconds, so nothing was changed.\n\n"
-                    f"{self._CAMPAIGN_USAGE}"
+                    f"`{rest[2]}` is not a number of seconds, so nothing was changed. Send just the number"
+                    " — 7"
                 )]
-            if not writers.JOIN_GAP_MIN_SECONDS <= value <= 600:
+            if not writers.JOIN_GAP_MIN_SECONDS <= value <= writers.JOIN_GAP_MAX_SECONDS:
                 return [Reply(
-                    f"{value:g} seconds apart is not something I will write. Between"
-                    f" {writers.JOIN_GAP_MIN_SECONDS:g} and 600 seconds — below that the messages are back to"
-                    " back, which is a flood aimed at people who only asked to join a channel, and above it a"
-                    " few hundred people would take days to reach."
+                    f"{value:g} seconds is not something I will write. One second is the floor, because a DM"
+                    f" list sent back to back is what gets an account restricted, and"
+                    f" {writers.JOIN_GAP_MAX_SECONDS:g} is the most this row can hold."
                 )]
             await self.db.execute(
-                "update app.join_campaign set per_message_delay_seconds = $2, updated_at = now() where id = $1",
+                "update app.join_campaign set per_message_delay_seconds = $2, updated_at = now()"
+                " where id = $1",
                 int(campaign["id"]),
                 value,
             )
             gap = writers.campaign_gap_seconds({**campaign, "per_message_delay_seconds": value})
-            cap = writers.campaign_run_cap(gap)
             return [Reply(
                 f"`{name}` on {destination.get('title') or destination['id']}: one message every {gap:g}"
-                f" seconds. A run writes up to {cap} people before it hands the list to the next one, so the"
-                " pace holds across a restart."
+                " seconds, and the campaign keeps going until you tap ⏸ Stop after this one. Nobody who was"
+                f" sent to is sent to again. A run writes up to {writers.campaign_run_cap(gap)} people at a"
+                " time, then hands the list to the next one, so a restart resumes it rather than starting"
+                " over."
                 "\n\nA run that is sending right now keeps the spacing it started with; the next one uses"
                 " this."
-            )]
-
-        if action == "rate":
-            # The hourly ceiling is the number that decides when the next stranger hears anything, and it is
-            # the one that quietly stopped this campaign: 20 sent, 20 per hour allowed, and every later run
-            # pausing itself the moment it started. It is a plain column, so it is changed here rather than in
-            # a config row the operator would have to remember the spelling of.
-            if len(rest) < 3:
-                return [Reply(f"`rate` needs the campaign and the number, e.g. `rate {self._JOINREQ_CAMPAIGN} 60`."
-                              f"\n\n{self._CAMPAIGN_USAGE}")]
-            name = rest[1]
-            campaign = await _row(name)
-            if campaign is None:
-                return [Reply(
-                    f"there is no campaign `{name}` on {destination.get('title') or destination['id']},"
-                    " so there is no ceiling to change. `/joinreq open` starts one from the saved wording."
-                )]
-            wanted = rest[2].strip().lower()
-            if wanted in {"off", "none", "all"}:
-                # "without any limit until i stop it" is what the operator asked for, and this column cannot
-                # hold infinity: `campaign_rate_check` allows 1 to 500, and rewriting a check on a database
-                # that is already running is not this bot's to do. So the honest answer is the number that
-                # cannot bind — everyone waiting right now — and the reply says which of the two it set.
-                total, listed, why = await self._pending_requests(
-                    str(destination.get("telegram_channel_id") or "")
-                )
-                if total is None:
-                    return [Reply(
-                        f"the pending count could not be read from this account right now: {why}\"no hourly"
-                        " stop\" is a number I can only set from that count, so I will not guess one. A number"
-                        f" works instead, e.g. `rate {name} 100`."
-                    )]
-                if total <= 0:
-                    return [Reply(
-                        "nobody's join request is pending on that channel right now, so there is no hourly"
-                        " number to remove. `/joinreq open` shows what the queue does say."
-                    )]
-                value = min(500, max(total, int(campaign.get("rate_per_hour") or 0)))
-                await self.db.execute(
-                    "update app.join_campaign set rate_per_hour = $2, updated_at = now() where id = $1",
-                    int(campaign["id"]),
-                    value,
-                )
-                woke = await self._wake_waiting_run(int(campaign["id"]))
-                if value >= total:
-                    return [Reply(
-                        f"`{name}` on {destination.get('title') or destination['id']}: no hourly stop for this"
-                        f" list. {total} people are waiting and the campaign may write {value} an hour, which"
-                        " is all of them. ⏸ Stop after this one is the only thing that stops it."
-                        f"{woke}"
-                    )]
-                return [Reply(
-                    f"`{name}` on {destination.get('title') or destination['id']}: the cap is at the largest"
-                    f" number the column allows, {value} an hour, and {total} people are waiting. The list"
-                    " empties that many at a time, and a run that meets it waits for the hour and resumes"
-                    " itself, so nothing has to be tapped again."
-                    "\n\nThe campaign is still never faster than one message every"
-                    f" {writers.campaign_gap_seconds(campaign):g} seconds, which is what actually protects the"
-                    " account."
-                    f"{woke}"
-                )]
-            if not wanted.isdigit():
-                return [Reply(
-                    f"`{wanted}` is not a number of people per hour, so nothing was changed.\n\n"
-                    f"{self._CAMPAIGN_USAGE}"
-                )]
-            value = int(wanted)
-            if not 1 <= value <= 500:
-                return [Reply(
-                    f"{value} per hour is not something I will write. Between 1 and 500 — the range the"
-                    " campaign's own check allows — and each run still stops at"
-                    f" {writers.campaign_run_cap(writers.campaign_gap_seconds(campaign)):d} messages,"
-                    f" {writers.campaign_gap_seconds(campaign):g} seconds apart, so a bigger number means more"
-                    " runs rather than a faster flood."
-                )]
-            await self.db.execute(
-                "update app.join_campaign set rate_per_hour = $2, updated_at = now() where id = $1",
-                int(campaign["id"]),
-                value,
-            )
-            pulled = await self._wake_waiting_run(int(campaign["id"]))
-            return [Reply(
-                f"`{name}` on {destination.get('title') or destination['id']}: at most {value} people per"
-                f" hour, one message every {writers.campaign_gap_seconds(campaign):g} seconds, and nobody who"
-                " was already sent to is sent to again."
-                " The default for a campaign that does not exist yet stays the `campaign.rate_per_hour`"
-                f" config row.{pulled}"
             )]
 
         if action in {"plan", "confirm", "pause", "abort"}:
@@ -2824,8 +2718,8 @@ class ControlBot:
                     f"campaign `{name}` ({campaign['status']}) on "
                     f"{destination.get('title') or destination['id']}:\n\n"
                     f"• text: {campaign['message_template']}\n"
-                    f"• at most {campaign['rate_per_hour']} people per hour, one message every"
-                    f" {writers.campaign_gap_seconds(campaign):g} seconds"
+                    f"• one message every {writers.campaign_gap_seconds(campaign):g} seconds, and it goes"
+                    " on until the list is empty or you tap ⏸ Stop after this one"
                     f"{schedule}\n"
                     f"• nobody is contacted twice, and a message never approves or declines the request"
                     f"{pending}\n\n"
@@ -2902,7 +2796,8 @@ class ControlBot:
                 return [Reply(
                     f"{head}{people}\n\n"
                     + (
-                        "It will send at the campaign's own rate and stop at the ceiling."
+                        "It sends one message at a time, spaced by the delay on this campaign's own row,"
+                        " and it keeps going until the list is empty or you tap ⏸ Stop after this one."
                         if getattr(self.settings, "outbound_enabled", False)
                         else "In shadow mode each message plans and blocks, which is the read-only version of this run."
                     )
@@ -3274,6 +3169,16 @@ class ControlBot:
                 note=console.screen_note(f"/source {value} add", replies[0].text if replies else None),
             )
             return [*replies, Reply(screen, markup=mark)]
+        if slot == "delay":
+            # `⏱ Set delay` asked for a number and this is it. The answer is not interpreted here: it becomes
+            # the argument of the same `/campaign … gap` line a typed path runs, so the tap meets the same
+            # refusals the keyboard would, and the screen that comes back is the one they were on, with the
+            # new spacing printed on it.
+            kind, row_id = console.parse_ref(ref or "") or ("d", 0)
+            replies = await self._console_run(
+                update, f"/campaign #{row_id} gap {self._JOINREQ_CAMPAIGN} {value}"
+            )
+            return [*replies, *await self._console_run(update, f"/joinreq open #{row_id}")]
         kind, row_id = console.parse_ref(ref or "") or ("s", 0)
         row = await self._console_row(kind, row_id)
         if row is None:
@@ -3940,9 +3845,16 @@ class ControlBot:
         ]
 
     async def _cancel(self, update: Update, args: list[str]) -> list[Reply]:
+        owed = self.console_owed.pop(update.chat_id, None)
         pending = self.pending.pop(update.chat_id, None)
         if pending is None:
-            return [Reply("nothing pending.")]
+            # A question one of the screens asked is dropped here as well. `nothing pending` while the next
+            # number typed into this chat was still being read as an answer to it would be the worse lie.
+            if owed is None:
+                return [Reply("nothing pending.")]
+            return [Reply(
+                "nothing pending — the question that screen asked is dropped, and nothing was changed."
+            )]
         discard = getattr(self.transport, "discard", None)
         if callable(discard):
             try:
