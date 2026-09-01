@@ -609,6 +609,70 @@ async def test_a_released_contact_is_owed_a_message_again(monkeypatch) -> None:
     # row, and a second copy of that figure inside a pass result is a second truth about the same table.
 
 
+class ReleaseOnlyDb:
+    """A database that answers the release the way asyncpg does, and refuses to be asked another way.
+
+    `Database.execute` returns the statement's **status tag** — `"UPDATE 2"`, never a count — and counting it
+    is what made an operator's ✅ tap raise `ValueError: invalid literal for int() with base 10: 'UPDATE 0'`.
+    Every fake in this suite used to hand back a tidy integer from `execute`, so the tests passed while the
+    deployment could not start a campaign; this one is deliberately unpleasant instead.
+    """
+
+    def __init__(self, rows: int) -> None:
+        self.rows = rows
+        self.fetched: list[str] = []
+
+    async def fetch(self, sql: str, *args):
+        self.fetched.append(sql)
+        return [{"telegram_user_id": 900 + one} for one in range(self.rows)]
+
+    async def execute(self, sql: str, *args):
+        raise AssertionError(
+            "a release is counted from the rows it returned: `execute` answers with a status tag"
+        )
+
+    async def fetchval(self, sql: str, *args):
+        return None
+
+
+@pytest.mark.asyncio
+async def test_a_write_that_wants_rows_back_cannot_be_asked_of_execute(make_settings) -> None:
+    """The guard that stops the next `int(await db.execute(…))`, and it needs no connection to do it.
+
+    The bug this stops was real: a campaign start counted the rows it released with `execute`, asyncpg
+    answered with the status tag `"UPDATE 0"`, `int()` of that raised, and the operator's ✅ tap ended in
+    `this command could not finish`. No fake in this suite could have seen it, because a fake returns `1`.
+    So the check is not on the answer, it is on the question — `returning` in an `execute` is refused.
+    """
+    from app.db import Database
+
+    db = Database(make_settings())
+
+    with pytest.raises(ValueError, match="`fetch`"):
+        await db.execute(
+            "update app.join_campaign_contact set status = 'skipped' where id = $1 returning id", 1
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_release_counts_the_rows_and_never_the_status_tag() -> None:
+    """The one number the start tap prints has to come from the rows that changed.
+
+    Two people freed is two rows back from `update … returning`, and that is the whole contract: no parsing
+    of a driver's status string, no `int()` of anything, and no count that can disagree with the write.
+    """
+    from app.writers import campaign_release_unsent
+
+    db = ReleaseOnlyDb(2)
+
+    assert await campaign_release_unsent(db, 7) == 2
+    assert len(db.fetched) == 1 and "returning telegram_user_id" in db.fetched[0], db.fetched
+
+    empty = ReleaseOnlyDb(0)
+    assert await campaign_release_unsent(empty, 7) == 0, "nobody to release is a zero, not an error"
+
+
+@pytest.mark.asyncio
 async def test_the_pass_leaves_alone_the_rows_nobody_released(monkeypatch) -> None:
     """A row that exists and was never sent is not a licence to message that person again.
 

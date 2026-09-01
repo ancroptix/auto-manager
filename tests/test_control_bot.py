@@ -237,6 +237,19 @@ class FakeDb:
             return hits
         if "app.job" in sql:
             return list(self.blocked)
+        if "update app.join_campaign_contact set" in sql:
+            # The release, read the only way it can be read: `update … returning`, whose rows are the count.
+            # The fake applies the write as well, because a reply that says "3 released" over a statement that
+            # changed nothing is the sentence an operator would tap twice.
+            self.writes.append((sql, args))
+            count = (
+                int((self.campaign or {}).get("unreleased") or 0)
+                if self.rows_changed is None
+                else int(self.rows_changed)
+            )
+            if self.campaign is not None:
+                self.campaign["unreleased"] = 0
+            return [{"telegram_user_id": 900 + one} for one in range(count)]
         return []
 
     async def fetchrow(self, sql: str, *args: Any):
@@ -450,20 +463,13 @@ class FakeDb:
             self.writes.append((sql, args))
             return 1
         if "update app.join_campaign_contact set" in sql:
-            # `/joinreq free` releases rows a run recorded and never sent. The fake answers with the count the
-            # command reports, and clears the screen's figure: a reply saying "2 released" over a write that
-            # matched nothing is the sentence an operator would tap twice.
-            self.writes.append((sql, args))
-            # Unset, the rowcount mirrors what the screen had just counted: the command reports the number it
-            # read, and a test can see the two disagree. `rows_changed` overrides it for the empty case.
-            count = (
-                int((self.campaign or {}).get("unreleased") or 0)
-                if self.rows_changed is None
-                else int(self.rows_changed)
+            # The release is read back from `fetch … returning`, never from this call: asyncpg answers
+            # `execute` with the statement's status tag, and a fake that returned a neat `2` here is what let
+            # `int(await db.execute(…))` pass every test while raising `ValueError: invalid literal for int()
+            # with base 10: 'UPDATE 0'` on the operator's own ✅ tap. A fake must not be nicer than the driver.
+            raise AssertionError(
+                "a campaign release may not be counted from `execute` — see app.writers.campaign_release_unsent"
             )
-            if self.campaign is not None:
-                self.campaign["unreleased"] = 0
-            return count
         if "update app.join_campaign set" in sql:
             # /campaign's state changes, mirrored onto the fake row so a test can read the status back
             # instead of pattern-matching the SQL it was written with. Both spellings the commands use: a

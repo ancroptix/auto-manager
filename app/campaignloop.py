@@ -139,11 +139,14 @@ class CampaignLoop:
     # ------------------------------------------------------------ one round
     async def _round(self) -> None:
         self.rounds += 1
-        if await self._paused():
+        state = await self._service_state()
+        if state != "on":
             # The service-wide pause is the operator's emergency stop, and "everything stops" has to include
             # the DMs. Nothing is skipped or lost by waiting: the campaigns keep their status, and the next
-            # round after a `/resume` reads the same list again.
-            self.detail[-2] = {"paused": True, "at": time.time()}
+            # round after a `/resume` reads the same list again. An unreadable flag waits too, and says so —
+            # "the service is paused" would be a story about a fact this loop could not read.
+            if state == "paused":
+                self.detail[-2] = {"paused": True, "at": time.time()}
             await self._pauseable(self.poll_seconds)
             return
         rows = list(await self.db.fetch(CAMPAIGN_ON_SQL) or [])
@@ -156,16 +159,22 @@ class CampaignLoop:
             campaign_id = int(row["id"])
             await self._pass(campaign_id, str(row.get("name") or ""))
 
-    async def _paused(self) -> bool:
-        """Whether the whole service is paused, read fresh every round, and never assumed.
+    async def _service_state(self) -> str:
+        """`"on"`, `"paused"`, or `"unreadable"` — read fresh every round, and never assumed.
 
         A database that cannot answer is not a licence to send: the flag exists for the moments when the
-        operator wants nothing to leave the account, so the safe answer to a failed read is "wait".
+        operator wants nothing to leave the account, so the safe answer to a failed read is "wait". It is kept
+        apart from a real pause because the two need different sentences on the operator's screen — one is
+        "you stopped me", the other is "I cannot see". A loop that reported the first while it meant the second
+        is how a campaign looks fine while nothing goes out, which is the report this whole file exists to
+        make impossible.
         """
         try:
-            return bool(await self.db.is_paused())
-        except Exception:  # noqa: BLE001 - and it is a wait, not a crash: the next round asks again
-            return True
+            return "paused" if await self.db.is_paused() else "on"
+        except Exception as exc:  # noqa: BLE001 - a wait, not a crash: the next round asks again
+            self.detail[-3] = {"unreadable": f"{type(exc).__name__}: {exc}"[:140], "at": time.time()}
+            self.detail.pop(-2, None)  # a stale "paused" would explain something this loop did not read
+            return "unreadable"
 
     async def _pass(self, campaign_id: int, name: str) -> None:
         started = time.monotonic()
@@ -248,6 +257,7 @@ class CampaignLoop:
         return {
             "running": self.running,
             "paused": bool(self.detail.get(-2, {}).get("paused")),
+            "unreadable": str(self.detail.get(-3, {}).get("unreadable") or ""),
             "shadow": bool(self.detail.get(-1, {}).get("shadow")),
             "rounds": self.rounds,
             "passes": self.passes,

@@ -259,7 +259,26 @@ class Database:
         Kept beside fetch/fetchrow so a handler never has to pick between them by
         accident: asyncpg raises if a *multi-statement* string is sent with
         arguments, which is easy to do when a DML helper is reused for migrations.
+
+        **The return value is the status tag, never a row count** — asyncpg answers
+        `"UPDATE 3"` / `"INSERT 0 1"`, so `int(await db.execute(...))` raises on the first
+        one. Nothing here should count a write this way anyway: `fetch` the statement with
+        `returning id` and take the length of the rows, which is the shape
+        `app.writers.campaign_release_unsent` uses after a `ValueError: invalid literal for
+        int() with base 10: 'UPDATE 0'` reached an operator's own ✅ tap. A test fake that
+        returns `1` from `execute` cannot catch that, which is the other half of the lesson.
         """
+
+        if "returning" in sql.lower():
+            # Raised here, on the way in, because the mistake is asking at all: asyncpg answers `execute`
+            # with the statement's status tag and *discards* the rows a `returning` clause produced, so the
+            # caller who wanted to know "which rows" or "how many" is left holding `"UPDATE 0"`. That string
+            # in an `int()` is the `ValueError` an operator saw when a campaign start counted its own
+            # release; a test could not catch it while every fake answered `execute` with a tidy `1`.
+            raise ValueError(
+                "a statement with `returning` wants its rows: run it with `fetch` (which returns a list)"
+                " and count the rows, instead of `execute` (which returns the status tag)"
+            )
 
         async def _fn(conn: Any) -> str | None:
             return await conn.execute(sql, *args)

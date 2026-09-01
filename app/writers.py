@@ -955,12 +955,16 @@ async def campaign_release_unsent(db: Any, campaign_id: int) -> int:
     the wording and the count. The rows and their history stay; only the status moves, to the one value that
     means "owed a message", and the next pass sends to them like anyone else.
     """
-    moved = await db.execute(
+    # `fetch`, not `execute`, and the count is the rows: asyncpg's `execute` answers with the statement's
+    # status tag (`"UPDATE 0"`), and a release that raised `invalid literal for int()` on the operator's own
+    # ✅ tap is the bug this sentence exists to stop. Reading `RETURNING` rows is the shape that cannot be
+    # misread, because the same list is what proves the write matched somebody.
+    moved = await db.fetch(
         "update app.join_campaign_contact set status = 'skipped' where campaign_id = $1"
         " and status = 'queued' and sent_at is null returning telegram_user_id",
         int(campaign_id),
     )
-    return len(moved or []) if isinstance(moved, list) else int(moved or 0)
+    return len(list(moved or []))
 
 
 async def campaign_status(db: Any, campaign_id: int) -> str:

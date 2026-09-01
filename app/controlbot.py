@@ -505,6 +505,12 @@ class ControlBot:
                 " here, so a campaign pass plans each message and blocks before it. Nothing is sent to anyone"
                 " while it stays that way."
             )
+        if sending.get("unreadable"):
+            return (
+                f"\nsending: the sender cannot read this service right now ({str(sending['unreadable'])[:90]}),"
+                " so nothing has gone out since. It tries again by itself; `/status` names the connection"
+                " problem if it stays."
+            )
         if not sending.get("running"):
             return (
                 "\nsending: the sender in this service is not running, so nothing is being sent even"
@@ -780,14 +786,10 @@ class ControlBot:
         row = await self._joinreq_row(int(destination["id"]), self._JOINREQ_CAMPAIGN)
         if row is None:
             return [Reply("there is no campaign on this channel yet, so there is nothing to release.")]
-        moved = int(
-            await self.db.execute(
-                "update app.join_campaign_contact set status = 'skipped'"
-                " where campaign_id = $1 and status = 'queued' and sent_at is null",
-                int(row["id"]),
-            )
-            or 0
-        )
+        # Through `app/writers.py`, because that is the same release the ✅ tap performs: two copies of the
+        # statement are two chances to disagree about who was freed, and the second one used to crash on the
+        # database's own answer (`int("UPDATE 0")`) while the first worked.
+        moved = await writers.campaign_release_unsent(self.db, int(row["id"]))
         if not moved:
             return [Reply(
                 f"nobody on `{destination.get('title') or destination['id']}` is sitting in that state right"

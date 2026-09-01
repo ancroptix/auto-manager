@@ -2856,6 +2856,83 @@ def test_the_writers_refuse_what_only_a_human_can_supply(conn, seed, episode):
     assert asyncio.run(scenario())
 
 
+def test_a_campaign_release_counts_the_rows_because_execute_answers_with_a_tag(conn, seed):
+    """`ValueError: invalid literal for int() with base 10: 'UPDATE 0'` — the operator's ✅ tap, once.
+
+    asyncpg's `execute` returns the statement's **status tag**, never a row count, so any code that treats
+    its answer as a number raises on the first real write. `app/writers.py` did exactly that when a campaign
+    start released the contacts an earlier attempt had recorded without messaging, and no fake in this repo
+    could catch it because a fake that returns a tidy `1` is nicer than the driver. Both shapes are pinned
+    here, against the real database: the tag `execute` answers with, and the count `fetch … returning` reads
+    back from the rows that changed.
+    """
+    import asyncio
+
+    from app.db import Database
+    from app.writers import campaign_release_unsent
+
+    settings = _write_settings(app_mode="live")
+    db = Database(settings)
+
+    async def scenario():
+        assert await db.connect()
+        with conn.cursor() as cur:
+            name = f"release-check-{seed['destination_id']}"
+            # Idempotent the way every test in this file has to be: the shared cluster keeps whatever an
+            # earlier run left, and a unique (destination, name) collision is not a finding about this code.
+            cur.execute(
+                "delete from app.join_campaign_contact where campaign_id in"
+                " (select id from app.join_campaign where destination_id = %s and name = %s)",
+                (seed["destination_id"], name),
+            )
+            cur.execute(
+                "delete from app.join_campaign where destination_id = %s and name = %s",
+                (seed["destination_id"], name),
+            )
+            cur.execute(
+                "insert into app.join_campaign (destination_id, name, message_template, status)"
+                " values (%s, %s, 'Welcome to the channel', 'ready') returning id",
+                (seed["destination_id"], name),
+            )
+            campaign_id = cur.fetchone()[0]
+            cur.execute(
+                "insert into app.join_campaign_contact (campaign_id, telegram_user_id, status, attempts)"
+                " values (%s, 9101, 'queued', 1), (%s, 9102, 'queued', 1), (%s, 9103, 'sent', 1)",
+                (campaign_id, campaign_id, campaign_id),
+            )
+            conn.commit()
+        try:
+            tag = await db.execute(
+                "update app.join_campaign_contact set attempts = attempts where campaign_id = $1",
+                int(campaign_id),
+            )
+            assert str(tag).startswith("UPDATE"), f"execute answers with {tag!r}, which no int() can read"
+            released = await campaign_release_unsent(db, int(campaign_id))
+            assert released == 2, released
+            with conn.cursor() as cur:
+                cur.execute(
+                    "select status from app.join_campaign_contact where campaign_id = %s"
+                    " and telegram_user_id = 9103",
+                    (campaign_id,),
+                )
+                assert cur.fetchone()[0] == "sent", "a person who was messaged is not owed a second one"
+                cur.execute(
+                    "select count(*) from app.join_campaign_contact where campaign_id = %s"
+                    " and status = 'skipped'",
+                    (campaign_id,),
+                )
+                assert cur.fetchone()[0] == 2, "the release moved exactly the rows that had no message"
+        finally:
+            with conn.cursor() as cur:
+                cur.execute("delete from app.join_campaign_contact where campaign_id = %s", (campaign_id,))
+                cur.execute("delete from app.join_campaign where id = %s", (campaign_id,))
+                conn.commit()
+            await db.close()
+        return True
+
+    assert asyncio.run(scenario())
+
+
 def test_every_statement_this_project_writes_parses_against_the_real_schema(conn):
     """The fake databases in this suite accept any SQL string. Postgres does not, and neither does asyncpg.
 

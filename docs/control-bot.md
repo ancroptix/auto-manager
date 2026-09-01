@@ -196,8 +196,10 @@ the list to the end, a restart resumes it by itself, and `⏸` is the only thing
   then left the campaign looking dead. What the screen prints instead is what the sender last did for that
   campaign (`sending: 20 sent in its last pass, 320 the read could not reach, one message every 3 s`), read
   from the loop's own memory, because the loop is the thing that either is or is not sending. When it is not —
-  shadow mode, a paused service, a fault in the last pass, no stored session — each of those is on the screen
-  with the tap that exists for it, stated as a fact rather than a promise. Starting a campaign also releases
+  shadow mode, a paused service, a service state the sender cannot read, a fault in the last pass, no stored
+  session — each of those is on the screen with the tap that exists for it, stated as a fact rather than a
+  promise. There are deliberately no other states to report: a sender that cannot see whether it may send
+  says that, instead of saying "awake". Starting a campaign also releases
   the contacts an earlier attempt wrote a row for and never messaged (the state that lets a campaign read "0
   still waiting" while nobody has been told anything), and the reply says how many it released, because that
   ✅ is a human decision and a machine should not make it.

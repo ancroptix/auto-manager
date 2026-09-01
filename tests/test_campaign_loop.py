@@ -284,6 +284,38 @@ async def test_shadow_mode_refuses_to_run_a_sender() -> None:
 
 
 @pytest.mark.asyncio
+async def test_a_service_it_cannot_read_is_reported_rather_than_promised() -> None:
+    """No sender that cannot see the service's own state gets to say "awake" on the operator's screen.
+
+    The pause flag is the loop's first read of every round, and a database that is down answers with an
+    exception. Waiting is right; reassuring is not. So the failure is remembered, it rides out in
+    `snapshot()`, and the campaign screen says what is unknown instead of printing a promise.
+    """
+
+    class Unreachable:
+        async def is_paused(self) -> bool:
+            raise ConnectionError("pooler refused")
+
+    loop = live_loop(Unreachable(), LoopWriters(), poll_seconds=0.01)  # type: ignore[arg-type]
+    pauses = watch_pauses(loop)
+
+    await loop._round()
+
+    assert pauses == [0.01], "the round waited instead of sending"
+    snapshot = loop.snapshot()
+    assert snapshot["unreadable"].startswith("ConnectionError"), snapshot
+    assert snapshot["on"] == [], "and it claimed no campaign at all"
+
+    from app.controlbot import ControlBot  # noqa: PLC0415  (the screen's half)
+
+    bot = ControlBot.__new__(ControlBot)
+    bot.sender_state = lambda: {"absent": False, **snapshot}  # type: ignore[attr-defined]
+    line = bot._campaign_sending_line(7)
+    assert "cannot read this service" in line, line
+    assert "sending: awake" not in line, "the reassurance is the bug this test exists to stop"
+
+
+@pytest.mark.asyncio
 async def test_a_round_that_cannot_read_the_list_is_retried_not_fatal() -> None:
     """The list read is the loop's one dependency, and an outage there must not end sending.
 
