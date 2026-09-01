@@ -47,8 +47,13 @@ def configure_logging(level: str) -> None:
     )
 
 
-async def _build_control_bot(settings: Settings, db: Any, *, user_client: Any = None) -> Any:
-    """Assemble the control bot. Separate so the wiring itself can be tested."""
+async def _build_control_bot(settings: Settings, db: Any, *, user_client: Any = None, state: Any = None) -> Any:
+    """Assemble the control bot. Separate so the wiring itself can be tested.
+
+    `state` is the app's own state object, passed so the bot can start or stop this process's queue worker
+    (see `switch_worker`) without owning a connection or a global: it is the only way `WORKER_ENABLED=false`
+    stops being a sentence the operator has to take to a dashboard.
+    """
     from .botapi import BotApi
     from .controlbot import ControlBot
 
@@ -96,6 +101,50 @@ async def _build_control_bot(settings: Settings, db: Any, *, user_client: Any = 
         log.info("the user client reconnected with the session the control bot just stored")
         return "the service reconnected with it, so the write jobs can run"
 
+    async def switch_worker(on: bool) -> str:
+        """Run, or stop, the queue worker of *this* process — no redeploy, no dashboard.
+
+        `WORKER_ENABLED=false` is a deliberate, documented step of the probe flow (docs/launch-checklist.md:
+        it is how a question gets asked without a job reaching a channel on the way). An operator who does
+        that step and never comes back is left with a service that writes jobs and never runs any of them,
+        which is indistinguishable from a broken bot — and this deployment was in exactly that state, with
+        a campaign queued and nobody sending it. So the switch is in the chat.
+
+        What it does not do is touch the environment: the variable still decides what happens after a
+        restart, so nothing is quietly reconfigured and a probe that wanted the worker off gets it back on
+        the next spin-up.
+        """
+        from .worker import Worker  # noqa: PLC0415
+
+        if db is None:
+            return "there is no database connection in this service, so there is no queue to run."
+        if state is None:
+            # No place to put one is a real answer, not a crash: it means the bot was assembled outside
+            # `create_app`, where only the service's own state can own a worker.
+            return (
+                "this service was assembled without a place to hold a worker, so /worker cannot run here —"
+                " WORKER_ENABLED on the service is the switch."
+            )
+        holder = state
+        current = getattr(holder, "worker", None)
+        if on:
+            if current is not None:
+                return "the queue worker is already running in this service, so nothing changed."
+            worker = Worker(db=db, settings=settings, telegram=user_client)
+            worker.start()
+            holder.worker = worker
+            log.warning("the queue worker was started from the control bot (/worker on)")
+            return "the queue worker is running in this service now — queued jobs are being claimed."
+        if current is None:
+            return "there is no queue worker in this service to stop."
+        await current.stop()
+        holder.worker = None
+        log.warning("the queue worker was stopped from the control bot (/worker off)")
+        return (
+            "the queue worker is stopped: jobs are still written, and nothing runs them."
+            " That is what /probe wants; /worker on when you are done."
+        )
+
     return ControlBot(
         api=api,
         db=db,
@@ -105,6 +154,7 @@ async def _build_control_bot(settings: Settings, db: Any, *, user_client: Any = 
         allow_login=settings.bot_allow_login,
         background=lambda coro: asyncio.create_task(coro),
         on_session_stored=adopt_session,
+        worker_switch=switch_worker,
         login_ttl_seconds=login_ttl,
         delete_sensitive=delete_sensitive,
     )
@@ -161,7 +211,7 @@ def create_app(settings: Settings | None = None, *, start_worker: bool | None = 
         if settings.bot_should_run:
             try:
                 app.state.control_bot = await _build_control_bot(
-                    settings, db, user_client=app.state.user_client
+                    settings, db, user_client=app.state.user_client, state=app.state
                 )
                 app.state.control_bot_task = asyncio.create_task(app.state.control_bot.run())
             except Exception as exc:  # noqa: BLE001 - /health must survive a bad bot token

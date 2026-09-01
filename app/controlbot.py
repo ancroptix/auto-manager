@@ -75,6 +75,7 @@ HELP = """auto-manager control
 /status      mode, queue, pause state, what is blocked and why
 /pause       stop claiming jobs (optional reason)
 /resume      start claiming again
+/worker      on|off — run or stop this service's queue worker (what WORKER_ENABLED does, from here)
 /reconcile   reclaim stale leases + queue a reconciliation now
 /probe       ask the storage bot and Channel Help their questions (report arrives here)
 /declare     say how long a season is (Total Episodes, and the batch post)
@@ -122,6 +123,7 @@ _ROUTES: dict[str, str] = {
     "status": "_status",
     "pause": "_pause",
     "resume": "_resume",
+    "worker": "_worker",
     "reconcile": "_reconcile",
     "probe": "_probe",
     "declare": "_declare",
@@ -259,6 +261,13 @@ class ControlBot:
     #: Called after a session is stored, so the account a login just produced reaches the writer
     #: without a redeploy. Injected (``app/main.py``) because the bot must not own that connection.
     on_session_stored: Callable[[], Any] | None = None
+    #: Starts or stops this process's queue worker (`app/main.py` wires it to the app state). Injected for
+    #: the same reason as `on_session_stored`: the bot must not own the connection, and a service that writes
+    #: jobs it never runs needs one tap in the chat rather than an environment edit.
+    worker_switch: Callable[[bool], Any] | None = None
+    #: What this bot last asked the worker to do, or None for "whatever the service was started with". A
+    #: screen that printed the environment's answer after a `/worker on` would deny what the tap just did.
+    worker_running: bool | None = None
     pending: dict[int, _Pending] = field(default_factory=dict, repr=False)
     #: One free-text question outstanding per chat: `(slot, row id)`. Kept beside `pending` rather than
     #: inside it because `pending` is a login — secrets, a timeout, a delete-after-use — and a rename
@@ -481,11 +490,17 @@ class ControlBot:
             )
         if not getattr(self.settings, "outbound_enabled", False):
             lines.append("• mode: shadow — nothing is sent from this service, only planned")
-        if not bool(getattr(self.settings, "worker_enabled", True)):
-            lines.append(
-                "• this service has its queue worker OFF, so jobs are written and never run"
-                " (WORKER_ENABLED is what turns it on)"
-            )
+        if not self._worker_is_running():
+            if self.worker_switch is not None:
+                lines.append(
+                    "• this service's queue worker is OFF, so jobs are written and never run"
+                    " — tap ▶️ Run the queue below, or /worker on"
+                )
+            else:
+                lines.append(
+                    "• this service has its queue worker OFF, so jobs are written and never run"
+                    " (WORKER_ENABLED is what turns it on)"
+                )
         rows: list = []
         try:
             rows = list(await list_sessions(self.db) or [])
@@ -768,6 +783,10 @@ class ControlBot:
             choices.append(
                 {"label": f"🔁 Send to those {unreleased}", "command": f"/joinreq free #{destination['id']}"}
             )
+        if self.worker_switch is not None and not self._worker_is_running():
+            # The tap that ends the silence. A queued job in a service that claims nothing looks identical to
+            # a campaign that is sending, from every screen that does not look at the worker.
+            choices.append({"label": "▶️ Run the queue", "command": "/worker on"})
         choices.append({"label": "✏️ Change the message", "screen": "joinmsg"})
         choices.append({"label": "📨 Other channels", "command": "/joinreq"})
         return await self._joinreq_screen(lines, choices, f"/joinreq open #{destination['id']}")
@@ -1065,10 +1084,67 @@ class ControlBot:
             f"{self._DESTINATION_USAGE}"
         )]
 
+    def _worker_is_running(self) -> bool:
+        """Whether jobs can be claimed *now*, as far as this process knows.
+
+        Three answers collapse into one: the environment's setting, what a `/worker on` or `/worker off` in
+        this chat just did, and the fact that a bot assembled without a switch cannot change anything. The
+        bot's own tap wins when it exists, because printing the environment's word after the operator turned
+        the worker on by hand would contradict the thing they just watched happen.
+        """
+        if self.worker_running is not None:
+            return bool(self.worker_running)
+        return bool(getattr(self.settings, "worker_enabled", True))
+
+    async def _worker(self, update: Update, args: list[str]) -> list[Reply]:
+        """``/worker on|off`` — run, or stop, this service's queue worker.
+
+        `WORKER_ENABLED=false` exists for one procedure (`/probe`: ask questions without a job reaching a
+        channel), and the operator is told to put it back afterwards. When that last step is missed, every
+        screen in this product says "queued" and nothing runs — so the switch lives where the mistake was
+        made. It changes only this process: the service's own environment still decides what a restart does,
+        which is the honest division — a tap in a chat should not silently reconfigure a deployment.
+        """
+        wanted = (args[0].strip().casefold() if args else "status")
+        if wanted not in {"on", "off", "status", ""}:
+            return [Reply(
+                "`/worker on` runs this service's queue worker, `/worker off` stops it, `/worker status`"
+                " just reports. Nothing is written to your channels either way."
+            )]
+        running = self._worker_is_running()
+        if wanted == "status" or self.worker_switch is None:
+            if wanted != "status" and self.worker_switch is None:
+                return [Reply(
+                    "this service has no worker switch wired up, so I cannot change it from here —"
+                    f" WORKER_ENABLED on the service is the switch, and it says {'on' if running else 'off'}."
+                )]
+            return [Reply(
+                f"queue worker: {'running in this service' if running else 'OFF — jobs are written and never run'}"
+                + ("" if self.worker_switch is not None else " (no switch wired up here)")
+                + ".\n"
+                + "WORKER_ENABLED is what a restarted service comes back with; this tap changes only the"
+                " process that is running now."
+            )]
+        note = await self.worker_switch(wanted == "on")
+        self.worker_running = wanted == "on"
+        if wanted == "off":
+            # Said by the bot and not left to the callback's wording, because "the worker is off" is a state
+            # an operator can walk into by accident and walk out of only if the sentence says how.
+            note += "\n/worker on starts it again; a restarted service obeys WORKER_ENABLED either way."
+        counts = ""
+        try:
+            queue = await self.db.queue_health()
+            if queue:
+                counts = f"\nqueued: {int(queue.get('queued') or 0)}, running: {int(queue.get('running') or 0)}"
+        except Exception:  # noqa: BLE001  - the count is a courtesy, not the answer
+            counts = ""
+        return [Reply(f"{note}{counts}")]
+
     async def _status(self, update: Update, args: list[str]) -> list[Reply]:
         lines = [
             f"mode: {self.settings.mode.value}",
             f"outbound telegram actions: {self.settings.outbound_enabled}",
+            f"queue worker in this service: {'running' if self._worker_is_running() else 'OFF'}",
         ]
         if self.settings.telegram_session_string is not None:
             lines.append("session: TELEGRAM_SESSION_STRING")

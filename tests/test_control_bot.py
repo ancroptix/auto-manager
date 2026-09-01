@@ -3642,6 +3642,116 @@ async def test_a_channel_with_no_campaign_row_has_nothing_to_release() -> None:
     assert not [sql for sql, _ in db.writes if "update app.join_campaign_contact" in sql], db.writes
 
 
+class WorkerSwitch:
+    """The in-process worker switch, as `app/main.py` wires it: takes a bool, returns a sentence."""
+
+    def __init__(self, *, running: bool = False) -> None:
+        self.running = running
+        self.calls: list[bool] = []
+        self.refusal = "there is no queue worker in this service to stop."
+
+    async def __call__(self, on: bool) -> str:
+        self.calls.append(bool(on))
+        if bool(on) == self.running:
+            return ("the queue worker is already running in this service, so nothing changed." if on else self.refusal)
+        self.running = bool(on)
+        return (
+            "the queue worker is running in this service now — queued jobs are being claimed."
+            if self.running
+            else "the queue worker is stopped: jobs are still written, and nothing runs them."
+        )
+
+
+def text_of(replies) -> str:
+    return "\n".join(reply.text for reply in replies)
+
+
+@pytest.mark.asyncio
+async def test_the_worker_switch_lives_in_the_chat_because_the_dashboard_is_not_where_the_mistake_was_made() -> None:
+    """**This deployment's last silence: a service whose queue worker is off, with a job politely queued.**
+
+    `WORKER_ENABLED=false` is step 1 of the documented probe procedure, and step 3 — putting it back — is a
+    dashboard edit the operator never came back for. Every screen then says "queued" and nothing runs, which
+    is indistinguishable from a broken bot. The command exists so the fix is a tap; what it deliberately does
+    *not* do is touch the environment, so a restart still obeys the service's own setting.
+    """
+    switch = WorkerSwitch(running=False)
+    control, api, db = bot(worker_enabled=False, worker_switch=switch)
+
+    text = text_of(await control.dispatch(update("/worker on")))
+
+    assert switch.calls == [True], switch.calls
+    assert "queued jobs are being claimed" in text, text
+    assert "running: 1" in text, "the reply has to say what the queue looks like, not just that it moved"
+    assert api.texts.lower().count("environment") == 0, "no dashboard step is asked of the operator"
+
+    again = text_of(await control._worker(None, ["status"]))
+    assert "running in this service" in again, again
+    assert switch.calls == [True], "a status read must not reach for the switch"
+
+
+@pytest.mark.asyncio
+async def test_turning_the_worker_off_says_what_it_costs_and_who_it_is_for() -> None:
+    """Off is not neutral: from that moment every job is written and never run. The reply says so."""
+    switch = WorkerSwitch(running=True)
+    control, api, db = bot(worker_enabled=True, worker_switch=switch)
+
+    text = text_of(await control.dispatch(update("/worker off")))
+
+    assert switch.calls == [False], switch.calls
+    assert "nothing runs them" in text, text
+    assert "/worker on" in text, "a state that can be left by accident has to say how to undo it"
+
+
+@pytest.mark.asyncio
+async def test_a_service_with_no_switch_says_so_instead_of_pretending_to_change_anything() -> None:
+    """The bot is built in tests (and in a bare `create_app`) without a place to hold a worker.
+
+    Refusing is the only honest answer: a reply that said "the worker is running" while nothing was started
+    is exactly the sentence that made this campaign look healthy for a day.
+    """
+    control, api, db = bot(worker_enabled=False)
+
+    text = text_of(await control.dispatch(update("/worker on")))
+
+    assert "no worker switch wired up" in text, text
+    assert "WORKER_ENABLED" in text, text
+
+
+@pytest.mark.asyncio
+async def test_the_worker_command_refuses_a_word_it_does_not_know() -> None:
+    control, api, db = bot(worker_switch=WorkerSwitch())
+
+    text = text_of(await control.dispatch(update("/worker restart")))
+
+    assert "on` runs" in text and "off` stops" in text, text
+
+
+@pytest.mark.asyncio
+async def test_the_campaign_screen_offers_the_tap_that_ends_the_silence() -> None:
+    """A start screen that only *names* a broken switch leaves the operator reading; this one hands over the tap.
+
+    The button is offered only when the service has a switch at all — otherwise it would be a button that
+    ends in a refusal, which is the thing this interface was built to stop.
+    """
+    switch = WorkerSwitch(running=False)
+    campaign = dict(CAMPAIGN_READY)
+    control, api, db, _w = joinreq_bot(campaign=campaign)
+    control.worker_switch = switch  # type: ignore[attr-defined]
+    control.settings = control.settings.model_copy(update={"worker_enabled": False})
+
+    await control.dispatch(parse_update(_press(api, "x:/joinreq open #21")))
+    labels = [
+        str(one.get("text") or "") for row in api.markups[-1]["inline_keyboard"] for one in row
+    ]
+    assert any(label.startswith("▶️ Run the queue") for label in labels), labels
+
+    await control.dispatch(parse_update(_press(api, "x:/joinreq go #21")))
+    reply = api.sent[-1][1]
+    assert "queue worker is OFF" in reply, reply
+    assert "tap ▶️ Run the queue" in reply, reply
+
+
 @pytest.mark.asyncio
 async def test_a_job_that_is_actually_running_is_left_alone_and_shown() -> None:
     """`held` is a real answer, and it has to be a *useful* one: the job's number and where to look.

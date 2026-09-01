@@ -218,7 +218,8 @@ and the probe becomes a confirmation rather than a requirement.
 2. `/probe` in the control bot chat, and read what it reports. That is the authenticated
    run the storage bot's command protocol and the season-sticker mapping have been waiting
    on (`docs/architecture.md` names them as the two unknowns).
-3. `WORKER_ENABLED=true` in Render, save. The queue starts claiming, and the first run of
+3. `/worker on` in the control bot (or `WORKER_ENABLED=true` in Render, if you would
+   rather the change survive a restart). The queue starts claiming, and the first run of
    every job kind is still a plan until you say otherwise.
 4. UptimeRobot (free) → a 5-minute HTTP monitor on
    `https://<your-render-service>.onrender.com/health`. Render's free tier sleeps after
