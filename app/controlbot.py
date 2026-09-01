@@ -467,6 +467,65 @@ class ControlBot:
         finally:
             await wrapper.stop()
 
+    async def _campaign_live_job(self, campaign_id: int) -> dict[str, Any] | None:
+        """The queue row this campaign has right now, if it has one - looked up by campaign, not by key.
+
+        A run's `dedup_key` is spelled `campaign:<id>:run<how many contacts were recorded when it was
+        written>` and it keeps that spelling for its whole life, so anything that moves the count between the
+        queueing and the reading (a `/joinreq free`, an earlier batch) leaves the key naming a row that is not
+        the one waiting. The question on this screen is "is anything scheduled for this campaign, and when",
+        and `app.job.payload` carries the campaign id the row was written for, which is what the row itself
+        is about.
+        """
+        try:
+            row = await self.db.fetchrow(
+                "select id, status::text as status, dedup_key, attempts, max_attempts,"
+                " extract(epoch from (next_attempt_at - now()))::int as in_seconds"
+                " from app.job where kind = 'join_request_campaign'"
+                " and (payload ->> 'campaign_id')::int = $1 and status in ('queued', 'running')"
+                " order by id desc limit 1",
+                int(campaign_id),
+            )
+        except Exception:  # noqa: BLE001  - a schedule line never outranks the answer it annotates
+            return None
+        return dict(row) if row else None
+
+    async def _campaign_schedule_line(self, campaign_id: int) -> str:
+        """One sentence about when this campaign's next run wakes up — or the fact that nothing will.
+
+        A ceiling wait is invisible in exactly the way that made this campaign look broken: the run was
+        written to the queue with a `next_attempt_at` in the future, the campaign sat `ready`, and every
+        screen said either nothing or "queued". The operator read that as a dead bot and tapped Start again,
+        which started a run that hit the same ceiling and returned. So the wait is printed here, in minutes,
+        read from the queue row itself rather than remembered: if the row says it wakes in four minutes, that
+        is what the chat says, and a wrong number is a lie about a timer rather than an omission.
+        """
+        row = await self._campaign_live_job(int(campaign_id))
+        if not row:
+            return (
+                "\nnothing is scheduled for it right now: tap ✅ Yes, start sending when you want the next"
+                " batch, and the run pauses itself at the ceiling."
+            )
+        status = str(row.get("status") or "")
+        seconds = int(row.get("in_seconds") or 0)
+        spent = int(row.get("attempts") or 0) >= int(row.get("max_attempts") or 0) > 0
+        if status in ("queued", "running") and spent:
+            # The queue's most misleading shape: a `queued` row with no tries left is invisible to
+            # `app.claim_next_job`, so every screen that says "queued" is true and nothing runs. Only the
+            # operator's tap resets it, so the screen names that tap rather than the number.
+            return (
+                f"\nnext batch: job #{row.get('id')} has spent its tries and no worker will claim it again."
+                " tap ✅ Yes, start sending — the same row goes back on the queue with its tries reset."
+            )
+        if status in ("queued", "running") and seconds > 60:
+            return (
+                f"\nnext batch: job #{row.get('id')} wakes in about {max(1, round(seconds / 60))} minutes"
+                " (the hourly ceiling is what it is waiting for; nothing has to be tapped again)."
+            )
+        if status == "running":
+            return f"\nnext batch: job #{row.get('id')} is running right now."
+        return f"\nnext batch: job #{row.get('id')} is {status} and due now."
+
     async def _campaign_watch(self) -> list[str]:
         """The reasons a queued run would still send nothing, each with the tap that fixes it.
 
@@ -769,11 +828,29 @@ class ControlBot:
                     f"{unreleased} person(s) have a row but were never sent a message — an older dry run"
                     " recorded them. The bot cannot tell that from a send that was cut off, so it asks you:"
                 )
+        rate = int((row or {}).get("rate_per_hour") or 20)
         lines.append(
             f"pace: one person every {writers.JOIN_SEND_GAP_SECONDS:g} seconds, at most "
-            f"{int((row or {}).get('rate_per_hour') or 20)} per hour, and nobody is written to twice"
+            f"{rate} per hour, and nobody is written to twice"
         )
+        if row is not None:
+            # Where the next batch is, in the same place the operator is looking for it. A ceiling wait that
+            # is not written down reads as a dead campaign, and the tap that follows it does nothing.
+            schedule = await self._campaign_schedule_line(int(row["id"]))
+            if schedule:
+                lines.append(schedule.strip())
         choices = []
+        if row is not None:
+            # The ceiling is the one number that decides when the next person hears anything, so the two taps
+            # that move it sit beside the start tap. Only the direction that differs from today is offered:
+            # a `60 an hour` button on a campaign already at 60 is a button that changes nothing.
+            for label, value in (("🐇 60 an hour", 60), ("🐇 120 an hour", 120), ("🐢 20 an hour", 20)):
+                if value != rate:
+                    choices.append({
+                        "label": label,
+                        "command": f"/campaign #{destination['id']} rate {name} {value}",
+                    })
+                    break
         if row is None or str(row.get("status")) in {"draft", "paused", "failed"}:
             choices.append({"label": "▶️ Start sending", "command": f"/joinreq start #{destination['id']}"})
         else:
@@ -2433,10 +2510,11 @@ class ControlBot:
 
     _CAMPAIGN_USAGE = (
         "usage: /campaign <channel> [new <name> | text <name> <words…> | plan <name> |"
-        " confirm <name> <code> | pause <name> | abort <name>]\n"
+        " confirm <name> <code> | rate <name> <n> | pause <name> | abort <name>]\n"
         "  /campaign @bleach_hindi new wave1      draft it from the saved /joinmsg wording\n"
         "  /campaign @bleach_hindi plan wave1       who would be contacted, and the code\n"
-        "  /campaign @bleach_hindi confirm wave1 4F2A   let it run\n\n"
+        "  /campaign @bleach_hindi confirm wave1 4F2A   let it run\n"
+        "  /campaign @bleach_hindi rate wave1 60        how many an hour, 1 to 200\n\n"
         "a campaign messages people whose join request is still pending, one message each, at "
         "campaign.rate_per_hour at most. It is the only job kind here that contacts a stranger, so it "
         "takes two deliberate steps and an unreadable-by-accident code; aborting leaves every row in "
@@ -2536,6 +2614,64 @@ class ControlBot:
                 f"plan it: /campaign {handle} plan {name}"
             )]
 
+        if action == "rate":
+            # The hourly ceiling is the number that decides when the next stranger hears anything, and it is
+            # the one that quietly stopped this campaign: 20 sent, 20 per hour allowed, and every later run
+            # pausing itself the moment it started. It is a plain column, so it is changed here rather than in
+            # a config row the operator would have to remember the spelling of.
+            from . import writers  # noqa: PLC0415  (the per-run cap lives with the loop it caps)
+
+            if len(rest) < 3:
+                return [Reply(f"`rate` needs the campaign and the number, e.g. `rate {self._JOINREQ_CAMPAIGN} 60`."
+                              f"\n\n{self._CAMPAIGN_USAGE}")]
+            name = rest[1]
+            campaign = await _row(name)
+            if campaign is None:
+                return [Reply(
+                    f"there is no campaign `{name}` on {destination.get('title') or destination['id']},"
+                    " so there is no ceiling to change. `/joinreq open` starts one from the saved wording."
+                )]
+            wanted = rest[2].strip()
+            if not wanted.isdigit():
+                return [Reply(
+                    f"`{wanted}` is not a number of people per hour, so nothing was changed.\n\n"
+                    f"{self._CAMPAIGN_USAGE}"
+                )]
+            value = int(wanted)
+            if not 1 <= value <= 200:
+                return [Reply(
+                    f"{value} per hour is not something I will write. Between 1 and 200 — and each run still "
+                    f"stops at {writers.JOIN_MAX_PER_RUN} messages with {writers.JOIN_SEND_GAP_SECONDS:g}"
+                    " seconds between them, so a bigger number means more runs rather than a faster flood."
+                )]
+            await self.db.execute(
+                "update app.join_campaign set rate_per_hour = $2, updated_at = now() where id = $1",
+                int(campaign["id"]),
+                value,
+            )
+            pulled = ""
+            try:
+                from .writers import WAKE_JOB_BY_ID_SQL  # noqa: PLC0415
+
+                waiter = await self._campaign_live_job(int(campaign["id"]))
+                # Only a row that is sitting on the queue with a wait on it is pulled forward; a run that is
+                # mid-batch needs nothing from here, and a `blocked` row is an open question, not a timer.
+                if (
+                    waiter
+                    and str(waiter.get("status")) == "queued"
+                    and int(waiter.get("in_seconds") or 0) > 0
+                ):
+                    if await self.db.fetchrow(WAKE_JOB_BY_ID_SQL, int(waiter["id"])):
+                        pulled = "\nthe waiting run is due now, so it does not have to sit out the old hour."
+            except Exception:  # noqa: BLE001  - a raised ceiling is the answer; the wake-up is a courtesy
+                pulled = ""
+            return [Reply(
+                f"`{name}` on {destination.get('title') or destination['id']}: at most {value} people per"
+                " hour, one message every 3 seconds, and nobody who was already sent to is sent to again."
+                " The default for a campaign that does not exist yet stays the `campaign.rate_per_hour`"
+                f" config row.{pulled}"
+            )]
+
         if action in {"plan", "confirm", "pause", "abort"}:
             if len(rest) < 2:
                 return [Reply(f"`{action}` needs a name.\n\n{self._CAMPAIGN_USAGE}")]
@@ -2548,6 +2684,7 @@ class ControlBot:
                 total, listed, why = await self._pending_requests(
                     str(destination.get("telegram_channel_id") or "")
                 )
+                schedule = await self._campaign_schedule_line(int(campaign["id"]))
                 if total is None:
                     pending = (
                         "\n\nthe pending requests could not be read from this account right now: "
@@ -2566,7 +2703,8 @@ class ControlBot:
                     f"campaign `{name}` ({campaign['status']}) on "
                     f"{destination.get('title') or destination['id']}:\n\n"
                     f"• text: {campaign['message_template']}\n"
-                    f"• at most {campaign['rate_per_hour']} people per hour, one message each\n"
+                    f"• at most {campaign['rate_per_hour']} people per hour, one message each"
+                    f"{schedule}\n"
                     f"• nobody is contacted twice, and a message never approves or declines the request"
                     f"{pending}\n\n"
                     f"to run it: /campaign {handle} confirm {name} {code}\n"
@@ -2646,6 +2784,7 @@ class ControlBot:
                         if getattr(self.settings, "outbound_enabled", False)
                         else "In shadow mode each message plans and blocks, which is the read-only version of this run."
                     )
+                    + (await self._campaign_schedule_line(int(campaign["id"])))
                     + (("\n\n" + "\n".join(watch)) if watch else "")
                 )]
 

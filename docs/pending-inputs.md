@@ -200,8 +200,13 @@ The list below is the residual — what still stops each kind from completing, i
   <message id>`, before any episode post of that season. A pack name or an install link is not an
   address, and which sticker opens a season is not this program's call.
 - `join_request_campaign` — reads the still-pending requests of one channel, sends the wording of
-  `/joinmsg`, and stops at `campaign.rate_per_hour` by pausing the campaign rather than pushing past
-  it. A campaign runs only after `/campaign … confirm <code>` — or after the plan and the start tap on
+  `/joinmsg`, and stops at `campaign.rate_per_hour` by *waiting* rather than pushing past it. The wait is
+  written, not slept: the run puts **its own queue row** back on the queue with `next_attempt_at` at the
+  minute one of this hour's sends ages out (`app.writers.requeue_current_run`), and asks the worker for no
+  verdict at all (`app.writers.Requeued`), because marking that row succeeded would delete the timer sitting
+  on it. A second row would be swallowed by the `dedup_key` the running row already holds, which is how this
+  branch once left a campaign armed, `paused`, and never started again. A spent ceiling is therefore a timer
+  in Postgres — not a `paused` row nobody restarts, and not a wait in a process that Render may spin down. A campaign runs only after `/campaign … confirm <code>` — or after the plan and the start tap on
   `/joinreq`, which computes that code instead of asking you to type it, and paces one person every 3
   seconds so a restart can resume the list. A shadow run plans and records **nobody**: `app.join_campaign_contact`
   is the promise that a person is not written to twice, so writing it for a message that never left the

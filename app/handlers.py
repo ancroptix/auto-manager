@@ -125,8 +125,8 @@ DEPENDENCIES: dict[str, str] = {
     JobKind.JOIN_REQUEST_CAMPAIGN.value: (
         "the campaign text (app/joinmsg.py, /joinmsg) and a campaign row set to ready by "
         "/campaign … confirm with the code that command shows. The text is refused if it carries an "
-        "invite link or reads like a decision about the request, and the per-hour ceiling pauses the "
-        "campaign rather than pushing past it"
+        "invite link or reads like a decision about the request, and the per-hour ceiling is waited out: "
+        "the next run is written with its wake-up time in the queue row rather than pushing past it"
     ),
 }
 

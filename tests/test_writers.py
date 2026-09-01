@@ -15,6 +15,7 @@ Each of those is cheap to break and expensive to discover in front of a channel.
 from __future__ import annotations
 
 import asyncio
+import re
 from pathlib import Path
 from types import SimpleNamespace  # the campaign fake hands out input entities, like the real read does
 
@@ -23,7 +24,7 @@ import pytest
 from app import captions, joinmsg, sender
 from app.handlers import DEPENDENCIES, FeatureNotImplemented, build_registry
 from app.stages import JobKind
-from app.writers import NeedsInput, PlanOnly, Writers, build_writers
+from app.writers import NeedsInput, PlanOnly, Requeued, Writers, build_writers
 
 
 def test_the_write_kinds_are_claimed_by_somebody() -> None:
@@ -287,16 +288,45 @@ class CampaignDb:
         # allowed to filter on one and count on the other, and a fake that conflated them would hide it.
         self.released = released
         self.unsent = unsent
+        # The campaign's own status, and the operator's ⏸ modelled as what it really is: a write to that row
+        # from another connection, while this run is working. `status_flip` is the value the tap writes and
+        # `flip_after` how many people the run has to record before the tap lands (`-1`: as soon as the run
+        # has read its campaign row and looked away). Reads and writes here both see `status`, so the fake
+        # can tell a run that re-reads between sends from one that remembers the plan, and a guarded write
+        # from an unguarded one — which is the whole difference between "my stop worked" and twenty DMs.
+        self.status = "ready"
+        self.status_flip: str | None = None
+        self.flip_after = 0
+        self.sends = 0
+        self.status_reads = 0
+        self.applied: list[str] = []
+        # What the ceiling has already spent, when the test wants a campaign that is halfway through (or
+        # clean through) its hour. Unset answers 0, which is what a campaign with no sends says.
+        self.sent_this_hour: int | None = None
+        self.next_slot_in: int | None = None
+        self.job_writes: list[tuple] = []
+        # What a run that is waiting said about itself, on the job's own timeline. `next_attempt_at` is a
+        # column no screen reads directly, so the sentence is the only thing an operator can check.
+        self.events: list[tuple] = []
         self.recorded = recorded if recorded else contacts
         self.sql: list[tuple[str, tuple]] = []
         self.queued: list[tuple[str, str]] = []
 
     async def fetchrow(self, statement: str, *args):
         self.sql.append((statement, args))
+        if "update app.job set" in statement:
+            # The queue row's own state: when a run was queued, and how far in the future it was pushed.
+            self.job_writes.append((statement, args))
+            return {"id": 7}
+        if "insert into app.job_event" in statement:
+            self.events.append(args)
+            return None
+        if "from app.job where dedup_key" in statement:
+            return None
         if "from app.join_campaign c" in statement:
-            return {
+            row = {
                 "id": 7,
-                "status": "ready",
+                "status": self.status,
                 "name": "default",
                 "message_template": "{name}, aapka request dekh liya jaa raha hai",
                 "rate_per_hour": self.rate,
@@ -304,6 +334,11 @@ class CampaignDb:
                 "telegram_channel_id": -1002575861262,
                 "title": "Dekin no mogura Anime in Hindi",
             }
+            if self.status_flip and self.flip_after < 0:
+                # Read as it stood, and the tap lands right after the run looked: the status the run planned
+                # against is then not the status it writes against, which is the race itself.
+                self.status, self.status_flip = self.status_flip, None
+            return row
         return None
 
     async def fetch(self, statement: str, *args):
@@ -319,6 +354,16 @@ class CampaignDb:
 
     async def fetchval(self, statement: str, *args):
         self.sql.append((statement, args))
+        # Two different reads over the same hour of contacts, matched apart on purpose: the count of what the
+        # ceiling has spent, and the arithmetic that says how long until a slot frees. A fake that answered
+        # both with one knob would let a run that mixed the two SQL strings still look right.
+        if "extract(epoch" in statement:
+            return 3600 if self.next_slot_in is None else self.next_slot_in
+        if "status = 'sent' and sent_at > now()" in statement:
+            return 0 if self.sent_this_hour is None else self.sent_this_hour
+        if "select status from app.join_campaign" in statement:
+            self.status_reads += 1
+            return self.status
         if "sent_at is null" in statement:
             return self.unsent
         if "count(*) from app.join_campaign_contact" in statement and "sent_at" not in statement:
@@ -329,6 +374,22 @@ class CampaignDb:
 
     async def execute(self, statement: str, *args) -> int:
         self.sql.append((statement, args))
+        if "insert into app.join_campaign_contact" in statement:
+            self.sends += 1
+            if self.status_flip and self.sends > self.flip_after >= 0:
+                self.status, self.status_flip = self.status_flip, None
+            return 1
+        if "update app.join_campaign set" in statement and "status" in statement:
+            # The guard clauses in those statements are obeyed the way Postgres obeys them: no `and status
+            # in (...)`, or a row whose status is not in the list, and the write simply matches nothing.
+            guard = re.search(r"and status in \(([^)]*)\)", statement)
+            allowed = re.findall(r"'([a-z_]+)'", guard.group(1)) if guard else None
+            if allowed is not None and self.status not in allowed:
+                return 0
+            taken = re.search(r"set status = '([a-z_]+)'", statement)
+            self.status = taken.group(1) if taken else str(args[1])
+            self.applied.append(self.status)
+            return 1
         return 1
 
     async def enqueue(self, kind: str, dedup_key: str, **kwargs):
@@ -678,6 +739,153 @@ async def test_a_campaign_without_a_hash_still_uses_the_id_it_has(monkeypatch) -
 
     assert result["sent"] == 1, result
     assert handlers.transport.peers == [900], handlers.transport.peers
+
+
+async def test_a_pause_tap_stops_the_batch_after_the_message_in_flight(monkeypatch) -> None:
+    """**⏸ Stop after this one means the next message is not sent.** The loop re-reads the campaign between
+    every person, so a tap that arrives mid-batch lands on the batch. It used to land nowhere: the run
+    planned twenty, sent twenty, and only then would anything have noticed the pause — which is exactly the
+    "I clicked pause and it sent DMs to 20 people" the operator reported.
+
+    What the run gives back is a stopped answer rather than a finished one: the messages already sent stay
+    sent (nothing un-sends), the campaign keeps the status the operator wrote, and no next run is queued,
+    because a stopped list has to be started again on purpose.
+    """
+    from app import writers as writers_module
+
+    slept: list[float] = []
+    monkeypatch.setattr(writers_module.asyncio, "sleep", lambda delay: slept.append(delay) or _noop())
+
+    async def _noop():
+        return None
+
+    db = CampaignDb(waiting=8, rate=1000)
+    db.status_flip = "paused"
+    db.flip_after = 3
+    handlers = _campaign_writers(db, outbound=True)
+
+    result = await handlers.join_request_campaign({"campaign_id": 7}, None)
+
+    assert result["sent"] == 4, result
+    assert result["continued"] is False and "stopped" in result, result
+    assert result["waiting_after"] == 4, result
+    assert slept == [writers_module.JOIN_SEND_GAP_SECONDS] * 3, slept
+    assert len(handlers.transport.sent) == 4, handlers.transport.sent
+    assert not [
+        sql for sql, _ in db.sql if "update app.join_campaign set status" in sql
+    ], "a finishing run overwrote the pause the operator just tapped"
+    assert db.queued == [], "a paused campaign is not handed to the next run by itself"
+
+
+async def test_the_hourly_ceiling_waits_for_the_hour_instead_of_parking_the_campaign() -> None:
+    """The ceiling is arithmetic about time, not a decision - so the run re-arms its own row and stops.
+
+    The old answer was correct about one thing and ruinous about the other: it refused to push past the
+    operator's per-hour number, and parked the campaign there with nothing scheduled. The operator's next
+    tap started a run that hit the same branch and paused it again on the spot - "clicked start sending
+    again, it is not sending anymore". A wake-up now sits on the queue row this run is in, at the moment the
+    oldest send of the hour ages out of the window, and `app.claim_next_job` honours a future
+    `next_attempt_at` on its own. That is also why nothing is *enqueued* here: the key for this run is held
+    by the row that is running, so a new row would be swallowed, the wait never written, and this run's
+    completion would close the only row there was - a campaign armed with a start screen and no timer.
+    """
+    db = CampaignDb(waiting=5, rate=2)
+    db.sent_this_hour = 2
+    handlers = _campaign_writers(db, outbound=True)
+    job = {"campaign_id": 7, "id": 41, "stage": "discovered"}
+
+    with pytest.raises(Requeued) as raised:
+        await handlers.join_request_campaign(job, None)
+
+    assert "2/hour ceiling is spent" in str(raised.value), raised.value
+    assert "about 60 minute" in str(raised.value), raised.value
+    waits = [(sql, args) for sql, args in db.job_writes if "set status = 'queued'" in sql]
+    assert len(waits) == 1, db.job_writes
+    assert waits[0][1] == (41, 3600), waits[0]
+    assert "locked_until = null" in waits[0][0], "a row on the queue again must not be left on this lease"
+    # The wait is the *whole* answer this branch gives, so the two things that would undo it are asserted
+    # here rather than assumed: the campaign is not paused, and no second run was queued behind it.
+    assert [sql for sql, _ in db.sql if "status = 'paused'" in sql] == [], "the campaign was parked again"
+    assert [sql for sql, _ in db.sql if "update app.join_campaign set status" in sql] == [], db.sql
+    assert db.queued == [], "a run queued under the key this row already holds is a wait that never lands"
+    assert db.events, "a job that is waiting has to say so on its own timeline"
+    assert "about 60 minute" in db.events[-1][2], db.events
+    assert handlers.transport.sent == [], "the ceiling is a wait, not a licence to send anyway"
+
+    db.next_slot_in = 240
+    with pytest.raises(Requeued) as soon:
+        await handlers.join_request_campaign(job, None)
+    assert "about 4 minute" in str(soon.value), soon.value
+    assert db.job_writes[-1][1] == (41, 240), db.job_writes
+
+    db.next_slot_in = 5
+    with pytest.raises(Requeued):
+        await handlers.join_request_campaign(job, None)
+    # A five-second "wait" for an hour-long window is a spin, and eight spins are a row no worker claims.
+    assert db.job_writes[-1][1] == (41, 60), db.job_writes
+
+
+async def test_a_ceiling_hit_that_is_not_a_queue_row_says_so_rather_than_promising_a_wake_up() -> None:
+    """A run with no row to re-arm cannot promise a timer, and must not pretend to have set one.
+
+    The shadow pass a dry run makes reaches the same arithmetic without sitting in the queue, and the last
+    thing this flow can afford is a screen that says a job is waiting when nothing will ever wake. The
+    answer is the truth plus the one tap that clears it, which is the same tap that revives a spent row.
+    """
+    db = CampaignDb(waiting=5, rate=2)
+    db.sent_this_hour = 2
+    handlers = _campaign_writers(db, outbound=True)
+
+    result = await handlers.join_request_campaign({"campaign_id": 7}, None)
+
+    assert result["rescheduled"] is False, result
+    assert result["resumes_in"] == 3600, result
+    assert "\u2705 Yes, start sending" in result["why"], result
+    assert db.job_writes == [], "there was no row to write a wait on"
+    assert db.queued == []
+    assert [sql for sql, _ in db.sql if "status = 'paused'" in sql] == []
+
+
+async def test_a_run_that_found_nobody_leaves_a_pause_the_operator_tapped_alone() -> None:
+    """An empty queue closes the campaign, but not over a stop that was tapped a moment earlier.
+
+    Both early writes in this function used to set the status with no condition on it, so a run that was
+    already on its way marked the campaign `completed` (or handed a dry run's campaign back as `ready`) in
+    the same breath as the operator pressed \u23f8. The messages that went out stay sent and the rows stay;
+    what does not change is what the operator just decided about the campaign itself.
+    """
+    db = CampaignDb(waiting=0, rate=1000)
+    db.status_flip = "paused"
+    db.flip_after = -1
+    handlers = _campaign_writers(db, outbound=True)
+
+    result = await handlers.join_request_campaign({"campaign_id": 7}, None)
+
+    assert "nobody is waiting" in result["skipped"], result
+    assert db.status == "paused", db.applied
+    assert "completed" not in db.applied, db.applied
+
+
+async def test_a_dry_run_hands_the_campaign_back_but_not_over_a_pause() -> None:
+    """Shadow mode plans and leaves the campaign as it found it \u2014 and as the operator left it.
+
+    A preview writes no contact rows and sends nothing, so its only state change is handing a campaign back
+    as `ready`. Handed back *unconditionally*, it also un-paused a campaign the operator had stopped while
+    the preview ran, which is a config change nobody asked for arriving from a screen that promises not to
+    change anything.
+    """
+    db = CampaignDb(waiting=3, rate=1000)
+    db.status_flip = "paused"
+    db.flip_after = -1
+    handlers = _campaign_writers(db, outbound=False, action="planned")
+
+    result = await handlers.join_request_campaign({"campaign_id": 7}, None)
+
+    # One person planned, then the run noticed the tap on its next read and stopped; what matters here is
+    # that the campaign row still says what the operator made it say when the preview handed it back.
+    assert result["sent"] == 0 and result["planned"] == 1, result
+    assert db.status == "paused", db.applied
+    assert db.applied == [], db.applied
 
 
 async def test_a_run_stops_at_the_lease_and_hands_the_rest_to_the_next_one(monkeypatch) -> None:

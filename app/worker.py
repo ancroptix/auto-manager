@@ -22,7 +22,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from . import sender
+from . import sender, writers
 from .config import Settings
 from .db import Database, DatabaseUnavailable
 from .keys import reconciliation_key
@@ -199,6 +199,12 @@ class Worker:
             await self.db.complete(job_id, result or {})
             self._processed += 1
             log.info("job %s (%s) completed", job_id, kind)
+        except writers.Requeued as exc:
+            # The handler wrote a wake-up time on this very row and asked for no verdict, so there is none
+            # to write: `complete` would mark the row succeeded and orphan the timer sitting on it. Nothing
+            # is counted as an error either - a run that is waiting for an hour is not a run that failed.
+            self._processed += 1
+            log.info("job %s (%s) re-queued by the handler: %s", job_id, kind, exc)
         except sender.RetryLater as exc:
             # Telegram's own number, once, and the queue waits: no inline sleep, no shorter retry.
             await self.db.fail(job_id, f"flood wait honoured: {exc}", retry_after=exc.retry_after)

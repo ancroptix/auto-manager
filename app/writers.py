@@ -38,7 +38,7 @@ from .stages import JobKind, JobStage
 
 log = logging.getLogger("auto_manager.writers")
 
-__all__ = ["FeatureNotImplemented", "NeedsInput", "Writers", "build_writers"]
+__all__ = ["FeatureNotImplemented", "NeedsInput", "Requeued", "Writers", "build_writers"]
 
 
 class FeatureNotImplemented(NotImplementedError):
@@ -66,6 +66,18 @@ class WriteBlocked(FeatureNotImplemented):
     silent — the exact shape of failure this project is not allowed to have. Raising the shape
     ``app/worker.py`` already parks puts the sentence in the blocked column instead. A flood is not this:
     a flood knows when it ends and arrives as :class:`app.sender.RetryLater`.
+    """
+
+
+class Requeued(Exception):
+    """The handler has put *its own row* back on the queue with a wake-up time, and wants no verdict.
+
+    It exists because a wait has to be written down rather than slept through or argued away. Marking the
+    row succeeded would delete the timer the handler just set; failing it would park it as `failed`, and
+    `app.claim_next_job` takes `queued` and `running` only, so the campaign would sit armed with nothing
+    able to wake it. So the loop counts the pass, logs this sentence, and leaves the row exactly as the
+    handler wrote it. :class:`app.sender.RetryLater` is the same shape for a wait Telegram named; this one
+    is for a wait our own arithmetic named.
     """
 
 
@@ -908,6 +920,65 @@ CAMPAIGN_JOB_BY_KEY_SQL = (
     " from app.job where dedup_key = $1"
 )
 
+#: Pulls one waiting run forward to right now, because the operator has just changed the thing it was
+#: waiting for. `app.claim_next_job` treats a past `next_attempt_at` as "now", so nothing else has to know
+#: this happened. By `id` and only while the row is `queued`: a row a worker is inside is not a screen's to
+#: move. `app.job` has no `updated_at`, which is a column this project has already been caught inventing.
+WAKE_JOB_BY_ID_SQL = (
+    "update app.job set next_attempt_at = now() where id = $1 and status = 'queued' returning id"
+)
+
+
+#: A claimed row asking for its own time back. By `id`, not by `dedup_key`: the key names the row this run
+#: is sitting in, so a key-based statement could only ever touch a row that is not ours. `locked_by` and
+#: `locked_until` go back to null with it, or the next worker has to wait out a lease that nobody holds,
+#: and `finished_at` goes null because a row on the queue again is not a row that is over.
+REQUEUE_JOB_SQL = (
+    "update app.job set status = 'queued', next_attempt_at = now() + make_interval(secs => $2::int),"
+    # `last_error` goes with the lease, or a row that failed three times before it learned to wait keeps
+    # showing the old sentence next to a `queued` status — the third state that makes a queue look busy.
+    " locked_by = null, locked_until = null, finished_at = null, started_at = null, last_error = null"
+    " where id = $1 returning id"
+)
+
+#: The wait on the row's own timeline, so `/status` and the campaign screen can say why a job that has not
+#: failed is not running either. A future `next_attempt_at` is invisible unless somebody writes it down.
+JOB_WAIT_EVENT_SQL = (
+    "insert into app.job_event (job_id, stage, status, message) values ($1, $2::app.job_stage,"
+    " 'queued', $3)"
+)
+
+
+async def requeue_current_run(
+    db: Any, *, job_id: int, delay_seconds: int, note: str, stage: str = "discovered"
+) -> bool:
+    """Hand this job's own row back to the queue with a wake-up time on it. True when the row is on it.
+
+    A campaign that has spent its hour needs a timer, and the two obvious ways to give it one are both
+    wrong. A *new* row for the same run is swallowed by the globally unique key the running row already
+    holds, so the wait is never written and the run then closes the only row there was: armed campaign,
+    no wake-up, and the operator's next tap met by the same ceiling again. Leaving the row `failed` with a
+    future `next_attempt_at` is equally dead, because claiming skips every status but `queued` and
+    `running`. So the row re-queues itself. The wait is a Postgres timestamp, which is the only kind that
+    survives a service spun down in the middle of it.
+    """
+    done = await db.fetchrow(REQUEUE_JOB_SQL, int(job_id), max(60, int(delay_seconds)))
+    if done is None:
+        return False
+    await db.fetchrow(JOB_WAIT_EVENT_SQL, int(job_id), stage, note[:400])
+    return True
+
+
+#: What the campaign's own status has to say for a run to keep going. Anything else is an operator's
+#: decision, taken while this run was mid-batch, and it wins.
+RUNNABLE_CAMPAIGN_STATES = ("ready", "running")
+
+
+async def campaign_status(db: Any, campaign_id: int) -> str:
+    """What the campaign says right now — read again between sends, not remembered from the batch plan."""
+    return str(await db.fetchval("select status from app.join_campaign where id = $1", int(campaign_id)) or "")
+
+
 #: Puts a closed run back on the queue rather than writing a second row for the same campaign. The guard is
 #: "not live, or spent its tries": `attempts = 0` has to come with it, or the revived row keeps the number
 #: that made `app.claim_next_job` skip it and the queue looks busy while nothing runs. `finished_at` goes
@@ -1033,8 +1104,10 @@ async def join_request_campaign(self: Writers, job: dict[str, Any], ctx: Any) ->
       (``app.joinmsg.refusals``), because a DM that admits someone past a pending approval is a hole;
     * one contact per (campaign, person), recorded *before* the send and updated after, so a crash in
       the middle becomes "already contacted" rather than a second message to the same stranger;
-    * ``rate_per_hour`` is honoured by *stopping* — the campaign goes to ``paused`` and the job
-      finishes — never by sleeping through a wait or shaving the interval;
+    * ``rate_per_hour`` is honoured by *waiting*: the run puts its own queue row back with the minute the
+      oldest send of the hour ages out, and the campaign stays armed. Never by sleeping through the wait,
+      never by shaving the interval, and no longer by pausing the campaign and calling that a plan — a
+      pause nobody scheduled is a stop nobody can find;
     * a privacy refusal marks the contact ``failed`` and is not retried into a second attempt.
     """
     from . import joinmsg  # noqa: PLC0415  (the wording module owns the rules, not this transport)
@@ -1128,7 +1201,11 @@ async def join_request_campaign(self: Writers, job: dict[str, Any], ctx: Any) ->
                 "why": "the queue is bigger than the pages this run could read",
             }
         await self.db.execute(
-            "update app.join_campaign set status = 'completed', finished_at = now(), updated_at = now() where id = $1",
+            # Guarded like every other write this function makes: "nobody is left" is a fact about the
+            # channel, and a pause the operator tapped while this run was reading is a fact about what they
+            # want next. `completed` here would settle the argument in favour of the run.
+            "update app.join_campaign set status = 'completed', finished_at = now(), updated_at = now()"
+            " where id = $1 and status in ('ready', 'running')",
             int(campaign_id),
         )
         return {
@@ -1148,10 +1225,51 @@ async def join_request_campaign(self: Writers, job: dict[str, Any], ctx: Any) ->
     )
     budget = max(0, rate - sent_this_hour)
     if budget == 0:
-        await self.db.execute(
-            "update app.join_campaign set status = 'paused', updated_at = now() where id = $1", int(campaign_id)
+        # The ceiling used to answer by setting the campaign to `paused`, and that was a trap with no
+        # key: nothing was scheduled, so the campaign stayed parked until the operator came back — and
+        # every later Start tap was met by this same branch pausing it again on the spot. The hour is what
+        # has to pass, not a decision, so the campaign stays armed and this row is put back on the queue
+        # with a wake-up time. The wait is until the *oldest* send of this hour ages out of the window,
+        # which is the first moment a slot is free again - not the top of an hour, which would be a number
+        # nobody asked for and could be an hour later than it needed to.
+        wait = int(
+            await self.db.fetchval(
+                "select coalesce(extract(epoch from (min(sent_at) + interval '1 hour') - now()), 3600)::int"
+                " from app.join_campaign_contact where campaign_id = $1 and status = 'sent'"
+                " and sent_at > now() - interval '1 hour'",
+                int(campaign_id),
+            )
+            or 3600
         )
-        return {"campaign_id": int(campaign_id), "paused": f"the {rate}/hour ceiling is already spent", "waiting": len(waiting)}
+        # A minute is the shortest wait this branch will write: the row is put back on the queue with its
+        # own `attempts` still spent, and a wait that is shorter than the hour it is guarding against would
+        # burn all eight tries inside five minutes and leave a row no worker claims.
+        wait = max(60, min(wait, 3900))
+        minutes = max(1, round(wait / 60))
+        note = f"the {rate}/hour ceiling is spent; this run wakes again in about {minutes} minute(s)"
+        job_id = job.get("id")
+        # The row is re-queued first and the run only then raises, so a wait that was not written cannot be
+        # announced. A hand-off under this run's own key would have been swallowed as a duplicate and the
+        # campaign would have been left armed with no timer at all, which is the bug this branch replaced.
+        armed = job_id is not None and await requeue_current_run(
+            self.db, job_id=int(job_id), delay_seconds=wait, note=note,
+            stage=str(job.get("stage") or "discovered"),
+        )
+        if armed:
+            raise Requeued(note)
+        return {
+            "campaign_id": int(campaign_id),
+            "waiting": len(waiting),
+            "sent": 0,
+            "failed": 0,
+            "ceiling": f"the {rate}/hour ceiling is spent, so nobody was sent to by this run",
+            "resumes_in": wait,
+            "rescheduled": False,
+            # Only a run that started from a queue row has a row to put back on the queue, and a dry run has
+            # none. Saying so is the whole difference between "wait and tap again" and silence.
+            "why": "this was not a queue row I could re-arm, so nothing is waiting for it - tap"
+            " ✅ Yes, start sending once the hour has turned",
+        }
 
     message = " ".join(str(campaign["message_template"]).split())
     series = str(campaign.get("title") or "")
@@ -1162,7 +1280,16 @@ async def join_request_campaign(self: Writers, job: dict[str, Any], ctx: Any) ->
     batch = waiting[: min(budget, JOIN_MAX_PER_RUN)]
     writer = self._writer([], max_writes=len(batch))
     sent = failed = planned = 0
+    stopped_early = False
     for position, entry in enumerate(batch):
+        if position:
+            # Re-read before every person, not once per batch: `⏸ Stop after this one` is a promise about the
+            # next message, and an operator who taps it while twenty are being planned must not watch all
+            # twenty go out. The read is one row by primary key, and it is the only way a stop that arrives
+            # mid-batch reaches this loop at all — nothing here holds a flag across awaits.
+            if await campaign_status(self.db, int(campaign_id)) not in RUNNABLE_CAMPAIGN_STATES:
+                stopped_early = True
+                break
         if position and batch_real_send:
             # Between sends, never before the first, and not at all in shadow mode: a planned message puts
             # nothing on the wire, so making a dry run of this take a minute per twenty people would be a
@@ -1211,7 +1338,11 @@ async def join_request_campaign(self: Writers, job: dict[str, Any], ctx: Any) ->
         # would have this shadow service re-read the whole queue forever, and `completed` would tell the
         # operator that strangers had been told when no message had left the account.
         await self.db.execute(
-            "update app.join_campaign set status = 'ready', updated_at = now() where id = $1", int(campaign_id)
+            # The same guard the live write carries: a dry run hands the campaign back as it found it, and a
+            # campaign the operator paused while it was planning is still paused when the planning stops.
+            "update app.join_campaign set status = 'ready', updated_at = now() where id = $1"
+            " and status in ('ready', 'running')",
+            int(campaign_id),
         )
         return {
             "campaign_id": int(campaign_id),
@@ -1223,14 +1354,43 @@ async def join_request_campaign(self: Writers, job: dict[str, Any], ctx: Any) ->
         }
 
     remaining = len(waiting) - len(batch)
+    if stopped_early:
+        # The operator's tap said stop. The messages that went out stay sent, the rows stay, and the
+        # campaign keeps the status they gave it — this run's only job is to say what it managed.
+        return {
+            "campaign_id": int(campaign_id),
+            "sent": sent,
+            "failed": failed,
+            "waiting_after": max(0, len(waiting) - position),
+            "stopped": "the campaign was paused or aborted while this run was working",
+            "gap_seconds": JOIN_SEND_GAP_SECONDS,
+            "continued": False,
+            "held_back": unreleased,
+        }
     finished = remaining <= 0
+    if await campaign_status(self.db, int(campaign_id)) not in RUNNABLE_CAMPAIGN_STATES:
+        return {
+            "campaign_id": int(campaign_id),
+            "sent": sent,
+            "failed": failed,
+            "waiting_after": max(0, remaining),
+            "stopped": "the campaign was paused or aborted while this run was working",
+            "gap_seconds": JOIN_SEND_GAP_SECONDS,
+            "continued": False,
+            "held_back": unreleased,
+        }
     # The status is passed as text and cast, and the "did we run out of people" flag is its own
     # parameter: reusing $2 for both the enum column and a `case when $2 = 'completed'` comparison makes
     # Postgres unable to settle on one type for it, and it answers with an error before anything runs.
     # A campaign that had sent every contact and then failed here would have looked unfinished forever.
     await self.db.execute(
         "update app.join_campaign set status = $2::app.campaign_status, updated_at = now(),"
-        " finished_at = case when $3 then now() else finished_at end where id = $1",
+        # `and status in ('ready', 'running')`: a pause or an abort the operator tapped while this run was
+        # sending is their decision about the campaign, and a finishing job has no business rewriting it to
+        # `running` (or, worse, `completed`) because the batch it planned is over. The rows this run wrote
+        # stay, and the contacts already sent stay sent.
+        " finished_at = case when $3 then now() else finished_at end where id = $1"
+        " and status in ('ready', 'running')",
         int(campaign_id),
         "completed" if finished else "running",
         finished,

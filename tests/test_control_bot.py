@@ -297,8 +297,17 @@ class FakeDb:
             return {"paused": paused[0], "reason": paused[1] or "", "last_reconcile_at": None}
         if "insert into app.telegram_session" in sql:
             return dict(self.stored[-1]) if self.stored else None
+        if "from app.job where kind = 'join_request_campaign'" in sql:
+            # "what does this campaign have on the queue" - the fake hands over the same row either way,
+            # because which of the two spellings the code asked with is exactly the bug this read avoids.
+            return dict(self.job_row) if self.job_row else None
         if "from app.job where dedup_key" in sql:
             return dict(self.job_row) if self.job_row else None
+        if "set next_attempt_at" in sql:
+            # Waking a waiting run early is a write on the queue row, and it is recorded as one so a test can
+            # see it happened with the campaign's key rather than on some other row.
+            self.writes.append((sql, args))
+            return {"id": int((self.job_row or {}).get("id") or 42)}
         if "update app.job set status = 'queued'" in sql:
             # The UPDATE carries its own guard (`not live, or out of tries`) for the race between the two
             # statements, and the fake honours it: a live row is not revived by a start tap.
@@ -478,6 +487,14 @@ class FakeDb:
             if self.campaign is not None:
                 self.campaign["unreleased"] = 0
             return count
+        if "update app.join_campaign set rate_per_hour" in sql:
+            # `/campaign … rate` writes the ceiling on this campaign's own row, and the fake reads it back
+            # onto that row: a command that said "now 60 per hour" over a row still at 20 is the sentence the
+            # operator would act on, so the mirror is the test.
+            self.writes.append((sql, args))
+            if self.campaign is not None:
+                self.campaign["rate_per_hour"] = int(args[1])
+            return 1
         if "update app.join_campaign set" in sql:
             # /campaign's state changes, mirrored onto the fake row so a test can read the status back
             # instead of pattern-matching the SQL it was written with. Both spellings the commands use: a
@@ -3750,6 +3767,159 @@ async def test_the_campaign_screen_offers_the_tap_that_ends_the_silence() -> Non
     reply = api.sent[-1][1]
     assert "queue worker is OFF" in reply, reply
     assert "tap ▶️ Run the queue" in reply, reply
+
+
+@pytest.mark.asyncio
+async def test_the_waiting_run_is_written_on_the_screen_that_shows_the_pace() -> None:
+    """A ceiling wait is only calm if it has a time on it; "queued" alone reads as a dead bot.
+
+    The number comes from the queue row's own `next_attempt_at`, not from a remembered value, so the screen
+    and the worker cannot disagree about when the campaign wakes up.
+    """
+    control, api, db, _w = joinreq_bot(campaign={**CAMPAIGN_READY, "status": "running", "sent": 20})
+    db.job_row = {
+        "id": 20,
+        "status": "queued",
+        "in_seconds": 2400,
+        "last_error": "",
+        "attempts": 0,
+        "max_attempts": 8,
+    }
+
+    await control.dispatch(parse_update(_press(api, "x:/joinreq open #21")))
+    text = api.sent[-1][1]
+
+    assert "wakes in about 40 minutes" in text, text
+    assert "job #20" in text, text
+    assert "nothing has to be tapped again" in text, text
+
+
+@pytest.mark.asyncio
+async def test_raising_the_ceiling_does_not_reach_into_a_run_that_is_already_working() -> None:
+    """A row a worker is inside is not a screen's to move, and the column change still stands on its own.
+
+    Pulling a `running` job's `next_attempt_at` forward would be the queue being told to hand the row to a
+    second worker while the first is still dialling: two passes over the same strangers is the one thing this
+    campaign must not do, and a run that is mid-batch will read the new number on its next hand-off anyway.
+    """
+    campaign = {**CAMPAIGN_READY, "status": "ready", "rate_per_hour": 20}
+    control, api, db, _w = joinreq_bot(campaign=campaign)
+    db.job_row = {
+        "id": 21,
+        "status": "running",
+        "in_seconds": -5,
+        "last_error": "",
+        "attempts": 1,
+        "max_attempts": 8,
+        "dedup_key": "campaign:7:run20",
+    }
+
+    text = text_of(await control._campaign(None, ["-1001234", "rate", "default", "60"]))
+
+    assert "at most 60 people per hour" in text, text
+    assert db.campaign["rate_per_hour"] == 60, db.campaign
+    assert not [sql for sql, _ in db.writes if "set next_attempt_at" in sql], db.writes
+    assert "the waiting run is due now" not in text, text
+
+
+@pytest.mark.asyncio
+async def test_a_campaign_with_no_run_scheduled_says_that_too() -> None:
+    """The other half: no row, no promise. "Tap Start and the run pauses itself at the ceiling" is what the
+    operator can actually do, and it is only true because the run re-arms its own wait."""
+    control, api, db, _w = joinreq_bot(campaign={**CAMPAIGN_READY, "status": "ready"})
+    db.job_row = None
+
+    await control.dispatch(parse_update(_press(api, "x:/joinreq open #21")))
+    text = api.sent[-1][1]
+
+    assert "nothing is scheduled for it right now" in text, text
+    assert "wakes in about" not in text, text
+
+
+@pytest.mark.asyncio
+async def test_a_queued_row_that_no_worker_will_claim_is_called_what_it_is() -> None:
+    """"queued" is a promise only while `app.claim_next_job` will still take the row.
+
+    A run that has spent its tries is the queue's most misleading shape: the number on screen says the work
+    is there, the worker's own predicate says it is not, and the campaign waits for a tap nobody mentions.
+    So the screen says what the row is, and names the one tap that resets it — which is the same ✅ the
+    operator already knows, not a new thing to learn.
+    """
+    control, api, db, _w = joinreq_bot(campaign={**CAMPAIGN_READY, "status": "ready"})
+    db.job_row = {
+        "id": 22,
+        "status": "queued",
+        "in_seconds": 3000,
+        "last_error": "",
+        "attempts": 8,
+        "max_attempts": 8,
+    }
+
+    await control.dispatch(parse_update(_press(api, "x:/joinreq open #21")))
+    text = api.sent[-1][1]
+
+    assert "job #22 has spent its tries" in text, text
+    assert "\u2705 Yes, start sending" in text, text
+    assert "wakes in about" not in text, text
+
+
+@pytest.mark.asyncio
+async def test_the_ceiling_is_changed_by_a_tap_because_it_is_the_number_that_stopped_the_campaign() -> None:
+    """20 sent, 20 an hour: the campaign was not broken, it was finished for the hour — and 20 was my default.
+
+    So the number is offered as taps beside the start button, and only in the direction that differs from
+    today. The row is what changes; the `campaign.rate_per_hour` config row stays the default for a campaign
+    that does not exist yet, and the reply says which of the two it touched.
+    """
+    campaign = {**CAMPAIGN_READY, "status": "ready", "rate_per_hour": 20}
+    control, api, db, _w = joinreq_bot(campaign=campaign)
+    # The campaign is sitting on a ceiling wait — twenty sent, twenty an hour — and the point of tapping the
+    # number up is that the wait ends with the tap rather than running out.
+    db.job_row = {
+        "id": 20,
+        "status": "queued",
+        "in_seconds": 1500,
+        "last_error": "",
+        "attempts": 0,
+        "max_attempts": 8,
+        "dedup_key": "campaign:7:run20",
+    }
+
+    await control.dispatch(parse_update(_press(api, "x:/joinreq open #21")))
+    labels = [str(one.get("text") or "") for row in api.markups[-1]["inline_keyboard"] for one in row]
+    faster = [label for label in labels if label.startswith("🐇")]
+    assert faster and faster[0] == "🐇 60 an hour", labels
+
+    text = text_of(await control._campaign(None, ["-1001234", "rate", "default", "60"]))
+
+    assert "at most 60 people per hour" in text, text
+    assert db.campaign["rate_per_hour"] == 60, db.campaign
+    wake = [(sql, args) for sql, args in db.writes if "set next_attempt_at" in sql]
+    assert wake, db.writes
+    assert wake[-1][1] == (20,), wake
+    assert "the waiting run is due now" in text, text
+
+    await control.dispatch(parse_update(_press(api, "x:/joinreq open #21")))
+    labels = [str(one.get("text") or "") for row in api.markups[-1]["inline_keyboard"] for one in row]
+    assert not [label for label in labels if label == "🐇 60 an hour"], labels
+
+
+@pytest.mark.asyncio
+async def test_the_ceiling_refuses_a_number_that_is_not_a_ceiling() -> None:
+    """Words and out-of-range numbers change nothing, and say what they would have done."""
+    control, api, db, _w = joinreq_bot(campaign={**CAMPAIGN_READY, "rate_per_hour": 20})
+
+    typed = text_of(await control._campaign(None, ["-1001234", "rate", "default", "soon"]))
+    assert "not a number of people per hour" in typed, typed
+    assert db.campaign["rate_per_hour"] == 20, db.campaign
+
+    huge = text_of(await control._campaign(None, ["-1001234", "rate", "default", "5000"]))
+    assert "not something I will write" in huge and "1 and 200" in huge, huge
+    assert db.campaign["rate_per_hour"] == 20, db.campaign
+
+    missing_number = text_of(await control._campaign(None, ["-1001234", "rate", "default"]))
+    assert "needs the campaign and the number" in missing_number, missing_number
+    assert "/campaign <channel> [new <name> | text <name> <words…> | plan <name> |" in missing_number
 
 
 @pytest.mark.asyncio

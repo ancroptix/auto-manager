@@ -105,6 +105,32 @@ async def test_reconciliation_runs_on_boot(make_settings) -> None:
 
 
 @pytest.mark.asyncio
+async def test_a_row_the_handler_rearms_is_left_exactly_as_the_handler_wrote_it(make_settings) -> None:
+    """The loop writes no verdict over a wait the handler just scheduled, and counts no error either.
+
+    A campaign that has spent its hour re-queues its own row and raises :class:`app.writers.Requeued`.
+    Marking that row succeeded would delete the wake-up time sitting on it, which is the whole reason the
+    campaign still has somewhere to come back to; failing it would park it in a status
+    `app.claim_next_job` never reads. So the only correct thing the loop can do is nothing at all to the
+    row, and say what happened in the log.
+    """
+    from app.writers import Requeued
+
+    db = FakeDB(jobs=[{"id": 11, "kind": "join_request_campaign", "stage": "discovered"}])
+
+    async def waiting(job, ctx):
+        raise Requeued("the 20/hour ceiling is spent; this run wakes again in about 40 minute(s)")
+
+    worker = make_worker(make_settings(), db, handlers={"join_request_campaign": waiting})
+    await run_briefly(worker)
+    assert db.completed == [], "the verdict overwrote the wait"
+    assert db.failed == [], "a run that is waiting is not a run that failed"
+    assert db.blocked == [], db.blocked
+    snap = worker.snapshot()
+    assert snap["processed"] == 1 and snap["errors"] == 0, snap
+
+
+@pytest.mark.asyncio
 async def test_unimplemented_feature_blocks_instead_of_succeeding(make_settings) -> None:
     db = FakeDB(jobs=[{"id": 7, "kind": "archive_media", "stage": "discovered"}])
 
