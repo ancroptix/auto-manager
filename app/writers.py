@@ -1061,12 +1061,26 @@ async def join_request_campaign(self: Writers, job: dict[str, Any], ctx: Any) ->
         raise NeedsInput("the campaign text breaks a rule: " + " / ".join(problems))
 
     peer = self._peer(campaign)
+    # `skipped` is the one status that means "this person is owed a message": an earlier run wrote the row and
+    # never sent it, and the operator has since said so out loud. Everything else counts as dealt with,
+    # `queued` included — the row is written *before* the send so a crash mid-run cannot become a second DM,
+    # and only a human can tell that state from a plan that was never a message at all.
     already = {
         int(row["telegram_user_id"])
         for row in await self.db.fetch(
-            "select telegram_user_id from app.join_campaign_contact where campaign_id = $1", int(campaign_id)
+            "select telegram_user_id from app.join_campaign_contact where campaign_id = $1"
+            " and status <> 'skipped'",
+            int(campaign_id),
         )
     }
+    unreleased = int(
+        await self.db.fetchval(
+            "select count(*) from app.join_campaign_contact where campaign_id = $1 and status = 'queued'"
+            " and sent_at is null",
+            int(campaign_id),
+        )
+        or 0
+    )
 
     async def _next_run() -> bool:
         """Hand the queue to the next run, under the key that says how far this one got. See `apply_pair`
@@ -1117,7 +1131,11 @@ async def join_request_campaign(self: Writers, job: dict[str, Any], ctx: Any) ->
             "update app.join_campaign set status = 'completed', finished_at = now(), updated_at = now() where id = $1",
             int(campaign_id),
         )
-        return {"campaign_id": int(campaign_id), "skipped": "nobody is waiting on this channel"}
+        return {
+            "campaign_id": int(campaign_id),
+            "skipped": "nobody is waiting on this channel",
+            "held_back": unreleased,
+        }
 
     rate = int(campaign.get("rate_per_hour") or 20)
     sent_this_hour = int(
@@ -1226,6 +1244,10 @@ async def join_request_campaign(self: Writers, job: dict[str, Any], ctx: Any) ->
         "waiting_after": max(0, remaining),
         "gap_seconds": JOIN_SEND_GAP_SECONDS,
         "continued": not finished,
+        # Named rather than folded into `failed`: these are rows this run did not touch because a record of
+        # them already exists, and the operator has to be able to tell "nobody is left" from "nobody is left
+        # *that I have not already written about*".
+        "held_back": unreleased,
     }
 
 

@@ -265,13 +265,28 @@ class CampaignDb:
     ask for its next run, and a run that asks twice would message the same stranger twice.
     """
 
-    def __init__(self, *, waiting: int, rate: int = 100, recorded: int = 0, contacts: int = 0) -> None:
+    def __init__(
+        self,
+        *,
+        waiting: int,
+        rate: int = 100,
+        recorded: int = 0,
+        contacts: int = 0,
+        released: int = 0,
+        unsent: int = 0,
+    ) -> None:
         self.waiting = waiting
         self.rate = rate
         # `contacts` is how far into the queue this campaign already is. It drives both halves of the story:
         # the rows the read is told to skip, and the count the continuation key is named after, so a test
         # cannot make one agree with the other by accident.
         self.contacts = contacts
+        # `released` is how many of those contact rows an operator has freed with `/joinreq free` (status
+        # `skipped`); `unsent` is how many are still `queued` with no send, which is the number the run has to
+        # report without being able to tell why. Both are separate from `contacts` because the handler is
+        # allowed to filter on one and count on the other, and a fake that conflated them would hide it.
+        self.released = released
+        self.unsent = unsent
         self.recorded = recorded if recorded else contacts
         self.sql: list[tuple[str, tuple]] = []
         self.queued: list[tuple[str, str]] = []
@@ -294,11 +309,18 @@ class CampaignDb:
     async def fetch(self, statement: str, *args):
         self.sql.append((statement, args))
         if "join_campaign_contact" in statement and "count(*)" not in statement:
-            return [{"telegram_user_id": 900 + n} for n in range(self.contacts)]
+            ids = list(range(self.contacts))
+            if "status <> 'skipped'" in statement:
+                # Only the query that says it filters gets the filtered answer: drop the predicate from the
+                # SQL and this fake hands back the released rows again, which is the bug being guarded.
+                ids = ids[self.released :]
+            return [{"telegram_user_id": 900 + n} for n in ids]
         return []
 
     async def fetchval(self, statement: str, *args):
         self.sql.append((statement, args))
+        if "sent_at is null" in statement:
+            return self.unsent
         if "count(*) from app.join_campaign_contact" in statement and "sent_at" not in statement:
             # The table's own count, so the continuation key is derived from what was recorded rather than
             # from a number the test happens to agree with.
@@ -586,6 +608,40 @@ async def test_a_run_that_vanished_between_two_statements_promises_nothing() -> 
 
 
 @pytest.mark.asyncio
+async def test_a_released_contact_is_owed_a_message_again(monkeypatch) -> None:
+    """`skipped` is the one contact status that means "still waiting", and it is what `/joinreq free` writes.
+
+    A row written by a run that never sent is the difference between a person being told twice and never
+    being told at all. The release is the operator's decision — but once they have made it, the campaign must
+    treat that person as new, or the tap does nothing and the number on the screen never moves.
+    """
+    db = CampaignDb(waiting=2, rate=1000, contacts=2, released=2)
+    handlers = _campaign_writers(db, outbound=True)
+
+    result = await handlers.join_request_campaign({"campaign_id": 7}, None)
+
+    assert result["sent"] == 2, result
+    assert [peer.user_id for peer in handlers.transport.peers] == [900, 901], handlers.transport.peers
+    assert result["held_back"] == 0, result
+
+
+async def test_the_run_reports_the_rows_it_was_not_allowed_to_send(monkeypatch) -> None:
+    """`held_back` counts rows this run skipped because a record of them exists and nobody released them.
+
+    It is reported apart from `failed` on purpose: "nobody is left" and "nobody is left *that I have not
+    already written about*" are different facts, and the second is the one that tells an operator to go and
+    release them.
+    """
+    db = CampaignDb(waiting=2, rate=1000, contacts=2, unsent=2)
+    handlers = _campaign_writers(db, outbound=True)
+
+    result = await handlers.join_request_campaign({"campaign_id": 7}, None)
+
+    assert result.get("skipped") == "nobody is waiting on this channel", result
+    assert result["held_back"] == 2, result
+    assert handlers.transport.sent == [], "a held-back row is not a licence to message whoever it was"
+
+
 async def test_a_campaign_addresses_people_by_the_handle_telegram_gave(monkeypatch) -> None:
     """The DM goes to the `InputUser` the queue read carried, not to the bare id the contact row stores.
 

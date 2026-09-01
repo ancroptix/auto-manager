@@ -648,6 +648,7 @@ class ControlBot:
         "  /joinreq start #21      the plan — who is waiting right now, and the exact words\n"
         "  /joinreq go #21         start it: one person every 3 seconds, nobody twice, no approvals\n"
         "  /joinreq stop #21       stop after the message in flight; what was sent stays sent\n"
+        "  /joinreq free #21       release people a run recorded but never messaged, so they can be sent to\n"
         "  /joinreq add            read the account and list the channels it can post in that are not here\n"
         "  /joinreq file 3         file that channel as a series' publishing channel and open it\n\n"
         "Which channel is offered is read from Telegram now, not from a cached list: the account has to be "
@@ -668,11 +669,47 @@ class ControlBot:
             " (select count(*) from app.join_campaign_contact k where k.campaign_id = c.id"
             "  and k.status = 'sent') as sent,"
             " (select count(*) from app.join_campaign_contact k where k.campaign_id = c.id"
-            "  and k.status = 'failed') as failed"
+            "  and k.status = 'failed') as failed,"
+            # Rows a run wrote and never sent: an older shadow run left them behind, and they are the reason
+            # a campaign can look finished while its strangers were never told. Counted here so the screen can
+            # offer one tap about them instead of leaving the number unexplained.
+            " (select count(*) from app.join_campaign_contact k where k.campaign_id = c.id"
+            "  and k.status = 'queued' and k.sent_at is null) as unreleased"
             " from app.join_campaign c where c.destination_id = $1 and lower(c.name) = lower($2)",
             int(destination_id),
             name,
         )
+
+    async def _joinreq_free(self, destination: Mapping[str, Any]) -> list[Reply]:
+        """Release the people a run recorded and never messaged, so a later run owes them again.
+
+        Why a tap and not an automatic rule: a row left at `queued` with no `sent_at` is one of two things,
+        and the table cannot tell them apart — a dry run that recorded contacts it only planned (which the
+        code did until it stopped), or a live run killed between writing the row and sending the message.
+        The second one exists to stop a duplicate DM to a stranger, so it cannot be undone by a guess. What
+        this writes is a status, never a deletion: the row, its id and its timestamp all stay.
+        """
+        row = await self._joinreq_row(int(destination["id"]), self._JOINREQ_CAMPAIGN)
+        if row is None:
+            return [Reply("there is no campaign on this channel yet, so there is nothing to release.")]
+        moved = int(
+            await self.db.execute(
+                "update app.join_campaign_contact set status = 'skipped'"
+                " where campaign_id = $1 and status = 'queued' and sent_at is null",
+                int(row["id"]),
+            )
+            or 0
+        )
+        if not moved:
+            return [Reply(
+                f"nobody on `{destination.get('title') or destination['id']}` is sitting in that state right"
+                " now, so nothing changed."
+            )]
+        return [Reply(
+            f"{moved} person(s) are released: their rows stay, and they are waiting for a message again."
+            " Tap ✅ Yes, start sending and they go out in the next batch — one person every 3 seconds,"
+            " and nobody who was already messaged is messaged again."
+        )]
 
     async def _joinreq_screen(self, lines: list[str], choices: list[dict], ran: str) -> list[Reply]:
         text, mark = console.joinreq_screen(lines, choices, note=console.screen_note(ran))
@@ -686,6 +723,10 @@ class ControlBot:
 
         name = self._JOINREQ_CAMPAIGN
         row = await self._joinreq_row(int(destination["id"]), name)
+        # Read before either branch, because the button below is built in both: no campaign row means nothing
+        # unreleased, and a screen that named the button before its campaign existed would be a promise about
+        # a row that does not exist.
+        unreleased = 0
         where = str(destination.get("title") or destination.get("telegram_channel_id") or destination["id"])
         lines = [f"{where} — series {destination.get('series') or '?'}"]
         if after:
@@ -706,6 +747,13 @@ class ControlBot:
             lines.append(
                 f"campaign: {row['status']}, {int(row.get('sent') or 0)} sent, {int(row.get('failed') or 0)} failed"
             )
+            # Two facts, two sentences: what the campaign did, and what is sitting in the table un-sent.
+            unreleased = int(row.get("unreleased") or 0)
+            if unreleased:
+                lines.append(
+                    f"{unreleased} person(s) have a row but were never sent a message — an older dry run"
+                    " recorded them. The bot cannot tell that from a send that was cut off, so it asks you:"
+                )
         lines.append(
             f"pace: one person every {writers.JOIN_SEND_GAP_SECONDS:g} seconds, at most "
             f"{int((row or {}).get('rate_per_hour') or 20)} per hour, and nobody is written to twice"
@@ -716,6 +764,10 @@ class ControlBot:
         else:
             choices.append({"label": "⏸ Stop after this one", "command": f"/joinreq stop #{destination['id']}"})
             choices.append({"label": "▶️ Keep going", "command": f"/joinreq start #{destination['id']}"})
+        if unreleased:
+            choices.append(
+                {"label": f"🔁 Send to those {unreleased}", "command": f"/joinreq free #{destination['id']}"}
+            )
         choices.append({"label": "✏️ Change the message", "screen": "joinmsg"})
         choices.append({"label": "📨 Other channels", "command": "/joinreq"})
         return await self._joinreq_screen(lines, choices, f"/joinreq open #{destination['id']}")
@@ -862,7 +914,7 @@ class ControlBot:
             return await self._joinreq_add()
         if action == "file":
             return await self._joinreq_file(" ".join(args[1:]).strip())
-        if action not in {"open", "start", "go", "stop"}:
+        if action not in {"open", "start", "go", "stop", "free"}:
             return [Reply(f"`{action}` is not something /joinreq does, so nothing was written.\n\n{self._JOINREQ_USAGE}")]
         ref = " ".join(args[1:]).strip()
         if not ref:
@@ -878,6 +930,8 @@ class ControlBot:
 
         if action == "open":
             return await self._joinreq_open(destination)
+        if action == "free":
+            return await self._joinreq_free(destination)
         if action == "stop":
             return await self._campaign(update, [handle, "pause", name])
         if action == "start":

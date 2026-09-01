@@ -100,6 +100,7 @@ class FakeDb:
         # let a test pass on a state the database cannot be in.
         self.job_row: dict | None = None
         self.revived: list[tuple] = []
+        self.rows_changed: int | None = None
         self.queued: list[tuple[str, Any, int]] = []
         self.leases_released = 0
         self.review_count = 2
@@ -462,6 +463,21 @@ class FakeDb:
             self.declared_history.append(dict(row))
             self.writes.append((sql, args))
             return 1
+        if "update app.join_campaign_contact set" in sql:
+            # `/joinreq free` releases rows a run recorded and never sent. The fake answers with the count the
+            # command reports, and clears the screen's figure: a reply saying "2 released" over a write that
+            # matched nothing is the sentence an operator would tap twice.
+            self.writes.append((sql, args))
+            # Unset, the rowcount mirrors what the screen had just counted: the command reports the number it
+            # read, and a test can see the two disagree. `rows_changed` overrides it for the empty case.
+            count = (
+                int((self.campaign or {}).get("unreleased") or 0)
+                if self.rows_changed is None
+                else int(self.rows_changed)
+            )
+            if self.campaign is not None:
+                self.campaign["unreleased"] = 0
+            return count
         if "update app.join_campaign set" in sql:
             # /campaign's state changes, mirrored onto the fake row so a test can read the status back
             # instead of pattern-matching the SQL it was written with. Both spellings the commands use: a
@@ -3569,6 +3585,61 @@ async def test_a_start_tap_revives_the_run_that_stole_its_own_key() -> None:
     assert "already queued" not in text, "the sentence that hid the silence must not come back"
     assert db.revived == [("campaign:7:run0",)], db.revived
     assert db.campaign["status"] == "ready", db.campaign
+
+
+@pytest.mark.asyncio
+async def test_people_recorded_but_never_messaged_are_offered_back_one_tap() -> None:
+    """The screen names the rows that make a campaign look finished, and offers exactly one decision.
+
+    An older shadow run wrote contact rows for people it only planned, and those rows are what tells a later
+    run to skip them — so the operator saw a count that never moved and a queue that stayed full. The bot
+    cannot tell that state from a live run killed between the row and the send (the second is why the row is
+    written first at all), so it does not guess: it shows the number, and one tap releases them.
+    """
+    campaign = dict(CAMPAIGN_READY)
+    campaign["unreleased"] = 2
+    control, api, db, _w = joinreq_bot(campaign=campaign)
+
+    await control.dispatch(parse_update(_press(api, "x:/joinreq open #21")))
+    text = api.sent[-1][1]
+    assert "2 person(s) have a row but were never sent a message" in text, text
+    labels = [
+        str(one.get("text") or one.get("label") or "")
+        for row in api.markups[-1]["inline_keyboard"]
+        for one in row
+    ]
+    assert any(label.startswith("🔁 Send to those 2") for label in labels), labels
+
+    await control.dispatch(parse_update(_press(api, "x:/joinreq free #21")))
+    reply = api.sent[-1][1]
+    assert "2 person(s) are released" in reply, reply
+    release = [sql for sql, _ in db.writes if "update app.join_campaign_contact set" in sql]
+    assert release, db.writes
+    assert "status = 'skipped'" in release[0], release[0]
+    assert "delete from" not in release[0].lower(), "nobody is deleted from this history"
+
+
+@pytest.mark.asyncio
+async def test_the_release_tap_says_nothing_changed_when_nothing_matched() -> None:
+    """A tap that changes nothing has to say so, in the same breath it would have promised a send."""
+    control, api, db, _w = joinreq_bot(campaign=dict(CAMPAIGN_READY))
+    db.rows_changed = 0
+
+    await control.dispatch(parse_update(_press(api, "x:/joinreq free #21")))
+
+    text = api.sent[-1][1]
+    assert "nothing changed" in text, text
+    assert "released" not in text, text
+
+
+@pytest.mark.asyncio
+async def test_a_channel_with_no_campaign_row_has_nothing_to_release() -> None:
+    control, api, db, _w = joinreq_bot(campaign=None)
+
+    await control.dispatch(parse_update(_press(api, "x:/joinreq free #21")))
+
+    assert "no campaign on this channel" in api.sent[-1][1], api.sent[-1][1]
+    assert not [sql for sql, _ in db.writes if "update app.join_campaign_contact" in sql], db.writes
 
 
 @pytest.mark.asyncio
