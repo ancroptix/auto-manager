@@ -361,3 +361,38 @@ async def test_a_round_that_cannot_read_the_list_is_retried_not_fatal() -> None:
 
     assert loop.errors >= 1, "the fault was counted, not swallowed"
     assert loop.passes >= 1 and writers.asked[0] == 7, "and the campaign was picked up without a hand in it"
+
+
+@pytest.mark.asyncio
+async def test_a_pass_that_stopped_on_a_rate_limit_is_waited_out_and_asked_again() -> None:
+    """The other half of "a flood is slept where it lands", for the pass that got somewhere first.
+
+    `RetryLater` is what a pass raises when it has nothing to report. A pass that sent two hundred messages
+    and *then* met Telegram's limit has plenty to report, so it returns instead — its counts, the people it
+    handed back, and the seconds it was asked to wait. The loop's job is to treat that number exactly like
+    the exception's: sleep it, then come back for the rest of the list. Before this, the number did not
+    exist, the pass carried on through fifteen hundred more strangers, and every one of them was written off.
+    """
+    db = LoopDb([{"id": 7, "name": "default", "status": "running"}])
+    writers = LoopWriters(
+        {
+            "sent": 200,
+            "failed": 0,
+            "owed": 1,
+            "waiting_after": 1575,
+            "more": True,
+            "retry_after": 3600,
+            "why": "Telegram asked this account to wait 3600s",
+        }
+    )
+    loop = live_loop(db, writers, page_seconds=0.5)
+    pauses = watch_pauses(loop)
+
+    await loop._round()
+
+    assert pauses == [3600.0], pauses
+    assert loop.errors == 0, "a wait is not a fault"
+    seen = loop.snapshot()["campaigns"]["7"]
+    assert seen["sent"] == 200 and seen["flood"] == 3600 and seen["owed"] == 1, seen
+    # And the campaign is still on, so the next round after the sleep asks for the rest.
+    assert writers.asked == [7], writers.asked

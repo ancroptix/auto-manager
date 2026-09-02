@@ -533,6 +533,11 @@ class ControlBot:
             head.append(f"{detail['planned']} planned, not sent")
         if detail.get("failed"):
             head.append(f"{detail['failed']} could not be sent")
+        if detail.get("owed"):
+            # People a pass wrote a row for and handed straight back — a flood, a timeout, a dropped
+            # connection. They are not failures and they are not sent, and folding them into either number
+            # is how fifteen hundred people disappeared out of a campaign without a sentence about it.
+            head.append(f"{detail['owed']} kept their place for the next pass")
         if len(head) == 1:
             head.append("nothing went out in its last pass")
         if detail.get("gap"):
@@ -542,10 +547,16 @@ class ControlBot:
             reason = "your \u23f8 stopped it"
         elif detail.get("skipped"):
             reason = f"its last look said: {detail['skipped']}"
+        elif detail.get("flood"):
+            # Ahead of the `waiting` line below, and that order is the fix: a pass stopped by a rate limit
+            # also reports everybody it did not reach, and reading that as "the queue is deeper than one
+            # read" told the operator the sender was busy when it was actually waiting out an hour.
+            reason = (
+                f"Telegram asked for a {detail['flood']} s pause, which this service waits out before it"
+                " sends to anybody else"
+            )
         elif detail.get("waiting"):
             reason = f"{detail['waiting']} people are past what one read can reach, and it goes back for them"
-        elif detail.get("flood"):
-            reason = f"Telegram asked for a {detail['flood']} s pause, which this service waits out"
         elif detail.get("finished"):
             reason = "the list was empty at its last look, so this campaign is done"
         if detail.get("error"):
@@ -756,17 +767,20 @@ class ControlBot:
 
     async def _joinreq_row(self, destination_id: int, name: str) -> dict | None:
         """The campaign row behind one channel, with what has been sent. A read, twice used and never written."""
+        from . import writers  # noqa: PLC0415  (the release predicate belongs to the sender, not the screen)
+
         return await self.db.fetchrow(
             "select c.id, c.name, c.status, c.message_template, c.per_message_delay_seconds,"
             " (select count(*) from app.join_campaign_contact k where k.campaign_id = c.id"
             "  and k.status = 'sent') as sent,"
             " (select count(*) from app.join_campaign_contact k where k.campaign_id = c.id"
             "  and k.status = 'failed') as failed,"
-            # Rows a run wrote and never sent: an older shadow run left them behind, and they are the reason
-            # a campaign can look finished while its strangers were never told. Counted here so the screen can
-            # offer one tap about them instead of leaving the number unexplained.
+            # Rows a run wrote and never sent: an older shadow run left them behind, a run was killed between
+            # the row and the send, or a rate limit wrote `failed` against people nobody ever refused. They
+            # are the reason a campaign can look finished while its strangers were never told. The predicate
+            # is `app/writers.py`'s own, so the number on this screen is exactly the number the ✅ frees.
             " (select count(*) from app.join_campaign_contact k where k.campaign_id = c.id"
-            "  and k.status = 'queued' and k.sent_at is null) as unreleased"
+            "  and " + writers.releasable_contacts_sql("k") + ") as unreleased"
             " from app.join_campaign c where c.destination_id = $1 and lower(c.name) = lower($2)",
             int(destination_id),
             name,

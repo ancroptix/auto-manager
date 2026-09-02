@@ -45,6 +45,8 @@ __all__ = [
     "build_writers",
     "campaign_gap_seconds",
     "campaign_release_unsent",
+    "RELEASABLE_CONTACT_SQL",
+    "releasable_contacts_sql",
 ]
 
 
@@ -910,6 +912,19 @@ JOIN_SEND_GAP_SECONDS = 3.0
 JOIN_READ_PAGES = 20
 JOIN_LIST_CEILING = JOIN_READ_PAGES * 100
 
+#: A page budget is only ever spent, never refunded, and the people this campaign has already written to are
+#: spending it. Telegram's waiting list does not shrink as a campaign works through it — nothing here approves
+#: anybody — so a run that has messaged 1 700 of 1 775 has to walk seventeen pages of known ids before it can
+#: reach the seventy-five it has not. With a fixed twenty-page budget that queue becomes unreachable exactly
+#: when it is nearly finished, which reads to an operator as "it stopped part way and never came back".
+JOIN_READ_PAGES_MAX = 120
+
+
+def _read_pages(known: int) -> int:
+    """How many pages one pass may ask for, given how many people it must page past to find a new one."""
+    return min(JOIN_READ_PAGES_MAX, JOIN_READ_PAGES + (max(0, int(known)) // 100) + 1)
+
+
 #: What a campaign's own status has to say for it to be sending. `ready` is "started and not yet finished",
 #: `running` is "in the middle of the list"; anything else — `paused`, `aborted`, `completed`, `draft` — is a
 #: decision about the campaign, and the decision wins between any two people, not between two batches.
@@ -922,6 +937,60 @@ RUNNABLE_CAMPAIGN_STATES = ("ready", "running")
 #: column can hold. A five-hour spacing is a choice about their own list, not a fault to guard against.
 JOIN_GAP_MIN_SECONDS = 1.0
 JOIN_GAP_MAX_SECONDS = 9999.0
+
+#: A wait this long or longer is Telegram saying "stop", not "that one was slow". `app/sender.py` maps every
+#: flood to at least sixty seconds (`FloodWaitError` -> `max(seconds, 60)`, `PeerFloodError` -> an hour) and a
+#: send that merely timed out to forty-five, so the two are told apart by the number itself rather than by
+#: parsing a sentence. Anything at or above this floor stops the pass where it stands; anything below it is one
+#: bad send and the next person is tried.
+JOIN_FLOOD_WAIT_FLOOR = 60
+
+#: How many times one person may be attempted before the campaign stops owing them a message. Attempts are
+#: counted on the contact row itself (`attempts`, bumped by the insert before every send), so this survives a
+#: restart. Three is "a bad minute is forgiven, a bad address is not".
+JOIN_MAX_ATTEMPTS = 3
+
+#: Consecutive sends that came back as something-went-wrong before the pass decides the fault is the account's
+#: and not the list's. Without it, one bad night burns the whole queue: the run that started this fix sent
+#: about two hundred DMs, met a rate limit, and then marked one thousand five hundred strangers `failed` at one
+#: every three seconds — each of them permanently, because a `failed` row is a row this campaign already has.
+JOIN_FAILURE_STREAK = 5
+
+#: How long a pass waits after that streak. Long enough that a rate limit the mapper did not name has time to
+#: clear, short enough that an operator who is watching sees it move again within the quarter hour.
+JOIN_STREAK_WAIT_SECONDS = 900
+
+
+def _contact_verdict(result: Any) -> tuple[str, int]:
+    """What one send means for the person it was aimed at: one of five words, and the wait it named.
+
+    This exists because the send loop used to ask one question — "did it say `sent`?" — and treat every other
+    answer as "this person is done with". A flood wait is not a fact about the person; it is Telegram telling
+    the account to stop, and answering it by moving to the next stranger three seconds later is how a campaign
+    marks its whole list `failed` in an hour and calls itself completed.
+
+    * ``sent`` — it went out.
+    * ``planned`` — shadow mode described it and nothing left the process.
+    * ``wait`` — Telegram asked for :data:`JOIN_FLOOD_WAIT_FLOOR` seconds or more. The pass stops here.
+    * ``restricted`` — a refusal about this person that a retry cannot fix (privacy, a peer this session cannot
+      address, a channel it can no longer see). Recorded once and never tried again, which is the promise the
+      campaign's docstring has always made.
+    * ``retry`` — anything else: a timeout, a dropped connection, an unmapped error. The person is still owed a
+      message, and a later pass tries again until :data:`JOIN_MAX_ATTEMPTS`.
+    """
+    action = str(getattr(result, "action", "") or "")
+    if getattr(result, "ok", False) and action == "sent":
+        return "sent", 0
+    if action == "planned":
+        return "planned", 0
+    wait = int(getattr(result, "retry_after", 0) or 0)
+    if wait >= JOIN_FLOOD_WAIT_FLOOR:
+        return "wait", wait
+    if wait:
+        return "retry", wait
+    if action == "blocked":
+        return "restricted", 0
+    return "retry", 0
 
 
 def campaign_gap_seconds(campaign: Mapping[str, Any]) -> float:
@@ -940,31 +1009,112 @@ def campaign_gap_seconds(campaign: Mapping[str, Any]) -> float:
     return max(JOIN_GAP_MIN_SECONDS, min(value, JOIN_GAP_MAX_SECONDS))
 
 
+#: Which contact rows are "we have a record of this person and they were never told", as one `where` clause
+#: written once. `app/controlbot.py` counts with it and `campaign_release_unsent` below frees with it, because
+#: a screen that offers a tap for one set of rows while the tap moves another is how an operator learns not to
+#: trust the number. The alias is `k`, which is what every subquery in this project calls this table.
+def releasable_contacts_sql(alias: str = "") -> str:
+    """The predicate above, spelled for whichever alias the caller's statement uses (`""` for none)."""
+    at = f"{alias}." if alias else ""
+    return (
+        f"{at}sent_at is null and ({at}status = 'queued' or ({at}status = 'failed'"
+        f" and {at}attempts < {JOIN_MAX_ATTEMPTS}"
+        f" and ({at}error is null or {at}error not ilike '%privacy%')))"
+    )
+
+
+#: The unaliased spelling, for the one statement that needs no alias.
+RELEASABLE_CONTACT_SQL = releasable_contacts_sql()
+
+
 async def campaign_release_unsent(db: Any, campaign_id: int) -> int:
     """Hand back the people a campaign wrote a row for and never messaged, and say how many there were.
 
-    A contact row is written *before* the send, so anything left at `queued` with no `sent_at` is one of two
-    things: a run killed between the two statements (whose person must not be messaged, because nobody can
-    prove the message did not go), or a row an older build left behind from a dry run that recorded people it
-    only planned. The second one is the state this deployment is full of, and it is why a campaign can read
-    "0 still waiting" while nobody has been sent anything: those ids are in the `already` set, so every later
-    pass skips them and the list looks empty.
+    Two shapes of row qualify, and both are "we have a record of this person and they were never told":
+
+    * `queued` with no `sent_at` — a run killed between the row and the send, or an older build that recorded
+      people it only planned. The second one is the state this deployment is full of, and it is why a campaign
+      can read "0 still waiting" while nobody has been sent anything: those ids are in the `already` set, so
+      every later pass skips them and the list looks empty.
+    * `failed` with no `sent_at`, attempts to spare, and an error that is not a refusal about the person. This
+      is the state a rate limit left behind: the pass met a flood after two hundred sends, kept going, and
+      wrote `failed` against every remaining stranger at one every three seconds. None of those people were
+      refused — the account was — and `failed` is far too permanent a word for it.
+
+    A privacy refusal is deliberately not released. Retrying it is a second attempt at the same impossible
+    thing, and this campaign has promised in writing not to make one.
 
     This is not decided by a guess. It is written by the operator's own ✅, which is a human saying "send to
     the people on this list" — so the release happens there, in `app/controlbot.py`, on the screen that shows
     the wording and the count. The rows and their history stay; only the status moves, to the one value that
     means "owed a message", and the next pass sends to them like anyone else.
     """
+
     # `fetch`, not `execute`, and the count is the rows: asyncpg's `execute` answers with the statement's
     # status tag (`"UPDATE 0"`), and a release that raised `invalid literal for int()` on the operator's own
     # ✅ tap is the bug this sentence exists to stop. Reading `RETURNING` rows is the shape that cannot be
     # misread, because the same list is what proves the write matched somebody.
+    #
+    # `failed` is released too, and that is the second half of this fix. A pass that met a rate limit used to
+    # walk the rest of the list marking everybody `failed` — a permanent word for a temporary refusal — and
+    # those people were then invisible to every later run. So a row that was never sent, whose attempts are not
+    # used up, and whose error is not a refusal about the person themselves, is owed a message again. A privacy
+    # refusal is left where it is: retrying it is a second attempt at the same impossible thing, and the
+    # campaign has promised in writing not to make one. `flood_wait_until` is cleared because the operator's
+    # tap is a decision about now.
     moved = await db.fetch(
-        "update app.join_campaign_contact set status = 'skipped' where campaign_id = $1"
-        " and status = 'queued' and sent_at is null returning telegram_user_id",
+        "update app.join_campaign_contact set status = 'skipped', flood_wait_until = null"
+        " where campaign_id = $1 and " + RELEASABLE_CONTACT_SQL + " returning telegram_user_id",
         int(campaign_id),
     )
     return len(list(moved or []))
+
+
+async def _contact_owed_again(
+    db: Any, campaign_id: int, user_id: int, detail: str, *, wait_seconds: int = 0
+) -> bool:
+    """Put one person back in the pool after a send that was not about them. ``True`` when they were.
+
+    ``skipped`` is this table's word for "owed a message" — it is what the operator's ✅ writes and what the
+    pass reads as "not already contacted" — so a transient failure is written there rather than to ``failed``.
+    The attempts already on the row are the bound: after :data:`JOIN_MAX_ATTEMPTS` the person is left `failed`
+    for real, because a list that can never finish is its own kind of silence.
+    """
+    attempts = 0
+    try:
+        attempts = int(
+            await db.fetchval(
+                "select attempts from app.join_campaign_contact"
+                " where campaign_id = $1 and telegram_user_id = $2",
+                int(campaign_id),
+                int(user_id),
+            )
+            or 0
+        )
+    except Exception as exc:  # noqa: BLE001 - an unreadable count must not decide a person is unreachable
+        log.info("campaign %s: attempts for %s unreadable (%s)", campaign_id, user_id, str(exc)[:120])
+    if attempts >= JOIN_MAX_ATTEMPTS:
+        await db.execute(
+            "update app.join_campaign_contact set status = 'failed', error = $3"
+            " where campaign_id = $1 and telegram_user_id = $2",
+            int(campaign_id),
+            int(user_id),
+            f"{detail} (attempt {attempts} of {JOIN_MAX_ATTEMPTS})"[:400],
+        )
+        return False
+    await db.execute(
+        # `flood_wait_until` is the column the schema has always carried for exactly this and nothing has ever
+        # written to it. It is what keeps the person out of the very next read: a pass re-reading somebody
+        # Telegram just refused, three seconds later, is the loop this fix exists to break.
+        "update app.join_campaign_contact set status = 'skipped', error = $3,"
+        " flood_wait_until = case when $4::int > 0 then now() + make_interval(secs => $4::int) else null end"
+        " where campaign_id = $1 and telegram_user_id = $2",
+        int(campaign_id),
+        int(user_id),
+        str(detail)[:400],
+        int(max(0, wait_seconds)),
+    )
+    return True
 
 
 async def campaign_status(db: Any, campaign_id: int) -> str:
@@ -991,7 +1141,17 @@ async def campaign_pass(self: Writers, campaign_id: int, *, ctx: Any = None) -> 
       re-read before every person, so the tap lands within one message), or when a flood wait says so.
       `campaign.rate_per_hour` is not read at all — it was a number the operator never chose and it stopped
       their list invisibly at twenty;
-    * a privacy refusal marks the contact ``failed`` and is not retried into a second attempt.
+    * a privacy refusal marks the contact ``restricted`` and is not retried into a second attempt;
+    * **a wait is a fact about the account, not about the person in front of the loop.** When a send comes
+      back carrying :data:`JOIN_FLOOD_WAIT_FLOOR` seconds or more — a flood, a `PeerFloodError`, the hour
+      Telegram gives an account that has DMed too many strangers — that person's row goes back to `skipped`
+      with the wait recorded on it and the pass *stops*, reporting `retry_after` so `app/campaignloop.py`
+      sleeps it and comes back for the rest. This is the fix for the run that sent about two hundred DMs,
+      met the limit, and then marked one thousand five hundred strangers `failed` at one every three
+      seconds — permanently, because a `failed` row is a row this campaign already has;
+    * anything else that goes wrong on the wire (a timeout, a dropped connection, an unmapped error) leaves
+      the person owed a message rather than written off, up to :data:`JOIN_MAX_ATTEMPTS` tries, and
+      :data:`JOIN_FAILURE_STREAK` of them in a row stops the pass for the same reason a flood does.
     """
     from . import joinmsg  # noqa: PLC0415  (the wording module owns the rules, not this transport)
 
@@ -1030,8 +1190,12 @@ async def campaign_pass(self: Writers, campaign_id: int, *, ctx: Any = None) -> 
     already = {
         int(row["telegram_user_id"])
         for row in await self.db.fetch(
+            # `flood_wait_until` is the second half of the predicate and it only ever excludes: a person the
+            # last pass released because Telegram asked for a wait is *owed* a message, but not yet. Reading
+            # them back into this pass would hand them straight to the send loop that just met the flood.
             "select telegram_user_id from app.join_campaign_contact where campaign_id = $1"
-            " and status <> 'skipped'",
+            " and (status <> 'skipped'"
+            "      or (flood_wait_until is not null and flood_wait_until > now()))",
             int(campaign_id),
         )
     }
@@ -1047,7 +1211,7 @@ async def campaign_pass(self: Writers, campaign_id: int, *, ctx: Any = None) -> 
     # to the first hundred would read those same hundred, find them known, and be tempted to call the
     # campaign finished with two thousand nine hundred still waiting.
     found, requests = await reader.pending_requests(
-        peer, limit=JOIN_LIST_CEILING, max_pages=JOIN_READ_PAGES, skip=already
+        peer, limit=JOIN_LIST_CEILING, max_pages=_read_pages(len(already)), skip=already
     )
     if not found.ok:
         return {"campaign_id": int(campaign_id), "blocked": found.detail}
@@ -1095,7 +1259,17 @@ async def campaign_pass(self: Writers, campaign_id: int, *, ctx: Any = None) -> 
     batch = waiting
     writer = self._writer([], max_writes=len(batch))
     sent = failed = planned = 0
+    #: People this pass wrote a row for, could not message, and handed back as still owed. They are not
+    #: `failed`: the reason was the account or the wire, not them, and a later pass tries again.
+    owed = 0
     stopped_early = False
+    #: Seconds Telegram (or the streak guard below) asked this pass to stop for. Non-zero means the pass
+    #: ended early on purpose and the rest of the list is still coming — `app/campaignloop.py` sleeps it and
+    #: comes straight back. Zero means the loop ran to the end of what it could read.
+    wait_after = 0
+    #: Consecutive sends that came back as something-went-wrong. Reset by every message that leaves.
+    streak = 0
+    position = 0
     for position, entry in enumerate(batch):
         if position:
             # Re-read before every person, not once per batch: `⏸ Stop after this one` is a promise about the
@@ -1132,27 +1306,85 @@ async def campaign_pass(self: Writers, campaign_id: int, *, ctx: Any = None) -> 
         )
         if result.ok and result.action == "sent":
             await self.db.execute(
-                "update app.join_campaign_contact set status = 'sent', sent_at = now() where campaign_id = $1 and telegram_user_id = $2",
+                "update app.join_campaign_contact set status = 'sent', sent_at = now(), error = null,"
+                " flood_wait_until = null where campaign_id = $1 and telegram_user_id = $2",
                 int(campaign_id),
                 user_id,
             )
             sent += 1
-        elif result.action == "planned":
+            streak = 0
+            continue
+        verdict, retry_after = _contact_verdict(result)
+        if verdict == "planned":
             planned += 1
-        else:
+            continue
+        if verdict == "wait":
+            # The whole point of this fix. Telegram has told the account to stop, and the person in front of
+            # the loop is not the reason — so their row goes back to "owed a message" with the wait recorded
+            # on it, and the pass ends here instead of walking the remaining fifteen hundred strangers at one
+            # every three seconds, marking each of them `failed` for somebody else's rate limit. The campaign
+            # stays `running`; `app/campaignloop.py` sleeps the number Telegram named and asks for the rest.
+            if await _contact_owed_again(
+                self.db, int(campaign_id), user_id, result.detail, wait_seconds=retry_after
+            ):
+                owed += 1
+            else:
+                failed += 1
+            wait_after = retry_after
+            log.warning(
+                "campaign %s: stopping this pass after %s sent — Telegram asked for %ss (%s)",
+                campaign_id,
+                sent,
+                retry_after,
+                result.detail[:160],
+            )
+            break
+        if verdict == "restricted":
+            # A refusal about this person that a retry cannot fix. Recorded once, in the word the schema
+            # already has for it, and never tried again — which is the promise this campaign has always made
+            # about a privacy refusal, now kept without also swallowing the rate limits.
             failed += 1
+            streak = 0
             await self.db.execute(
-                "update app.join_campaign_contact set status = 'failed', error = $3 where campaign_id = $1 and telegram_user_id = $2",
+                "update app.join_campaign_contact set status = 'restricted', error = $3"
+                " where campaign_id = $1 and telegram_user_id = $2",
                 int(campaign_id),
                 user_id,
                 result.detail[:400],
             )
+            continue
+        # `retry`: a timeout, a dropped connection, an error nobody has mapped. The person is still owed.
+        if await _contact_owed_again(
+            self.db, int(campaign_id), user_id, result.detail, wait_seconds=retry_after
+        ):
+            owed += 1
+        else:
+            failed += 1
+        streak += 1
+        if streak >= JOIN_FAILURE_STREAK:
+            # Five in a row is not five unlucky strangers, it is the account or the connection, and the only
+            # thing a sixth attempt buys is a sixth burnt row. The pass stops and says how long for.
+            wait_after = JOIN_STREAK_WAIT_SECONDS
+            log.warning(
+                "campaign %s: %s sends failed in a row, so this pass stops for %ss (%s)",
+                campaign_id,
+                streak,
+                wait_after,
+                result.detail[:160],
+            )
+            break
     # How many people are still owed a message when this pass stops. One number, worked out once, because "the
     # channel has nobody left" and "this read could not reach that many" and "the operator stopped me partway"
     # are three different sentences and the operator has been shown the wrong one of them twice.
-    # `position` is the person this pass stopped *before* sending, so the ones left are `len - position`.
-    unhandled = (len(waiting) - position) if stopped_early else 0
-    waiting_after = max(0, unhandled + beyond)
+    # `position` is the person this pass stopped on. A stop happens *before* their message, so they are still
+    # in the count; a flood happens *after* their row was handed back, so `owed` already holds them.
+    if stopped_early:
+        untouched = len(batch) - position
+    elif wait_after:
+        untouched = len(batch) - position - 1
+    else:
+        untouched = 0
+    waiting_after = max(0, untouched + owed + beyond)
     if not batch_real_send:
         # A dry run plans a page and stops there: it hands the campaign back as `ready`, waiting for the tap
         # that sends for real. The two alternatives are both traps — leaving it `running` would give the
@@ -1185,12 +1417,13 @@ async def campaign_pass(self: Writers, campaign_id: int, *, ctx: Any = None) -> 
             "campaign_id": int(campaign_id),
             "sent": sent,
             "failed": failed,
+            "owed": owed,
             "waiting_after": waiting_after,
             "stopped": "the campaign was paused or aborted while this pass was working",
             "gap_seconds": gap,
             "more": False,
         }
-    finished = waiting_after <= 0
+    finished = waiting_after <= 0 and not wait_after
     if await campaign_status(self.db, int(campaign_id)) not in RUNNABLE_CAMPAIGN_STATES:
         return {
             "campaign_id": int(campaign_id),
@@ -1221,11 +1454,28 @@ async def campaign_pass(self: Writers, campaign_id: int, *, ctx: Any = None) -> 
         "campaign_id": int(campaign_id),
         "sent": sent,
         "failed": failed,
+        # People this pass handed back rather than gave up on: a flood, a timeout, a dropped connection. They
+        # are `skipped` in the table, which is this campaign's word for "owed a message", so the next pass
+        # reads them again. Named separately from `failed` because the difference is the whole fix.
+        "owed": owed,
         "waiting_after": waiting_after,
         "gap_seconds": gap,
         # The loop's signal, and the only "next" this function knows about: the sender asks for the rest of
         # the list itself, so nothing here writes a row for anything else to finish.
         "more": not finished,
+        # How long before that next ask. `app/campaignloop.py` sleeps it. Absent (or zero) means "as soon as
+        # you like" — the pass ended because the list did, not because Telegram said stop.
+        **({"retry_after": int(wait_after)} if wait_after else {}),
+        **(
+            {
+                "why": (
+                    f"Telegram asked this account to wait {wait_after}s, so the pass stopped after {sent}"
+                    f" message(s); the {waiting_after} still owed keep their place"
+                )
+            }
+            if wait_after
+            else {}
+        ),
         # Named rather than folded into `failed`: these are rows this pass did not touch because a record of
         # them already exists, and the operator has to be able to tell "nobody is left" from "nobody is left
         # *that I have not already written about*".

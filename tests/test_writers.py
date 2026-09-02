@@ -402,12 +402,18 @@ class CampaignDb:
 class CampaignSender:
     """The two calls the campaign makes on the session: who is waiting, and one text to one person."""
 
-    def __init__(self, *, action: str = "sent", total: int | None = None) -> None:
+    def __init__(
+        self, *, action: str = "sent", total: int | None = None, results: list | None = None
+    ) -> None:
         self.action = action
         self.sent: list[tuple[str, str]] = []
         self.peers: list[object] = []
         self._total = total
         self._hash = 911
+        # What Telegram answers, send by send. A campaign that only ever meets `sent` is a campaign nobody
+        # has watched meet a rate limit at two hundred people, which is the run this list exists to model:
+        # the entries are used in order and the last one repeats for as long as the pass keeps asking.
+        self._results = list(results or [])
 
     def set_hash(self, value: int | None) -> None:
         """Whether the read hands out a usable address for the people it returns."""
@@ -442,11 +448,13 @@ class CampaignSender:
         # fact the string form hides, and it is the fact that decides whether the DM can be sent at all.
         self.peers.append(peer)
         self.sent.append((str(peer), text))
+        if self._results:
+            return self._results[0] if len(self._results) == 1 else self._results.pop(0)
         return sender.Result(ok=True, action=self.action, detail="sent")
 
 
 def _campaign_writers(
-    db, *, outbound: bool, action: str = "sent", total: int | None = None
+    db, *, outbound: bool, action: str = "sent", total: int | None = None, results: list | None = None
 ) -> Writers:
     from types import SimpleNamespace
 
@@ -454,7 +462,7 @@ def _campaign_writers(
     # `total` is the channel's own count of waiting people, which is deliberately settable apart from the
     # rows a page returned: a queue of 250 with a page of 3 is the situation that used to be misread.
     total = db.waiting if total is None else total
-    transport = CampaignSender(action=action, total=total)
+    transport = CampaignSender(action=action, total=total, results=results)
     transport.set_waiting(db.waiting)
     writers._writer = lambda peers, **kwargs: transport  # type: ignore[assignment]
     writers.transport = transport  # type: ignore[attr-defined]
@@ -861,3 +869,153 @@ async def test_a_shadow_run_plans_without_recording_anybody(monkeypatch) -> None
     )
     assert not [sql for sql, _ in db.sql if "'completed'" in sql], "a plan completed a campaign it only read"
     assert db.queued == [], "a shadow run must not hand itself to the next run and re-read forever"
+
+
+# --------------------------------------------------------- the rate limit that ate fifteen hundred people
+from app import writers as writers_module  # noqa: E402  (the constants below are the subject of these tests)
+
+
+async def _no_sleep(delay: float) -> None:
+    """The campaign's own pacing, skipped: three seconds times fifty people is not a unit test."""
+
+
+def _contact_writes(db: "CampaignDb") -> list[tuple[str, tuple]]:
+    """Every write this run made against a contact row, in order."""
+    return [
+        (sql, args) for sql, args in db.sql if "update app.join_campaign_contact set" in sql
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_rate_limit_stops_the_pass_instead_of_burning_the_rest_of_the_list(monkeypatch) -> None:
+    """The report this fix came from: 1 775 people waiting, about 200 DMs, and then nothing, ever.
+
+    Telegram's answer after a couple of hundred DMs to strangers is `PeerFloodError`, which `app/sender.py`
+    maps to a blocked result carrying an hour. The send loop used to read that the only way it read anything —
+    "it does not say `sent`" — mark *that person* `failed`, sleep the campaign's three seconds and try the
+    next stranger, who was refused for the same reason, and the next. An hour later every remaining person
+    carried a `failed` row, `failed` rows are rows this campaign already has, and no later pass would ever
+    read them again. The campaign then closed itself `completed`.
+
+    So a wait is now a fact about the account: the person in front of the loop keeps their place, the pass
+    stops, and it says how long for.
+    """
+    flood = sender.Result(
+        ok=False,
+        action="blocked",
+        detail="Telegram says this account is rate-limited for now",
+        retry_after=3600,
+    )
+    ok = sender.Result(ok=True, action="sent", detail="sent")
+    db = CampaignDb(waiting=40, rate=1000)
+    handlers = _campaign_writers(db, outbound=True, results=[ok, ok, flood])
+    monkeypatch.setattr("app.writers.asyncio.sleep", _no_sleep)
+
+    result = await handlers.campaign_pass(7)
+
+    assert result["sent"] == 2, result
+    # Three people were written to at most: two sent, one handed back. The other thirty-seven were never
+    # touched, which is the difference between this and the run that wrote to all forty.
+    assert len(handlers.transport.sent) == 3, handlers.transport.sent
+    assert result["retry_after"] == 3600, result
+    assert result["more"] is True and result["waiting_after"] == 38, result
+    assert result["failed"] == 0 and result["owed"] == 1, result
+    # Nobody was marked `failed` for somebody else's rate limit, and the person the flood landed on is
+    # `skipped`, which is this table's word for "owed a message".
+    writes = _contact_writes(db)
+    assert not [sql for sql, _ in writes if "'failed'" in sql], writes
+    assert [sql for sql, _ in writes if "status = 'skipped'" in sql], writes
+    # And the campaign is still on: `completed` here is the sentence that made 1 575 people unreachable.
+    assert db.status == "running", db.applied
+
+
+@pytest.mark.asyncio
+async def test_a_person_the_wire_failed_is_owed_a_message_rather_than_written_off(monkeypatch) -> None:
+    """A timeout is not a fact about the stranger, so it may not be recorded as one.
+
+    `failed` is permanent in this table — a `failed` row is in the `already` set every later pass reads — and
+    spending it on a dropped connection is how a list shrinks without anybody being told anything. The row
+    goes back to `skipped` with the reason on it, and the next pass tries again.
+    """
+    hiccup = sender.Result(ok=False, action="failed", detail="ConnectionResetError: connection lost")
+    ok = sender.Result(ok=True, action="sent", detail="sent")
+    db = CampaignDb(waiting=3, rate=1000)
+    handlers = _campaign_writers(db, outbound=True, results=[hiccup, ok, ok])
+    monkeypatch.setattr("app.writers.asyncio.sleep", _no_sleep)
+
+    result = await handlers.campaign_pass(7)
+
+    assert result["sent"] == 2 and result["owed"] == 1 and result["failed"] == 0, result
+    # One person is still owed, so the campaign is not finished and the loop is told to come back.
+    assert result["more"] is True and result["waiting_after"] == 1, result
+    assert db.status == "running", db.applied
+    releases = [sql for sql, _ in _contact_writes(db) if "status = 'skipped'" in sql]
+    assert len(releases) == 1, _contact_writes(db)
+
+
+@pytest.mark.asyncio
+async def test_a_privacy_refusal_is_recorded_once_and_never_tried_again(monkeypatch) -> None:
+    """The one refusal that *is* about the person keeps its old promise, in the word the schema has for it."""
+    refused = sender.Result(
+        ok=False, action="blocked", detail="this user's privacy does not allow a DM"
+    )
+    ok = sender.Result(ok=True, action="sent", detail="sent")
+    db = CampaignDb(waiting=2, rate=1000)
+    handlers = _campaign_writers(db, outbound=True, results=[refused, ok])
+    monkeypatch.setattr("app.writers.asyncio.sleep", _no_sleep)
+
+    result = await handlers.campaign_pass(7)
+
+    assert result["sent"] == 1 and result["failed"] == 1 and result["owed"] == 0, result
+    assert result["more"] is False, "nobody is owed, so the list is done"
+    assert [sql for sql, _ in _contact_writes(db) if "status = 'restricted'" in sql], _contact_writes(db)
+
+
+@pytest.mark.asyncio
+async def test_five_failures_in_a_row_are_the_account_and_the_pass_says_so(monkeypatch) -> None:
+    """A streak is the guard for the flood nobody mapped: stop, name a wait, keep everybody's place."""
+    hiccup = sender.Result(ok=False, action="failed", detail="OSError: broken pipe")
+    db = CampaignDb(waiting=50, rate=1000)
+    handlers = _campaign_writers(db, outbound=True, results=[hiccup])
+    monkeypatch.setattr("app.writers.asyncio.sleep", _no_sleep)
+
+    result = await handlers.campaign_pass(7)
+
+    assert len(handlers.transport.sent) == writers_module.JOIN_FAILURE_STREAK, handlers.transport.sent
+    assert result["retry_after"] == writers_module.JOIN_STREAK_WAIT_SECONDS, result
+    assert result["owed"] == writers_module.JOIN_FAILURE_STREAK, result
+    assert result["waiting_after"] == 50, "everybody is still owed a message"
+    assert result["more"] is True and db.status == "running", (result, db.applied)
+
+
+@pytest.mark.asyncio
+async def test_the_release_frees_the_people_a_rate_limit_wrote_off(monkeypatch) -> None:
+    """`✅ Start` has to be able to undo the damage the old loop did, or 1 575 people stay unreachable.
+
+    The rows are `failed` with no `sent_at` and one attempt on them. Nobody refused those people — the
+    account was rate-limited — so the operator's own start tap owes them a message again. A privacy refusal
+    is left alone by the same statement, because retrying it is a second attempt at the same impossible thing.
+    """
+    from app.writers import JOIN_MAX_ATTEMPTS, campaign_release_unsent
+
+    db = ReleaseOnlyDb(1575)
+
+    assert await campaign_release_unsent(db, 7) == 1575
+    sql = db.fetched[0]
+    assert "status = 'queued'" in sql and "status = 'failed'" in sql, sql
+    assert f"attempts < {JOIN_MAX_ATTEMPTS}" in sql, sql
+    assert "not ilike '%privacy%'" in sql, sql
+    assert "sent_at is null" in sql, sql
+
+
+def test_the_read_budget_grows_with_the_people_already_written_to() -> None:
+    """A page budget spent walking past known ids is a queue that becomes unreachable as it nears the end.
+
+    1 775 waiting and 1 700 already messaged is seventeen pages of nothing before the first new person, and a
+    fixed twenty-page read would find them only by luck. The budget is what is known, plus the same twenty.
+    """
+    from app.writers import JOIN_READ_PAGES, JOIN_READ_PAGES_MAX, _read_pages
+
+    assert _read_pages(0) == JOIN_READ_PAGES + 1
+    assert _read_pages(1700) == JOIN_READ_PAGES + 18
+    assert _read_pages(10_000_000) == JOIN_READ_PAGES_MAX, "and it is still bounded"
