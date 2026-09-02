@@ -106,6 +106,10 @@ stage**, and a `reconciliation` job is enqueued. So it resumes at
 | --- | --- | --- |
 | DMing a requester never approves/declines them | `CHECK (approve_after_send is not true)` — the column cannot be set true | `test_messaging_never_approves_a_request` |
 | Same campaign cannot message a user twice | `PRIMARY KEY (campaign_id, user_id)` | `test_same_campaign_cannot_message_a_user_twice` |
+| A rate limit stops the campaign instead of writing off the rest of the list | `app.writers._contact_verdict` -> the `wait` branch of `campaign_pass`, which hands the person back and returns `retry_after` | `test_a_rate_limit_stops_the_pass_instead_of_burning_the_rest_of_the_list` |
+| A send that failed on the wire leaves the person owed, not `failed` | `app.writers._contact_owed_again` (status `skipped`, bounded by `attempts`) | `test_a_person_the_wire_failed_is_owed_a_message_rather_than_written_off` |
+| A privacy refusal is recorded once and never retried | the `restricted` branch of `campaign_pass`, and the release predicate that skips it | `test_a_privacy_refusal_is_recorded_once_and_never_tried_again` |
+| The waiting list stays reachable however far the campaign has got | `app.writers._read_pages` — the page budget grows with the ids that must be walked past | `test_the_read_budget_grows_with_the_people_already_written_to` |
 | Same episode+quality never posted twice | unique index on `(episode_id, lower(quality), release_variant)` | `test_duplicate_quality_is_rejected_case_insensitively` |
 | One permanent post per episode (so a late 1080p is an **edit**) | partial unique index `where kind = 'episode'` | `test_one_permanent_post_per_episode` |
 | One active universal link per episode | partial unique index | `test_one_active_universal_link_per_episode` |

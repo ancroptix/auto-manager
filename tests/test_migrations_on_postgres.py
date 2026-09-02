@@ -3036,3 +3036,115 @@ def test_the_lease_a_claim_grants_comes_from_the_settings_table(conn):
             conn.execute("update app.config set value = '120'::jsonb where key = 'worker.lease_seconds'")
 
     assert asyncio.run(scenario())
+
+
+def test_a_rate_limited_contact_is_owed_again_and_a_refused_one_is_not(conn, seed):
+    """The three writes the send loop makes about a person who was not messaged, against the real table.
+
+    The run this pins is the one the operator reported: 1 775 people waiting, about 200 DMs, and then a
+    rate limit that the old loop answered by marking every remaining stranger `failed` at one every three
+    seconds. `failed` is a row this campaign already has, so those people were unreachable for good, and the
+    campaign closed itself `completed` over them.
+
+    So three statements are exercised here on the real schema, because each one uses something a fake cannot
+    check: `make_interval` and the `flood_wait_until` column the schema has always carried and nothing ever
+    wrote to; the `restricted` value of `app.contact_status`; and the release predicate, which has to free
+    the people a rate limit wrote off while leaving a privacy refusal exactly where it is.
+    """
+    import asyncio
+
+    from app.db import Database
+    from app.writers import _contact_owed_again, campaign_release_unsent
+
+    settings = _write_settings(app_mode="live")
+    db = Database(settings)
+
+    async def scenario():
+        assert await db.connect()
+        with conn.cursor() as cur:
+            name = f"flood-check-{seed['destination_id']}"
+            cur.execute(
+                "delete from app.join_campaign_contact where campaign_id in"
+                " (select id from app.join_campaign where destination_id = %s and name = %s)",
+                (seed["destination_id"], name),
+            )
+            cur.execute(
+                "delete from app.join_campaign where destination_id = %s and name = %s",
+                (seed["destination_id"], name),
+            )
+            cur.execute(
+                "insert into app.join_campaign (destination_id, name, message_template, status)"
+                " values (%s, %s, 'Welcome to the channel', 'running') returning id",
+                (seed["destination_id"], name),
+            )
+            campaign_id = cur.fetchone()[0]
+            cur.execute(
+                "insert into app.join_campaign_contact (campaign_id, telegram_user_id, status, attempts, error)"
+                " values (%s, 9201, 'queued', 1, null),"
+                "        (%s, 9202, 'failed', 1, 'Telegram says this account is rate-limited for now'),"
+                "        (%s, 9203, 'restricted', 1, 'this user''s privacy does not allow a DM'),"
+                "        (%s, 9204, 'failed', 1, 'this user''s privacy does not allow a DM'),"
+                "        (%s, 9205, 'failed', 3, 'tried three times and never got through'),"
+                "        (%s, 9206, 'sent', 1, null)",
+                (campaign_id,) * 6,
+            )
+            conn.commit()
+
+        def status_of(user_id: int) -> tuple:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "select status, flood_wait_until > now() from app.join_campaign_contact"
+                    " where campaign_id = %s and telegram_user_id = %s",
+                    (campaign_id, user_id),
+                )
+                return cur.fetchone()
+
+        try:
+            # 1. The person the flood landed on: handed back, with the wait Telegram named on the row.
+            assert await _contact_owed_again(
+                db, campaign_id, 9201, "rate-limited for now", wait_seconds=3600
+            ) is True
+            assert status_of(9201) == ("skipped", True), status_of(9201)
+
+            # 2. Somebody who has used their attempts is not owed a fourth: the row says `failed` for real.
+            assert await _contact_owed_again(db, campaign_id, 9205, "still nothing") is False
+            assert status_of(9205)[0] == "failed", status_of(9205)
+
+            # 3. A privacy refusal, in the word the enum already had for it.
+            await db.execute(
+                "update app.join_campaign_contact set status = 'restricted', error = $3"
+                " where campaign_id = $1 and telegram_user_id = $2",
+                int(campaign_id),
+                9203,
+                "this user's privacy does not allow a DM",
+            )
+            assert status_of(9203)[0] == "restricted", status_of(9203)
+
+            # 4. The operator's ✅. It frees the person a rate limit wrote off (9202) and leaves alone the
+            #    person who was refused (9204), the person out of attempts (9205), and the one already sent.
+            released = await campaign_release_unsent(db, int(campaign_id))
+            assert released == 1, released
+            assert status_of(9202)[0] == "skipped", status_of(9202)
+            assert status_of(9204)[0] == "failed", "a privacy refusal is not retried into a second attempt"
+            assert status_of(9205)[0] == "failed", status_of(9205)
+            assert status_of(9206)[0] == "sent", status_of(9206)
+
+            # 5. And the read the pass makes leaves the flood-waiting person out until their wait is over.
+            owed_now = await db.fetch(
+                "select telegram_user_id from app.join_campaign_contact where campaign_id = $1"
+                " and (status <> 'skipped'"
+                "      or (flood_wait_until is not null and flood_wait_until > now()))",
+                int(campaign_id),
+            )
+            known = {int(row["telegram_user_id"]) for row in owed_now}
+            assert 9201 in known, "the wait is still running, so this pass may not message them yet"
+            assert 9202 not in known, "the released person is owed a message and must be read again"
+        finally:
+            with conn.cursor() as cur:
+                cur.execute("delete from app.join_campaign_contact where campaign_id = %s", (campaign_id,))
+                cur.execute("delete from app.join_campaign where id = %s", (campaign_id,))
+                conn.commit()
+            await db.close()
+        return True
+
+    assert asyncio.run(scenario())

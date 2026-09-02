@@ -18,6 +18,13 @@ flood wait from Telegram is slept out rather than shaved.
 One service per campaign is the assumption this makes, and it is the deployment's own: one Render web service
 running one loop.
 
+**A wait is obeyed here, wherever it comes from.** A pass that met Telegram's limit before it sent anything
+raises `RetryLater`; a pass that sent two hundred messages and *then* met it returns its counts with a
+`retry_after` on them. Both are the same instruction — sleep this number, keep the campaign on, ask again —
+and the second one exists because the alternative was the pass carrying on through the rest of the list at one
+refusal every three seconds, which is how a campaign of 1 775 people ended a night with 200 messages sent and
+everybody else marked `failed`.
+
 **Why the service starts this and not the queue worker.** It rode the worker for exactly one round, and the
 result was a campaign screen that needed a paragraph about `app.job` to explain why nothing was being sent: the
 operator had to start the queue before their DMs would move, and `▶️ Run the queue` sat on a screen that is
@@ -199,13 +206,22 @@ class CampaignLoop:
         sent = int(result.get("sent") or 0)
         planned = int(result.get("planned") or 0)
         failed = int(result.get("failed") or 0)
+        owed = int(result.get("owed") or 0)
         more = bool(result.get("more"))
+        # A pass that ended because Telegram said stop says so with a number, not with an exception: it has
+        # already handed its unsent people back to the list, and the only thing left to do with the number is
+        # sleep it. This is the same courtesy as the `RetryLater` branch above, for the case where the pass
+        # got far enough to have counts worth showing — a flood after two hundred messages is a report, and it
+        # used to be nothing at all, because the pass simply carried on burning the list.
+        wait = float(result.get("retry_after") or 0.0)
         self._note(
             campaign_id,
             name,
             sent=sent,
             failed=failed,
             planned=planned,
+            owed=owed,
+            flood=int(wait) or None,
             waiting=int(result.get("waiting_after") or 0),
             gap=float(result.get("gap_seconds") or 0.0),
             stopped=bool(result.get("stopped")),
@@ -217,6 +233,13 @@ class CampaignLoop:
             skipped=str(result["skipped"]) if result.get("skipped") else None,
             seconds=round(time.monotonic() - started, 1),
         )
+        if wait > 0:
+            # Obeyed where it lands, exactly like `RetryLater`. Nothing is skipped: the people this pass did
+            # not reach are `skipped` rows again, which is this campaign's word for "owed a message", so the
+            # next pass after this sleep reads them like anybody else.
+            log.warning("campaign %s: waiting %ss before the next page", campaign_id, int(wait))
+            await self._pauseable(max(1.0, wait))
+            return
         if sent + planned + failed == 0:
             # This covers a `skipped` answer too — a campaign that stopped between this round's read of the
             # list and the pass itself, or a row that has gone. Waiting is the right answer either way: the
