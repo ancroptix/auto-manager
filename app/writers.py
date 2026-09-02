@@ -988,6 +988,20 @@ def _contact_verdict(result: Any) -> tuple[str, int]:
         return "wait", wait
     if wait:
         return "retry", wait
+    detail = str(getattr(result, "detail", "") or "").casefold()
+    # A privacy refusal is about the person. "this session cannot see" / "cannot find any entity" is
+    # about the account: the queue read did not leave an access hash, or the process restarted and
+    # lost Telethon's cache. Filing that as `restricted` is how a start tap after the flood-wait fix
+    # still sent nobody — every remaining requester was written off on the first pass.
+    if action == "blocked" and "privacy" in detail:
+        return "restricted", 0
+    if action == "blocked" and (
+        "cannot see" in detail
+        or "cannot find" in detail
+        or "entity" in detail
+        or "no peer" in detail
+    ):
+        return "retry", 0
     if action == "blocked":
         return "restricted", 0
     return "retry", 0
@@ -1016,10 +1030,13 @@ def campaign_gap_seconds(campaign: Mapping[str, Any]) -> float:
 def releasable_contacts_sql(alias: str = "") -> str:
     """The predicate above, spelled for whichever alias the caller's statement uses (`""` for none)."""
     at = f"{alias}." if alias else ""
+    # Anyone who never got a message, except a privacy refusal about *them*. `restricted` is included
+    # because the send loop used to file "this session cannot see that user" under that word — a fact
+    # about the account's cache, not about the stranger — and those people then survived every later
+    # start tap. Attempts are not a ceiling on a human ✅: the tap is "send to these people".
     return (
-        f"{at}sent_at is null and ({at}status = 'queued' or ({at}status = 'failed'"
-        f" and {at}attempts < {JOIN_MAX_ATTEMPTS}"
-        f" and ({at}error is null or {at}error not ilike '%privacy%')))"
+        f"{at}sent_at is null and {at}status in ('queued', 'failed', 'restricted', 'already_contacted')"
+        f" and ({at}error is null or {at}error not ilike '%privacy%')"
     )
 
 
@@ -1216,6 +1233,22 @@ async def campaign_pass(self: Writers, campaign_id: int, *, ctx: Any = None) -> 
     if not found.ok:
         return {"campaign_id": int(campaign_id), "blocked": found.detail}
     waiting = [entry for entry in requests if int(entry.get("user_id") or 0) and int(entry["user_id"]) not in already]
+    # People this campaign already owes a message to (`skipped`, wait expired). Telegram's waiting list
+    # is newest-first and does not always hand the same ids back after a rate limit; if we only send to
+    # whoever this read returned, a start tap that just freed 1 575 rows still sends nobody. Fold them
+    # in by id. An access hash, when the read carried one, still wins.
+    seen_waiting = {int(entry["user_id"]) for entry in waiting}
+    owed_rows = await self.db.fetch(
+        "select telegram_user_id from app.join_campaign_contact where campaign_id = $1"
+        " and status = 'skipped' and (flood_wait_until is null or flood_wait_until <= now())",
+        int(campaign_id),
+    )
+    for row in owed_rows or []:
+        user_id = int(row["telegram_user_id"] or 0)
+        if not user_id or user_id in already or user_id in seen_waiting:
+            continue
+        waiting.append({"user_id": user_id})
+        seen_waiting.add(user_id)
     # Telegram's own count of who is waiting, minus the people this campaign has a row for, minus the people
     # this read reached. Whatever is left is a list deeper than the pages walked, and it is carried on every
     # answer below: "nobody is waiting" and "this pass could not reach them" are two different sentences, and

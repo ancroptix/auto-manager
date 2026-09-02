@@ -354,6 +354,10 @@ class CampaignDb:
                 # Only the query that says it filters gets the filtered answer: drop the predicate from the
                 # SQL and this fake hands back the released rows again, which is the bug being guarded.
                 ids = ids[self.released :]
+            elif "status = 'skipped'" in statement:
+                # The people an operator freed: the first `released` ids, matching how the already-set
+                # query above drops them.
+                ids = ids[: self.released]
             return [{"telegram_user_id": 900 + n} for n in ids]
         return []
 
@@ -972,6 +976,27 @@ async def test_a_privacy_refusal_is_recorded_once_and_never_tried_again(monkeypa
 
 
 @pytest.mark.asyncio
+async def test_a_session_that_cannot_see_a_stranger_does_not_write_them_off(monkeypatch) -> None:
+    """`Cannot find any entity` is about the cache, not the person — they stay owed a message."""
+    missing = sender.Result(
+        ok=False,
+        action="blocked",
+        detail="this session cannot see 900123 (ValueError: Cannot find any entity corresponding to 900123)",
+    )
+    ok = sender.Result(ok=True, action="sent", detail="sent")
+    db = CampaignDb(waiting=2, rate=1000)
+    handlers = _campaign_writers(db, outbound=True, results=[missing, ok])
+    monkeypatch.setattr("app.writers.asyncio.sleep", _no_sleep)
+
+    result = await handlers.campaign_pass(7)
+
+    assert result["sent"] == 1 and result["owed"] == 1 and result["failed"] == 0, result
+    assert result["more"] is True, result
+    assert [sql for sql, _ in _contact_writes(db) if "status = 'skipped'" in sql], _contact_writes(db)
+    assert not [sql for sql, _ in _contact_writes(db) if "'restricted'" in sql], _contact_writes(db)
+
+
+@pytest.mark.asyncio
 async def test_five_failures_in_a_row_are_the_account_and_the_pass_says_so(monkeypatch) -> None:
     """A streak is the guard for the flood nobody mapped: stop, name a wait, keep everybody's place."""
     hiccup = sender.Result(ok=False, action="failed", detail="OSError: broken pipe")
@@ -996,14 +1021,13 @@ async def test_the_release_frees_the_people_a_rate_limit_wrote_off(monkeypatch) 
     account was rate-limited — so the operator's own start tap owes them a message again. A privacy refusal
     is left alone by the same statement, because retrying it is a second attempt at the same impossible thing.
     """
-    from app.writers import JOIN_MAX_ATTEMPTS, campaign_release_unsent
+    from app.writers import campaign_release_unsent
 
     db = ReleaseOnlyDb(1575)
 
     assert await campaign_release_unsent(db, 7) == 1575
     sql = db.fetched[0]
-    assert "status = 'queued'" in sql and "status = 'failed'" in sql, sql
-    assert f"attempts < {JOIN_MAX_ATTEMPTS}" in sql, sql
+    assert "queued" in sql and "failed" in sql and "restricted" in sql, sql
     assert "not ilike '%privacy%'" in sql, sql
     assert "sent_at is null" in sql, sql
 
