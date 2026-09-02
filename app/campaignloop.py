@@ -240,6 +240,12 @@ class CampaignLoop:
             log.warning("campaign %s: waiting %ss before the next page", campaign_id, int(wait))
             await self._pauseable(max(1.0, wait))
             return
+        if more and owed:
+            # People were handed back as still owed. Sleeping the idle gap here is how a start tap after a
+            # rate-limit recovery sat for half a minute between every empty-looking page and looked like
+            # "the bot is not sending DMs".
+            await self._pauseable(self.page_seconds)
+            return
         if sent + planned + failed == 0:
             # This covers a `skipped` answer too — a campaign that stopped between this round's read of the
             # list and the pass itself, or a row that has gone. Waiting is the right answer either way: the
