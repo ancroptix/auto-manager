@@ -1,0 +1,3998 @@
+"""The control bot: your remote, and the only way in for a non-terminal operator.
+
+What it is for, in one line: you own a bot via @BotFather, paste its token into
+Render, and then *every* remaining setup and operational step happens by messaging
+that bot from your own Telegram account — including logging the spare user account
+in, which is why this file exists at all. A session string never has to appear in a
+chat log, a terminal or a file: you type the phone number and the code into a DM
+with a bot only you can talk to, the service performs the MTProto login, and the
+result goes straight into Postgres.
+
+The trust model, stated plainly:
+
+* **Owner-only.** Every update from anyone else is dropped before its text is even
+  parsed. No help message, no "unauthorised" reply — anything that answers a
+  stranger tells a stranger the bot is real.
+* **Private chats only.** In a group the chat id is not the sender id, and a bot
+  that checks one and not the other has an open door for whoever else is in there.
+* **Secrets are deleted, not just ignored.** Phone number, code and 2FA password
+  live in memory for one attempt, are never written to the database, and the
+  operator's message carrying each one is deleted from the chat once it has been
+  used. Our own replies are never deleted: they hold the instruction being followed,
+  they are masked before they are sent, and a question that erases itself mid-flow
+  reads as a broken bot rather than a careful one.
+* **Nothing sensitive leaves.** Every reply passes through :func:`app.sessions.scrub`,
+  which strips session-shaped text and any named secret, so an exception traceback
+  cannot print a session into your DMs.
+* **Login can be switched off** once it has happened: ``BOT_ALLOW_LOGIN=0``.
+
+The bot adds no authority of its own — it only drives what the queue and the
+database already expose — which is what makes it safe to hand to a phone.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+from dataclasses import dataclass, field
+from typing import Any, Callable, Mapping
+
+from . import console, discover, keyboards, sourcecfg
+from .botapi import BotApi, Update
+from .sessions import forget as forget_session
+from .sessions import list_sessions, mask_phone, scrub, store as store_session, valid_name
+
+log = logging.getLogger("auto_manager.controlbot")
+
+__all__ = ["ControlBot", "LoginCancelled", "LoginResult", "LoginUnstored", "NeedsPassword", "Reply"]
+
+#: Telegram's own limit for repeated code requests is roughly "a few per minute,
+#: then wait a while". Stopping at three per ten minutes keeps us well clear of it,
+#: because a flood wait on a *login* is what gets an account flagged, not a wrong
+#: guess.
+MAX_ATTEMPTS_PER_WINDOW = 3
+ATTEMPT_WINDOW_SECONDS = 600.0
+#: How long a /login reply may wait for the writer to adopt the new session. Telegram's own connect is
+#: seconds, not minutes, and a hand-off that cannot answer is better reported as a timeout than as silence.
+_ADOPT_TIMEOUT = 20.0
+
+#: Wrong codes tolerated in one flow before it is closed outright. A fourth guess is
+#: worthless (Telegram invalidates the code long before) and costs the account.
+MAX_CODE_TRIES = 3
+
+#: The pause state, in the one spelling this service uses. `/status`, the queue screen and the main screen
+#: all read it, and a second copy of the text is how a screen ends up asking for a column that the schema
+#: does not have (`reason`, where the table says `paused_reason`).
+_SERVICE_STATE_SQL = (
+    "select paused, coalesce(paused_reason,'') as reason, last_reconcile_at from app.service_state "
+    "where id = 1"
+)
+
+HELP = """auto-manager control
+
+/start /help   this list (Telegram's Start button sends /start)
+/status      mode, queue, pause state, what is blocked and why
+/pause       stop claiming jobs (optional reason)
+/resume      start claiming again
+/worker      on|off — run or stop this service's queue worker (what WORKER_ENABLED does, from here)
+/reconcile   reclaim stale leases + queue a reconciliation now
+/probe       ask the storage bot and Channel Help their questions (report arrives here)
+/declare     say how long a season is (Total Episodes, and the batch post)
+/source      add a source channel, say what it carries (series, audio, season), flip its switches
+/sources     every source channel, with its switches as buttons (the same list the menu shows)
+/discover    read the channels this account can see: member → a source, admin → a destination
+             /discover add 3 · /discover add all · /discover auto on|off
+/destination the channel a series publishes into: the card post, the link, the campaigns, the counts
+             /destinations                    every one of them, which is what `/destination` alone says
+             /destination <series|@handle|id>  one, with its buttons
+             /destination <one> card <id|show|clear>   campaigns   episodes <season> <count|tba>
+             /destination <one> inplace [plan|off]    (a private channel's id is in any link to a post)
+/archive     which private channel holds the master copy: /archive <@handle|id> add title <name>
+/inplace     caption the files already posted in your own channel (no delete; link + post still run)
+/joinmsg     what a join requester is told: options, your own words, or switch it off
+/card        name the post a shareable link is made from, per destination channel (the announcement)
+/sticker     which sticker message opens a season, and from where
+/campaign    draft, plan, confirm a join-request campaign: two steps before anyone is messaged
+/joinreq     the same thing by button: pick a channel you post in, read the plan, start (1 per 3 seconds)
+/sessions    stored Telegram sessions (never their contents)
+/use <name>  make one session the active account
+/forget <n>  delete a stored session from the database
+
+login (needs BOT_ALLOW_LOGIN=1)
+/login <name> +<country><number>   start; Telegram sends a code to that account
+/code 123456                       the code you received
+/password <2fa>                    only if the account has 2FA
+/cancel                            drop the pending attempt
+
+After /login or /pause you can also just reply with what I asked for, without a
+command. Where a choice is yours, the reply arrives with buttons under it — a tap is
+the same command, typed for you, and it changes exactly what the label says.
+
+This bot answers you and nobody else. It cannot read, post or delete anything in
+your channels — the user session it logs in does the pipeline work."""
+
+
+#: Command -> handler method name. The help text is checked against this table by the tests,
+#: so neither a routed-but-undocumented command nor a documented-but-dead one survives a
+#: refactor. Mapped by *name* rather than by bound method because this file is read by a
+#: person more often than by Python, and the router stays three lines long.
+_ROUTES: dict[str, str] = {
+    "start": "_help",
+    "help": "_help",
+    "status": "_status",
+    "pause": "_pause",
+    "resume": "_resume",
+    "worker": "_worker",
+    "reconcile": "_reconcile",
+    "probe": "_probe",
+    "declare": "_declare",
+    "source": "_source",
+    "sources": "_sources",
+    "discover": "_discover",
+    "joinreq": "_joinreq",
+    "destination": "_destination",
+    "destinations": "_destination",
+    "archive": "_archive",
+    "inplace": "_inplace",
+    "joinmsg": "_joinmsg",
+    "card": "_card",
+    "sticker": "_sticker",
+    "campaign": "_campaign",
+    "sessions": "_sessions",
+    "use": "_use",
+    "forget": "_forget",
+    "login": "_login",
+    "code": "_code",
+    "password": "_password",
+    "cancel": "_cancel",
+}
+
+
+def _col(row: Any, name: str, default: Any = None) -> Any:
+    """Read one column, tolerating a row that does not carry it.
+
+    A couple of these commands read columns added by later migrations, and a fake row in the
+    tests answers with the shape the earlier commands needed. Reading ``None`` there is the
+    right failure, because "not recorded" is also what it means in the database.
+    """
+    try:
+        value = row[name]
+    except (KeyError, IndexError, TypeError):
+        return default
+    return default if value is None else value
+
+
+def _int_or_none(token: str | None) -> int | None:
+    """A positive episode/season count, or None. Deliberately strict: ``"12 eps"`` is a
+    human being casual, not a number to store, and a wrong season length is a public,
+    permanent claim about how much of a show exists."""
+    text = (token or "").strip()
+    if not text.isdigit():
+        return None
+    return int(text)
+
+
+class NeedsPassword(Exception):
+    """The account has 2FA; the caller must ask for it and try again."""
+
+
+class LoginCancelled(Exception):
+    """The operator cancelled, or the attempt expired."""
+
+
+class LoginUnstored(Exception):
+    """Telegram accepted the credentials and the service could not hand over a session.
+
+    Its own exception because the two login failures need opposite answers. A wrong code means *try the
+    code again*; this means the account is signed in right now, there is no code left to retry, and the
+    only useful thing to say is that a live session exists which nobody stored — so it should be
+    terminated on the account before anyone tries again. Answering it with "2 attempt(s) left, reply with
+    the code" sends the operator to do something that cannot work, over a login that already worked.
+    """
+
+
+@dataclass(frozen=True, slots=True)
+class LoginResult:
+    session_string: str
+    account_id: int | None = None
+    username: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class Reply:
+    """One outgoing message.
+
+    ``delete_prompt_too`` marks the reply that answers a secret: the operator's
+    own message — a phone number, a code, a password — is deleted once it has been
+    used, because that is the copy that must not sit in a chat log.
+
+    The reply itself is never deleted, and nothing here marks a message as
+    "sensitive, delete mine too". A bot that erases its own instructions mid-flow is
+    unreadable: the operator sees a question appear and vanish and cannot tell whether
+    to answer it, and every line we send has already been scrubbed and masked, so there
+    is nothing in it worth hiding.
+    """
+
+    text: str
+    delete_prompt_too: bool = False
+    #: An inline keyboard, built by `app/keyboards.py` — and every button in it is a command string this
+    #: same bot would accept typed. That identity is the safety property, not a convenience: the owner
+    #: check, the private-chat check and the router all run on the text, so a tap can never reach an
+    #: action the words could not. None means "no buttons", which is what every reply that has no
+    #: `app/config.py`-style choice to offer sends.
+    markup: dict[str, Any] | None = None
+
+
+@dataclass
+class _Pending:
+    """In-memory state of one login. Never persisted, never logged."""
+
+    name: str
+    phone: str = ""
+    code: str | None = None
+    code_hash: str | None = None
+    password: str | None = None
+    #: "phone" (waiting for the number), "code", "password"
+    stage: str = "phone"
+    tries: int = 0
+    started_at: float = field(default_factory=time.monotonic)
+
+
+@dataclass
+class ControlBot:
+    """``handle()`` is the whole brain and takes an update; ``run()`` is plumbing.
+
+    Splitting them means the security rules are testable without a network: the
+    tests drive ``handle()`` with fake transports, and nothing about the polling
+    loop can weaken a check that lives there. ``dispatch()`` is the layer that
+    actually sends and deletes, so a test can assert on deletions too.
+    """
+
+    api: BotApi
+    db: Any
+    settings: Any
+    transport: Any = None  # MTProto login helper; injected so tests can fake it
+    owner_ids: frozenset[int] = frozenset()
+    allow_login: bool = True
+    login_ttl_seconds: float = 600.0
+    delete_sensitive: bool = True
+    background: Callable[[Any], None] | None = None  # fires /probe off without blocking
+    #: Called after a session is stored, so the account a login just produced reaches the writer
+    #: without a redeploy. Injected (``app/main.py``) because the bot must not own that connection.
+    on_session_stored: Callable[[], Any] | None = None
+    #: Starts or stops this process's queue worker (`app/main.py` wires it to the app state). Injected for
+    #: the same reason as `on_session_stored`: the bot must not own the connection, and a service that writes
+    #: jobs it never runs needs one tap in the chat rather than an environment edit.
+    worker_switch: Callable[[bool], Any] | None = None
+    #: A read of this service's campaign sender (`app/campaignloop.py`), from `app/main.py`'s state. A
+    #: callable rather than the loop itself, because the loop is the service's and not the bot's: a copied
+    #: snapshot would be a remembered answer to "is it sending", which is the one question this screen is not
+    #: allowed to guess at. `None` means this bot was assembled without a service to ask, and the screens say
+    #: that instead of printing a reassuring nothing.
+    sender_state: Callable[[], dict[str, Any]] | None = None
+    #: What this bot last asked the worker to do, or None for "whatever the service was started with". A
+    #: screen that printed the environment's answer after a `/worker on` would deny what the tap just did.
+    worker_running: bool | None = None
+    pending: dict[int, _Pending] = field(default_factory=dict, repr=False)
+    #: One free-text question outstanding per chat: `(slot, row id)`. Kept beside `pending` rather than
+    #: inside it because `pending` is a login — secrets, a timeout, a delete-after-use — and a rename
+    #: question is none of those things. Nothing here is persisted: a restart forgets the question, and
+    #: the operator's next tap asks it again.
+    console_owed: dict[int, tuple[str, int | None]] = field(default_factory=dict, repr=False)
+    attempts: dict[int, list[float]] = field(default_factory=dict, repr=False)
+    _stop: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
+
+    def __post_init__(self) -> None:
+        if not self.owner_ids:
+            # Fail closed, loudly, at construction: a bot with an unset owner list
+            # would otherwise answer whoever found it first.
+            raise ValueError(
+                "the control bot refuses to start without TELEGRAM_OWNER_USER_IDS (or "
+                "TELEGRAM_MAIN_ADMIN_USER_ID): it would otherwise obey any stranger who "
+                "guesses the token"
+            )
+
+    # ------------------------------------------------------------------ gating
+    def authorized(self, update: Update) -> bool:
+        return update.from_id is not None and int(update.from_id) in self.owner_ids
+
+    def _throttled(self, chat_id: int) -> bool:
+        now = time.monotonic()
+        window = [t for t in self.attempts.get(chat_id, []) if now - t < ATTEMPT_WINDOW_SECONDS]
+        window.append(now)
+        self.attempts[chat_id] = window
+        return len(window) > MAX_ATTEMPTS_PER_WINDOW
+
+    def _pending_valid(self, chat_id: int) -> _Pending | None:
+        pending = self.pending.get(chat_id)
+        if pending is None:
+            return None
+        if (time.monotonic() - pending.started_at) > self.login_ttl_seconds:
+            # Silence is the right behaviour for an expired attempt: the operator
+            # may have walked away mid-code and a half-finished flow must not sit
+            # in memory holding a phone number.
+            del self.pending[chat_id]
+            return None
+        return pending
+
+    # ----------------------------------------------------------------- router
+    async def handle(self, update: Update) -> list[Reply]:
+        """Decide and act. Returns the replies the caller should send.
+
+        Every text is produced here rather than sent, so "what could this bot ever
+        say to a person" is answerable by reading one function.
+        """
+        if not self.authorized(update):
+            # One log line, no reply, and no echo of the text: a rejected stranger
+            # learns nothing, and their message never reaches the database.
+            log.info("ignored control-bot message from non-owner id=%s", update.from_id)
+            return []
+        if not update.is_private_chat:
+            log.info("ignored control-bot command in a non-private chat=%s", update.chat_id)
+            return [Reply("I only take commands in our private chat — not in groups or channels.")]
+
+        text = (update.text or "").strip()
+        if not text:
+            return []
+
+        if update.kind == "callback":
+            # A tap. It runs through the same router the keyboard runs through — see app/console.py for
+            # why that identity is the safety property and not a shortcut.
+            return await self._console_tap(update, text)
+
+        pending = self._pending_valid(update.chat_id)
+        if pending is not None and not text.startswith("/"):
+            # Mid-flow, a bare reply is what a person actually does ("123456"), and
+            # forcing "/code 123456" on a phone keyboard loses logins.
+            return await self._bare(update, pending, text)
+
+        owed = self.console_owed.get(update.chat_id)
+        if owed is not None and not text.startswith("/"):
+            # A screen asked for one piece of text and this is it. A line that *does* start with a slash
+            # is a command, not an answer, so the question stays open: the operator stopped to check
+            # something, and dropping their half-finished rename while they were away would be worse
+            # than waiting.
+            return await self._console_answer(update, text)
+
+        parts = text.split()
+        command = parts[0].lstrip("/").split("@", 1)[0].casefold()
+        args = parts[1:]
+        method = _ROUTES.get(command)
+        if method is None:
+            # Unknown commands are ignored rather than echoed: an "unknown command"
+            # reply is how a bot advertises that it exists and which words work.
+            return []
+        return await getattr(self, method)(update, args)
+
+    async def _bare(self, update: Update, pending: _Pending, text: str) -> list[Reply]:
+        if pending.stage == "phone":
+            return await self._start_code(update, pending.name, text)
+        if pending.stage == "code":
+            return await self._submit_code(update, pending, text)
+        if pending.stage == "password":
+            return await self._submit_password(update, pending, text)
+        self.pending.pop(update.chat_id, None)
+        return []
+
+    # -------------------------------------------------------------- commands
+    async def _help(self, update: Update, args: list[str]) -> list[Reply]:
+        # The command list, and under it the way in to the console. `/help` is what an operator types when
+        # they have forgotten how to drive the bot, so the screen that needs no remembering goes with it.
+        one = console.button("🏠 Open the menu", f"{console.NAV_PREFIX}main")
+        if one is None:
+            return [Reply(HELP)]
+        return [Reply(HELP, markup={"inline_keyboard": [[one]]})]
+
+    async def _sources(self, update: Update, args: list[str]) -> list[Reply]:
+        """`/sources` — every source channel, with its switches as buttons.
+
+        The list the menu shows, reachable by words as well: the console's refusal text points here, and a
+        list that only exists behind a tap cannot be quoted in a bug report or read on a client that renders
+        no keyboards. Same builder, so the two can never disagree.
+        """
+        if self.db is None or not getattr(self.db, "connected", False):
+            return [Reply(
+                "the database is not reachable, so there is nothing to list. `/status` names the reason."
+            )]
+        rows, extra = await self._console_screen_rows("s")
+        text, mark = console.sources_screen(rows, truncated=extra)
+        return [Reply(text, markup=mark)]
+
+    _DISCOVER_USAGE = (
+        "usage: /discover [plan | add <n> | add all | pair <n> | pair all | auto on|off]\n"
+        "  /discover                read the account's channels and say what each one would become\n"
+        "  /discover add 3          write that one row, exactly as the screen described it\n"
+        "  /discover add all        write every row on the page, one at a time, and report each\n"
+        "  /discover pair 1         one series, one tap: its row if it is new, both channels, the link\n"
+        "  /discover pair all       the same for every pair the page can see\n"
+        "  /discover auto on        keep re-reading roles on every reconcile, and apply the switch there\n"
+        "  /discover auto off       go back to reading only when you ask\n\n"
+        "Discovery reads. It posts nothing, creates no channel in Telegram, and never rewrites a file that "
+        "was already published. A channel is a source when this account can only read it and a destination "
+        "when it can post there; two channels of the same name are the same series, and the name a "
+        "destination is spelled with (`{TITLE} Anime in Hindi`) strips down to that same series."
+    )
+
+    #: A dialog walk is a few API calls, and a stalled one must not hold up a chat reply forever. The
+    #: number is generous next to `app/probe.py`'s per-step budget because this walk has no bot menu to
+    #: wait on: 90 seconds of silence is already the longest a control-bot command should ever make you look.
+    _DISCOVER_TIMEOUT = 90.0
+
+    async def _discover_auto(self) -> bool:
+        """Whether auto mode is on, read the way the rest of this bot reads a flag.
+
+        Tolerant of the two spellings a jsonb boolean arrives in — `True` from a parsed value and
+        `"true"` from a row somebody edited by hand — and of a database that answers nothing at all, which
+        means off. An unread flag is not a licence to start switching channels.
+        """
+        try:
+            value = await self.db.config(discover.AUTO_KEY, False)
+        except Exception:  # noqa: BLE001 - a config read that fails is "off", never a crash in a DM
+            return False
+        if isinstance(value, str):
+            return value.strip().strip('"').casefold() in {"true", "on", "1", "yes"}
+        return bool(value)
+
+    async def _set_discover_auto(self, on: bool) -> None:
+        import json  # noqa: PLC0415  (only the writer needs the encoder)
+
+        await self.db.execute(
+            "insert into app.config (key, value, description) values ($1, $2::jsonb, $3)"
+            " on conflict (key) do update set value = excluded.value, updated_at = now()",
+            discover.AUTO_KEY,
+            json.dumps(bool(on)),
+            "Set from the control bot with /discover auto on|off. When true, app/handlers.py re-reads this "
+            "account's channel roles on every reconciliation and applies the member-reads / admin-publishes "
+            "switch; app/discover.py owns the rules and refuses a switch it cannot undo.",
+        )
+
+    async def _discover_dialogs(self, *, verify_rights: bool = False) -> list | str:
+        """One dialog walk, on a client of its own, or the sentence that says why there is none.
+
+        Its own client for the reason `app/telegram_client.probe_once` gives: a read that fails must not be
+        able to take the worker's connection down with it. Nothing is sent to anyone by this call — it is the
+        account listing its own chats, which is why it runs in shadow mode while `/probe`'s menu questions do
+        not.
+        """
+        from .probe import collect_dialogs  # noqa: PLC0415
+        from .telegram_client import TelegramUserClient  # noqa: PLC0415
+
+        wrapper = TelegramUserClient(settings=self.settings, db=self.db)
+        try:
+            client = await wrapper.start()
+            return await asyncio.wait_for(
+                collect_dialogs(client, verify_rights=verify_rights), self._DISCOVER_TIMEOUT
+            )
+        except Exception as exc:  # noqa: BLE001 - the operator needs the reason, not a traceback
+            return (
+                f"the channels could not be read from this account: {type(exc).__name__}: {str(exc)[:160]}"
+                "\n\nNothing was written. `/status` says whether a session is stored and reachable, and "
+                "`/sessions` lists the names — a login that expired is the usual reason for this."
+            )
+        finally:
+            await wrapper.stop()
+
+    def _campaign_sending_line(self, campaign_id: int) -> str:
+        """What this service's sender last did about this campaign — or why it is doing nothing.
+
+        Read from the loop's memory (`app/campaignloop.py`) rather than from a queue row, because there is no
+        queue row any more, and read from the same object `/worker status` talks to, because a screen that said
+        "sending" while the sender was off is how this campaign came to look broken twice. Every branch here
+        names a tap that exists in that state, and none of them promises a message.
+        """
+        sending: dict[str, Any] = {}
+        if self.sender_state is not None:
+            try:
+                sending = dict(self.sender_state() or {})
+            except Exception as exc:  # noqa: BLE001 - a screen must not fail because a status read did
+                return f"\nsending: the sender could not be asked ({str(exc)[:90]})."
+        else:
+            return "\nsending: this bot has no service behind it to send from."
+        if sending.get("absent"):
+            return (
+                "\nsending: this service has no sender running, because it has no database to read the"
+                " campaign list from. `/status` names the connection problem."
+            )
+        if sending.get("paused"):
+            return (
+                "\nsending: the service is paused, so the sender is waiting and nobody is being messaged."
+                " /resume starts it again, and the list carries on where it stopped."
+            )
+        if sending.get("shadow"):
+            return (
+                "\nsending: this service is in shadow mode, which is its deployment's setting and not a tap"
+                " here, so a campaign pass plans each message and blocks before it. Nothing is sent to anyone"
+                " while it stays that way."
+            )
+        if sending.get("unreadable"):
+            return (
+                f"\nsending: the sender cannot read this service right now ({str(sending['unreadable'])[:90]}),"
+                " so nothing has gone out since. It tries again by itself; `/status` names the connection"
+                " problem if it stays."
+            )
+        if not sending.get("running"):
+            return (
+                "\nsending: the sender in this service is not running, so nothing is being sent even"
+                " though this campaign says it is on. It starts with the service, so this means the service"
+                " came up without one — /status and /probe show what it found."
+            )
+        detail = (sending.get("campaigns") or {}).get(str(campaign_id)) or {}
+        if not detail:
+            return (
+                "\nsending: awake. It looks at this campaign every few seconds and works the list from where"
+                " it stands — nothing has to be tapped again."
+            )
+        # Two short lines, because this screen has already printed the headcounts and the delay: what belongs
+        # here is whether the sender is awake and what it did last, and anything else would be the same number
+        # twice in two fonts. A long run-on sentence about a campaign is how these screens ended up unread.
+        head = ["sending: awake"]
+        if detail.get("sent"):
+            head.append(f"{detail['sent']} sent in its last pass")
+        if detail.get("planned"):
+            head.append(f"{detail['planned']} planned, not sent")
+        if detail.get("failed"):
+            head.append(f"{detail['failed']} could not be sent")
+        if detail.get("owed"):
+            # People a pass wrote a row for and handed straight back — a flood, a timeout, a dropped
+            # connection. They are not failures and they are not sent, and folding them into either number
+            # is how fifteen hundred people disappeared out of a campaign without a sentence about it.
+            head.append(f"{detail['owed']} kept their place for the next pass")
+        if len(head) == 1:
+            head.append("nothing went out in its last pass")
+        if detail.get("gap"):
+            head.append(f"one message every {detail['gap']:g} s")
+        reason = None
+        if detail.get("stopped"):
+            reason = "your \u23f8 stopped it"
+        elif detail.get("skipped"):
+            reason = f"its last look said: {detail['skipped']}"
+        elif detail.get("flood"):
+            # Ahead of the `waiting` line below, and that order is the fix: a pass stopped by a rate limit
+            # also reports everybody it did not reach, and reading that as "the queue is deeper than one
+            # read" told the operator the sender was busy when it was actually waiting out an hour.
+            reason = (
+                f"Telegram asked for a {detail['flood']} s pause, which this service waits out before it"
+                " sends to anybody else"
+            )
+        elif detail.get("waiting"):
+            reason = f"{detail['waiting']} people are past what one read can reach, and it goes back for them"
+        elif detail.get("finished"):
+            reason = "the list was empty at its last look, so this campaign is done"
+        if detail.get("error"):
+            reason = f"the last pass faulted: {str(detail['error'])[:90]}"
+        line = ", ".join(head) + "."
+        return "\n" + line + (f"\n{reason}." if reason else "")
+
+    async def _campaign_watch(self) -> list[str]:
+        """The reasons a campaign that is on would still send nothing, each with the tap that fixes it.
+
+        A start screen that promises sending while the service will not send is worse than one that refuses:
+        the operator waits, sees no DMs, and has no way to know the switch is off on purpose. Three things can
+        each silence a campaign on their own — the service-wide pause, the deployment's mode, and an account
+        with no stored session — so all three are read here, and a line is printed only when it is actually a
+        problem. The queue worker is deliberately **not** one of them: sending does not go through it, and a
+        button for it on this screen was a second feature the operator had to understand in order to do the
+        first one. Nothing in this method writes anything.
+        """
+        lines: list[str] = []
+        state = None
+        try:
+            state = await self.db.fetchrow(_SERVICE_STATE_SQL)
+        except Exception:  # noqa: BLE001  - a screen must not die over a status read
+            state = None
+        if state and state.get("paused"):
+            reason = str(state.get("reason") or "").strip()
+            lines.append(
+                "• the service is PAUSED" + (f" ({reason[:80]})" if reason else "") + " — no job is claimed"
+                " and nobody is being messaged. /resume starts both again"
+            )
+        if not getattr(self.settings, "outbound_enabled", False):
+            lines.append("• mode: shadow — nothing is sent from this service, only planned")
+        rows: list = []
+        try:
+            rows = list(await list_sessions(self.db) or [])
+        except Exception:  # noqa: BLE001  - same reason: a status read
+            rows = []
+        if not any(bool(row.get("active")) for row in rows):
+            lines.append(
+                "• no Telegram session is active for this service, so a send has nothing to go out on."
+                " /sessions shows them, /login <name> +<phone> adds one"
+            )
+        return lines
+
+    async def _pending_requests(self, peer: str) -> tuple[int | None, int | None, str | None]:
+        """How many join requests are waiting, how many this look could read, and why if neither.
+
+        Two numbers because they answer two different questions. Telegram's counters say how big the queue
+        is; the read's rows say how far into it this look reached, and a page of 100 in a queue of 3 000 is
+        both true at once. Printing only the second is how an operator is told "100 pending" for the tenth
+        run in a row and starts to suspect the bot is stuck. The first version printed neither honestly: it
+        counted the rows of one linkless query, that query answers nothing for a private channel's primary
+        `+ABCDEF` link, and a queue of twenty people was reported as zero.
+
+        `/campaign … plan` has always promised the real headcount, and it used to get it from
+        `self.telegram.client` — an attribute this class does not have and never did, so in a live deployment
+        the plan answered `AttributeError: 'ControlBot' object has no attribute 'telegram'` instead of a
+        number, and every tap that planned anything died there. Reading a list is not a write, so this runs
+        in shadow mode too; what it never does is answer `0` when the read failed. The count is the same
+        thing the job will act on, so a number that is quietly unavailable would be worse than no number.
+
+        The client is opened and closed here for the same reason `app/telegram_client.probe_once` exists: a
+        read that fails must not be able to take the worker's connection down with it.
+        """
+        from . import sender  # noqa: PLC0415
+        from .telegram_client import TelegramUserClient  # noqa: PLC0415
+
+        wrapper = TelegramUserClient(settings=self.settings, db=self.db)
+        try:
+            client = await wrapper.start()
+            reader = sender.Sender(
+                client, db=None, policy=sender.WritePolicy(mode="plan", allow_peers=())
+            )
+            # Bounded on purpose: a plan needs the queue's size, which the channel's own counters answer in
+            # the first calls, and reading 100 people per link across a dozen links could run past the time a
+            # tap is allowed to take and come back as "could not be read". The rows a plan shows are a
+            # sample, and the sentence says so.
+            result, rows = await asyncio.wait_for(
+                reader.pending_requests(peer, limit=25, max_pages=1, max_links=4), self._DISCOVER_TIMEOUT
+            )
+        except Exception as exc:  # noqa: BLE001 - the operator needs the reason, not a traceback
+            return None, None, f"{type(exc).__name__}: {str(exc)[:160]}"
+        finally:
+            await wrapper.stop()
+        if not result.ok:
+            return None, None, str(result.detail)[:200]
+        waiting = [row for row in rows if not row.get("approved_by")]
+        return int(getattr(result, "total", 0) or 0) or len(waiting), len(waiting), None
+
+    async def _discover(self, update: Update, args: list[str]) -> list[Reply]:
+        """``/discover`` — what this account can see, and the tap that files it.
+
+        The command exists because the operator should not have to type the channel numbers they can already
+        see in their own Telegram: the session the pipeline uses has the list, and the role it holds in each
+        channel is the only thing that decides whether that channel is a place files come *from* or a place
+        posts go *to*. Both halves are read, not configured: :mod:`app.rights` decides what "admin" means
+        and :func:`app.channels.destination_name` decides what a destination is called.
+
+        One tap per series — `✅ Set up <series>` — writes the whole setup: the series row if nothing has
+        named it yet, the destination row for the channel this account can post in, a source row for each
+        channel of the same name it can only read, and `destination_id` linking them. That is the operator's
+        own rule, from their own words: the source channel and the destination channel of `Mob Psycho 100`
+        are the same show, and what tells them apart is that the account can post in one of them.
+
+        What is deliberately not here: creating a channel in Telegram, sending an invite, adding a bot, or
+        turning off the only channel a series reads from. Those are the places a button could do something the
+        operator did not mean, so each one is refused with the reason rather than done quietly — see
+        `app/discover.py`.
+        """
+        if self.db is None or not getattr(self.db, "connected", False):
+            return [Reply(
+                "the database is not reachable, so there is nothing to record a channel in. `/status` names "
+                "the reason."
+            )]
+        action = (args[0].strip().casefold() if args else "plan")
+        if action in {"help", "-h", "?"}:
+            return [Reply(self._DISCOVER_USAGE)]
+        if action == "auto":
+            word = " ".join(args[1:]).strip().casefold()
+            if word in sourcecfg.ON_WORDS:
+                await self._set_discover_auto(True)
+            elif word in sourcecfg.OFF_WORDS:
+                await self._set_discover_auto(False)
+            else:
+                return [Reply(
+                    f"`auto` needs on or off — I read `{word or 'nothing'}` as neither.\n{self._DISCOVER_USAGE}"
+                )]
+        dialogs = await self._discover_dialogs(verify_rights=True)
+        if isinstance(dialogs, str):
+            return [Reply(f"{dialogs}\n\n{self._DISCOVER_USAGE}")]
+        auto = await self._discover_auto()
+        # Said out loud, because the answer to "where am I admin" is only as good as how it was found: a
+        # channel whose rights Telegram would not confirm keeps the session's weaker answer, and an operator
+        # reading "member" deserves to know that is what the cached list said, not what was asked now.
+        asked = sum(1 for one in dialogs if isinstance(one, Mapping) and one.get("rights_source") == "participant")
+        refused = [one for one in dialogs if isinstance(one, Mapping) and one.get("rights_error")]
+        swept = await discover.sweep(self.db, dialogs, auto=auto)
+        plan = swept["plan"]
+        outcomes = [dict(flip, title=flip.get("title") or flip.get("channel")) for flip in swept["flips"]]
+        if action in {"add", "apply"}:
+            wanted = " ".join(args[1:]).strip().casefold()
+            targets = [
+                finding
+                for finding in plan["findings"]
+                if finding.get("use") in ("source", "destination")
+                and (wanted == "all" or str(finding["index"]) == wanted)
+            ]
+            if not targets and wanted and wanted != "all":
+                return [Reply(
+                    f"nothing on this page is numbered {wanted}, so nothing was written. /discover shows the "
+                    "list again, and only the rows with a button can be added."
+                )]
+            for finding in targets:
+                adder = discover.add_destination if finding["use"] == "destination" else discover.add_source
+                outcome = await adder(self.db, finding)
+                # One vocabulary for the report's `applied` list: a writer says `ok` and `text`, the report
+                # says "was it done, and why", and translating here is what keeps `add_source` free to
+                # return the plan's own words instead of a paraphrase of them.
+                outcomes.append({**outcome, "applied": bool(outcome.get("ok")), "why": outcome.get("text") or ""})
+        elif action == "pair":
+            wanted = " ".join(args[1:]).strip().casefold()
+            targets = [
+                pair for pair in plan.get("pairs") or [] if wanted == "all" or str(pair["index"]) == wanted
+            ]
+            if not targets:
+                return [Reply(
+                    f"nothing on this page can be paired as {wanted or 'that'}, so nothing was written. "
+                    "A pair needs one channel this account can post in and one it can only read, with the "
+                    "same name — /discover shows what was found."
+                )]
+            for pair in targets:
+                outcome = await discover.apply_pair(self.db, pair)
+                outcomes.append({**outcome, "applied": bool(outcome.get("ok")), "why": outcome.get("text") or ""})
+        elif action not in {"plan", "show", "auto"}:
+            return [Reply(f"`{action}` is not something /discover does, so nothing was written.\n\n{self._DISCOVER_USAGE}")]
+        lines = discover.report(plan, auto=auto, applied=outcomes).splitlines()
+        if asked or refused:
+            note = f"rights asked of Telegram directly for {asked} channel" + ("" if asked == 1 else "s")
+            if refused:
+                note += f", {len(refused)} would not answer and kept the session's older answer"
+            lines.insert(1, note)
+        ran = "/discover" if action in {"plan", "show"} else f"/discover {' '.join(args)}"
+        text, mark = console.discover_screen(
+            lines, plan["findings"], auto=auto, note=console.screen_note(ran), pairs=plan.get("pairs") or []
+        )
+        return [Reply(text, markup=mark)]
+
+    _JOINREQ_USAGE = (
+        "usage: /joinreq [plan | open <ref> | start <ref> | go <ref> | stop <ref> | add | file <n>]\n"
+        "  /joinreq                every channel this account can post in, and what is set for it\n"
+        "  /joinreq open #21       that channel: the message, what has been sent, and the start button\n"
+        "  /joinreq start #21      the plan — who is waiting right now, and the exact words\n"
+        "  /joinreq go #21         start it: one person every 3 seconds, nobody twice, no approvals\n"
+        "  /joinreq stop #21       stop after the message in flight; what was sent stays sent\n"
+        "  /joinreq free #21       release people a run recorded but never messaged, so they can be sent to\n"
+        "  /joinreq add            read the account and list the channels it can post in that are not here\n"
+        "  /joinreq file 3         file that channel as a series' publishing channel and open it\n\n"
+        "Which channel is offered is read from Telegram now, not from a cached list: the account has to be "
+        "the owner or an admin who may post there, and a channel where it is only a member is not offered. "
+        "Nothing here approves or declines a join request, and no message is written to anyone before the "
+        "plan has been shown."
+    )
+
+    #: The campaign the buttons use. One name per channel is the whole interface — a campaign name an
+    #: operator has to invent is a typed step, and `/campaign <channel> list` still shows every name that
+    #: exists, including the ones typed before this screen did.
+    _JOINREQ_CAMPAIGN = "default"
+
+    async def _joinreq_row(self, destination_id: int, name: str) -> dict | None:
+        """The campaign row behind one channel, with what has been sent. A read, twice used and never written."""
+        from . import writers  # noqa: PLC0415  (the release predicate belongs to the sender, not the screen)
+
+        return await self.db.fetchrow(
+            "select c.id, c.name, c.status, c.message_template, c.per_message_delay_seconds,"
+            " (select count(*) from app.join_campaign_contact k where k.campaign_id = c.id"
+            "  and k.status = 'sent') as sent,"
+            " (select count(*) from app.join_campaign_contact k where k.campaign_id = c.id"
+            "  and k.status = 'failed') as failed,"
+            # Rows a run wrote and never sent: an older shadow run left them behind, a run was killed between
+            # the row and the send, or a rate limit wrote `failed` against people nobody ever refused. They
+            # are the reason a campaign can look finished while its strangers were never told. The predicate
+            # is `app/writers.py`'s own, so the number on this screen is exactly the number the ✅ frees.
+            " (select count(*) from app.join_campaign_contact k where k.campaign_id = c.id"
+            "  and " + writers.releasable_contacts_sql("k") + ") as unreleased"
+            " from app.join_campaign c where c.destination_id = $1 and lower(c.name) = lower($2)",
+            int(destination_id),
+            name,
+        )
+
+    async def _joinreq_free(self, destination: Mapping[str, Any]) -> list[Reply]:
+        """Release the people a run recorded and never messaged, so a later run owes them again.
+
+        Why a tap and not an automatic rule: a row left at `queued` with no `sent_at` is one of two things,
+        and the table cannot tell them apart — a dry run that recorded contacts it only planned (which the
+        code did until it stopped), or a live run killed between writing the row and sending the message.
+        The second one exists to stop a duplicate DM to a stranger, so it cannot be undone by a guess. What
+        this writes is a status, never a deletion: the row, its id and its timestamp all stay.
+        """
+        from . import writers  # noqa: PLC0415  (the pace number lives with the sender it paces)
+
+        row = await self._joinreq_row(int(destination["id"]), self._JOINREQ_CAMPAIGN)
+        if row is None:
+            return [Reply("there is no campaign on this channel yet, so there is nothing to release.")]
+        # Through `app/writers.py`, because that is the same release the ✅ tap performs: two copies of the
+        # statement are two chances to disagree about who was freed, and the second one used to crash on the
+        # database's own answer (`int("UPDATE 0")`) while the first worked.
+        moved = await writers.campaign_release_unsent(self.db, int(row["id"]))
+        if not moved:
+            return [Reply(
+                f"nobody on `{destination.get('title') or destination['id']}` is sitting in that state right"
+                " now, so nothing changed."
+            )]
+        return [Reply(
+            f"{moved} person(s) are released: their rows stay, and they are waiting for a message again."
+            f" Tap ✅ Yes, start sending and the sender takes them on its next page — one person every"
+            f" {writers.campaign_gap_seconds(row):g} seconds, and nobody who was already messaged is messaged"
+            " again."
+        )]
+
+    async def _joinreq_screen(self, lines: list[str], choices: list[dict], ran: str) -> list[Reply]:
+        text, mark = console.joinreq_screen(lines, choices, note=console.screen_note(ran))
+        return [Reply(text, markup=mark)]
+
+    async def _joinreq_open(
+        self, destination: Mapping[str, Any], *, after: str | None = None
+    ) -> list[Reply]:
+        """One channel: what it will say, what it already said, and the one button that starts it."""
+        from . import joinmsg, writers  # noqa: PLC0415  (the pace number lives with the sender it paces)
+
+        name = self._JOINREQ_CAMPAIGN
+        row = await self._joinreq_row(int(destination["id"]), name)
+        # Read before either branch, because the button below is built in both: no campaign row means nothing
+        # unreleased, and a screen that named the button before its campaign existed would be a promise about
+        # a row that does not exist.
+        unreleased = 0
+        where = str(destination.get("title") or destination.get("telegram_channel_id") or destination["id"])
+        lines = [f"{where} — series {destination.get('series') or '?'}"]
+        if after:
+            # What the write just did, above what the screen is about to do. The two are different facts and
+            # have to be read separately — a series founded from a channel title is exactly the sentence an
+            # operator needs to see *before* they start messaging people under that name.
+            lines.append(after)
+        if row is None:
+            saved = " ".join(str(await self.db.config(joinmsg.CONFIG_KEY, "") or "").split())
+            lines.append(
+                "the message: "
+                + (f"saved wording, {len(saved)} chars — {saved[:120]}" if saved else
+                   "nothing is saved yet, so 📩 Join message has to fill the wording in first")
+            )
+            lines.append("campaign: not started")
+        else:
+            lines.append(f"the message: {row.get('message_template') or '(empty)'}")
+            lines.append(
+                f"campaign: {row['status']}, {int(row.get('sent') or 0)} sent, {int(row.get('failed') or 0)} failed"
+            )
+            # Two facts, two sentences: what the campaign did, and what is sitting in the table un-sent.
+            unreleased = int(row.get("unreleased") or 0)
+            if unreleased:
+                lines.append(
+                    f"{unreleased} person(s) have a row and no message from an earlier attempt. Starting the"
+                    " campaign is what says they are owed one, so ✅ below includes them; nothing already sent"
+                    " is sent again."
+                )
+        gap = writers.campaign_gap_seconds(row or {})
+        lines.append(
+            f"pace: one message every {gap:g} seconds, and it keeps going until you tap \u23f8 Stop after"
+            " this one. Nobody is written to twice."
+        )
+        if row is not None:
+            # Whether the sender is actually awake for this campaign, in the same place the operator is
+            # looking for it. "It is on, so why has nobody been DM'd" can only be answered by the loop that
+            # does the sending, and the tap that follows has to be the one that fixes what it reports.
+            schedule = self._campaign_sending_line(int(row["id"]))
+            if schedule:
+                lines.append(schedule.strip())
+        choices = []
+        if row is not None:
+            # The one knob this screen offers. It asks for a number rather than carrying one, because the
+            # value is the operator's to type — a row of preset buttons is how a simple thing gets
+            # complicated, and the label says what is set today so the tap is never a guess.
+            choices.append({
+                "label": f"⏱ Set delay ({writers.campaign_gap_seconds(row):g} s)",
+                "prompt": "delay",
+                "row": console.row_ref("d", int(destination["id"])),
+            })
+        if row is None or str(row.get("status")) in {"draft", "paused", "failed"}:
+            choices.append({"label": "▶️ Start sending", "command": f"/joinreq start #{destination['id']}"})
+        else:
+            choices.append({"label": "⏸ Stop after this one", "command": f"/joinreq stop #{destination['id']}"})
+            choices.append({"label": "▶️ Keep going", "command": f"/joinreq start #{destination['id']}"})
+        # Two buttons used to live here: `🔁 Send to those N` for the contacts an earlier attempt had
+        # recorded without messaging, and `▶️ Run the queue` for a service whose worker was off. The first is
+        # what the ✅ below now does on its own, and the second was a queue control on a screen about DMs —
+        # sending does not go through the queue, so neither belongs on this screen any more.
+        choices.append({"label": "✏️ Change the message", "screen": "joinmsg"})
+        choices.append({"label": "📨 Other channels", "command": "/joinreq"})
+        return await self._joinreq_screen(lines, choices, f"/joinreq open #{destination['id']}")
+
+    async def _joinreq_list(self) -> list[Reply]:
+        """Every publishing channel this account can actually post in, and what each one is set to do."""
+        from . import discover  # noqa: PLC0415
+
+        dialogs = await self._discover_dialogs(verify_rights=True)
+        if isinstance(dialogs, str):
+            return [Reply(f"{dialogs}\n\n{self._JOINREQ_USAGE}")]
+        roles = {
+            str(one.get("id")): discover.role_of(one)
+            for one in dialogs
+            if isinstance(one, Mapping) and one.get("id") is not None
+        }
+        rows = list(await self.db.fetch(self._CONSOLE_DEST_SQL + " order by d.id") or [])
+        lines = [f"{len(rows)} publishing channel(s) are on record, and the rights were read now."]
+        choices: list[dict] = []
+        for row in rows:
+            role = roles.get(str(row.get("telegram_channel_id"))) or roles.get(
+                str(row.get("telegram_channel_id") or "").replace("-100", "")
+            )
+            campaign = await self._joinreq_row(int(row["id"]), self._JOINREQ_CAMPAIGN)
+            state = f"{campaign['status']}, {int(campaign.get('sent') or 0)} sent" if campaign else "not started"
+            if role is None:
+                # Unread is not the same as not allowed: a channel outside the dialog list's cap, or one the
+                # session lost the cache of, still has rights that the campaign's own read will settle when
+                # it asks Telegram for the pending requests. So the tap is offered, marked as unverified —
+                # withholding it would strand a working channel over a question the run answers anyway.
+                lines.append(
+                    f"• {row.get('title') or row.get('telegram_channel_id')} — {state}; it was not in the "
+                    "channels this account listed just now, so its rights here are unverified"
+                )
+                choices.append(
+                    {"label": f"⚠️ {str(row.get('title') or row['id'])[:32]}", "command": f"/joinreq open #{row['id']}"}
+                )
+                continue
+            if role not in (discover.OWNER, discover.ADMIN):
+                # The message goes out from this account, so a channel it cannot post in cannot run a
+                # campaign. Saying which row it *is* (a source) is the fix, not a dead end.
+                lines.append(
+                    f"• {row.get('title') or row.get('telegram_channel_id')} — the account is only a "
+                    f"{role} there, so it cannot be asked to message people; 🔎 Find channels files it as a source"
+                )
+                continue
+            lines.append(f"• {row.get('title') or row.get('telegram_channel_id')} — {role}, {state}")
+            choices.append({"label": f"📨 {str(row.get('title') or row['id'])[:34]}", "command": f"/joinreq open #{row['id']}"})
+        choices.append({"label": "➕ Add a channel", "command": "/joinreq add"})
+        return await self._joinreq_screen(lines, choices, "/joinreq")
+
+    async def _joinreq_add(self) -> list[Reply]:
+        """The channels this account posts in that have no row yet — the same read /discover makes."""
+        from . import discover  # noqa: PLC0415
+
+        dialogs = await self._discover_dialogs(verify_rights=True)
+        if isinstance(dialogs, str):
+            return [Reply(f"{dialogs}\n\n{self._JOINREQ_USAGE}")]
+        plan = await discover.unfiled_channels(self.db, dialogs)
+        candidates = [one for one in plan["findings"] if one.get("use") == "destination"]
+        if not candidates:
+            return await self._joinreq_screen(
+                [
+                    "nothing new to add: every channel this account can post in is already on the list,",
+                    f"and {plan['read']} dialog(s) were read just now.",
+                ],
+                [{"label": "📨 Back to the channels", "command": "/joinreq"}],
+                "/joinreq add",
+            )
+        lines = ["pick the channel the join requests came into — it becomes that series' publishing channel:"]
+        for finding in candidates[: console.LIST_LIMIT]:
+            lines.append(
+                f"  {finding['index']}. {finding.get('title') or finding['channel']} — {finding['role']}"
+                + (f", series {finding['series']}" if finding.get("series") else "")
+            )
+        if len(candidates) > console.LIST_LIMIT:
+            lines.append(f"  … and {len(candidates) - console.LIST_LIMIT} more; /sources lists every channel")
+        choices = [
+            {"label": f"✅ {str(one.get('title') or one['channel'])[:34]}", "command": f"/joinreq file {one['index']}"}
+            for one in candidates[: console.LIST_LIMIT]
+        ]
+        return await self._joinreq_screen(lines, choices, "/joinreq add")
+
+    async def _joinreq_file(self, number: str) -> list[Reply]:
+        """File one picked channel as a destination, through discovery's writer, then open it."""
+        from . import discover  # noqa: PLC0415
+
+        dialogs = await self._discover_dialogs(verify_rights=True)
+        if isinstance(dialogs, str):
+            return [Reply(f"{dialogs}\n\n{self._JOINREQ_USAGE}")]
+        plan = await discover.unfiled_channels(self.db, dialogs)
+        wanted = (number or "").strip().lstrip("#")
+        finding = next(
+            (
+                one
+                for one in plan["findings"]
+                if one.get("use") == "destination" and str(one["index"]) == wanted
+            ),
+            None,
+        )
+        if finding is None:
+            return [Reply(
+                f"nothing on that list is numbered {wanted or '-'}, so nothing was written. "
+                "/joinreq add shows the list again."
+            )]
+        outcome = await discover.add_destination(self.db, finding)
+        note = str(outcome.get("text") or "").strip()
+        if not outcome.get("ok") and "already a destination row" not in note:
+            return [Reply(f"it could not be filed:\n{note}\n\n{self._JOINREQ_USAGE}")]
+        row_id = await discover._row_id(self.db, "app.destination", finding["channel"])
+        if row_id is None:
+            return [Reply("the row was written but cannot be read back, so the screen stays closed.")]
+        found = await self._find_destination(f"#{row_id}")
+        if isinstance(found, str) or not found:
+            return [Reply("filed, but the channel is not readable back yet — open it again in a moment.")]
+        return await self._joinreq_open(found[0], after=note or None)
+
+    async def _joinreq(self, update: Update, args: list[str]) -> list[Reply]:
+        """``/joinreq`` — the join-request campaign, startable without typing a channel or a name.
+
+        Three taps, in the order the operator described: pick the channel the requests came into (only the
+        ones this account can post in are offered, and that is read from Telegram on the spot), see the exact
+        words and who is waiting, start. `app/campaignloop.py` then works the pending list page by page at the
+        delay written on the campaign's own row (`per_message_delay_seconds`), with no hourly stop and
+        nothing to re-arm: the sender looks at the campaign again for as long as its row says it is on, so a
+        restart or a Render spin-down resumes the list by itself.
+
+        What is deliberately kept from `/campaign`: the row is still drafted from the saved `/joinmsg` wording
+        and still has to pass `confirm` — the code is computed here instead of typed, because the tap on the
+        plan *is* the reading of the plan, and an operator who never sees the words must not be able to start
+        a DM to two hundred strangers by accident.
+        """
+        from . import joinmsg  # noqa: PLC0415
+
+        if self.db is None or not getattr(self.db, "connected", False):
+            return [Reply(
+                "the database is not reachable, so there is no campaign to start. `/status` names the reason."
+            )]
+        action = (args[0].strip().casefold() if args else "plan")
+        if action in {"help", "-h", "?"}:
+            return [Reply(self._JOINREQ_USAGE)]
+        if action in {"plan", "list", "show", "refresh"}:
+            return await self._joinreq_list()
+        if action == "add":
+            return await self._joinreq_add()
+        if action == "file":
+            return await self._joinreq_file(" ".join(args[1:]).strip())
+        if action not in {"open", "start", "go", "stop", "free"}:
+            return [Reply(f"`{action}` is not something /joinreq does, so nothing was written.\n\n{self._JOINREQ_USAGE}")]
+        ref = " ".join(args[1:]).strip()
+        if not ref:
+            return [Reply(f"`{action}` needs a channel — the number on the button, or #21.\n\n{self._JOINREQ_USAGE}")]
+        found = await self._find_destination(ref)
+        if isinstance(found, str):
+            return [Reply(f"{found}\n\n{self._JOINREQ_USAGE}")]
+        if len(found) > 1:
+            return [Reply("that name matches more than one channel; use the number on the button.")]
+        destination = found[0]
+        name = self._JOINREQ_CAMPAIGN
+        handle = f"#{int(destination['id'])}"
+
+        if action == "open":
+            return await self._joinreq_open(destination)
+        if action == "free":
+            return await self._joinreq_free(destination)
+        if action == "stop":
+            return await self._campaign(update, [handle, "pause", name])
+        if action == "start":
+            if await self._joinreq_row(int(destination["id"]), name) is None:
+                drafted = await self._campaign(update, [handle, "new", name])
+                if await self._joinreq_row(int(destination["id"]), name) is None:
+                    # `new` refused — there is nothing saved to draft from, or the wording breaks a rule.
+                    # Its own sentence is the answer; starting on an empty template would be sending "".
+                    return drafted
+            planned = (await self._campaign(update, [handle, "plan", name]))[0].text
+            return await self._joinreq_screen(
+                [planned, "", "It sends at the pace printed above, and nobody is written to twice by this"
+                              " campaign."],
+                [
+                    {"label": "✅ Yes, start sending", "command": f"/joinreq go {handle}"},
+                    {"label": "🧿 Not now", "command": f"/joinreq open {handle}"},
+                ],
+                f"/joinreq start {handle}",
+            )
+        row = await self._joinreq_row(int(destination["id"]), name)
+        if row is None:
+            return [Reply(
+                "there is no campaign to start for that channel yet — 📨 open it and tap Start, which drafts "
+                "one from the saved /joinmsg wording."
+            )]
+        code = joinmsg.confirm_code(int(row["id"]), row.get("message_template"))
+        replies = await self._campaign(update, [handle, "confirm", name, code])
+        after = await self._joinreq_row(int(destination["id"]), name)
+        if after is None or str(after.get("status")) not in {"ready", "running"}:
+            # `confirm` refused — the text breaks a rule, or the row moved under us. Its own sentence is the
+            # answer, and this command has nothing to add to a start that did not happen.
+            return replies
+        from . import writers  # noqa: PLC0415
+
+        return await self._joinreq_screen(
+            [
+                replies[0].text,
+                "",
+                f"It goes out at one person every {writers.campaign_gap_seconds(after):g} seconds and it does"
+                " not stop by itself: it finishes the list or you tap ⏸. A restart picks the list up again"
+                " where it left off.",
+            ],
+            [
+                {"label": "⏸ Stop after this one", "command": f"/joinreq stop {handle}"},
+                {"label": "📨 All channels", "command": "/joinreq"},
+            ],
+            f"/joinreq go {handle}",
+        )
+
+    _DESTINATION_USAGE = (
+        "usage: /destination [<series|@handle|channel id>] [action]\n"
+        "  /destination                          every destination channel, with its buttons\n"
+        "  /destination Bleach                   one of them: what it publishes, the card post, the link\n"
+        "  /destination Bleach card 512          make message 512 the post a shareable link is made from\n"
+        "  /destination Bleach card show|clear   what is named, or stop naming it (the stored link stays)\n"
+        "  /destination Bleach campaigns         the join-request campaigns recorded for it\n"
+        "  /destination Bleach campaign new <n>  draft one from the saved /joinmsg wording\n"
+        "  /destination Bleach episodes 2 12     this series' season length (tba goes back to not claiming)\n"
+        "  /destination Bleach inplace plan      caption the files already there instead of posting links\n\n"
+        "A destination is addressed by its own channel id, its title, or the @handle of the source that "
+        "publishes into it — `app.destination` stores no username of its own, so those are the three names "
+        "it can be called by."
+    )
+
+    async def _destination(self, update: Update, args: list[str]) -> list[Reply]:
+        """`/destination` — the channel a series publishes into, and the four things it can be set to.
+
+        This command is here because the bot has been telling people about it for a round: "the card post",
+        "the campaigns", "the link" all belong to a destination row, and each was only reachable through its
+        own command with a channel named in it. So `/destination` resolves the row once — by channel id, by
+        title, or by the source handle paired with it — and hands each action to the command that already
+        owns it. Nothing is written here: `_card`, `_campaign`, `_declare` and `_inplace` stay the only
+        paths that touch those columns, which is what keeps a tap and a typed line the same write.
+        """
+        if self.db is None or not getattr(self.db, "connected", False):
+            return [Reply(
+                "the database is not reachable, so there is nothing to show about a destination channel. "
+                "`/status` names the reason."
+            )]
+        text = [a.strip() for a in args if a.strip()]
+        if not text:
+            rows, extra = await self._console_screen_rows("d")
+            screen, mark = console.destinations_screen(rows, truncated=extra)
+            return [Reply(screen, markup=mark)]
+        if text[0].casefold() in {"help", "-h", "?"}:
+            return [Reply(self._DESTINATION_USAGE)]
+        handle, rest = text[0], text[1:]
+        found = await self._find_destination(handle)
+        if isinstance(found, str):
+            return [Reply(f"{found}\n\n{self._DESTINATION_USAGE}")]
+        if len(found) > 1:
+            names = ", ".join(str(row.get("title") or row.get("id")) for row in found)
+            return [Reply(
+                f"`{handle}` matches {len(found)} destinations ({names}), so I am not picking one. Use the "
+                "channel number."
+            )]
+        row = found[0]
+        full = await self._console_row("d", int(row["id"]))
+        row = full or row
+        action = (rest[0] if rest else "show").casefold()
+        tail = rest[1:]
+        ref = str(row.get("telegram_channel_id") or "").strip()
+        if action == "show":
+            screen, mark = console.destination_screen(row)
+            return [Reply(screen, markup=mark)]
+        if not ref or ref in {"0", "None"}:
+            return [Reply(
+                "this series has a destination row but no channel id stored yet, so there is nothing to "
+                "point a card or a campaign at. The channel is built by the pipeline when the first episode "
+                "is ready — /status shows that job."
+            )]
+        if action == "card":
+            return await self._card(update, [ref, *tail])
+        if action in {"campaigns", "campaign"}:
+            return await self._campaign(update, [ref, *tail])
+        if action == "inplace":
+            return await self._inplace(update, [ref, *tail])
+        if action == "episodes":
+            series = str(row.get("series") or "").strip()
+            if not series:
+                return [Reply(
+                    "this destination row is not linked to a series title I can quote, so there is nothing "
+                    "to declare against. `/declare <series> <season> <count>` names it directly."
+                )]
+            if not tail:
+                return [Reply(
+                    f"how many episodes, and of which season? `/destination {handle} episodes 2 12`\n"
+                    f"(or `tba` as the count, to stop claiming a length for that season)"
+                )]
+            return await self._declare(update, [series, *tail])
+        return [Reply(
+            f"`{action}` is not something /destination does, so nothing was written.\n\n"
+            f"{self._DESTINATION_USAGE}"
+        )]
+
+    def _worker_is_running(self) -> bool:
+        """Whether jobs can be claimed *now*, as far as this process knows.
+
+        Three answers collapse into one: the environment's setting, what a `/worker on` or `/worker off` in
+        this chat just did, and the fact that a bot assembled without a switch cannot change anything. The
+        bot's own tap wins when it exists, because printing the environment's word after the operator turned
+        the worker on by hand would contradict the thing they just watched happen.
+        """
+        if self.worker_running is not None:
+            return bool(self.worker_running)
+        return bool(getattr(self.settings, "worker_enabled", True))
+
+    async def _worker(self, update: Update, args: list[str]) -> list[Reply]:
+        """``/worker on|off`` — run, or stop, this service's queue worker.
+
+        `WORKER_ENABLED=false` exists for one procedure (`/probe`: ask questions without a job reaching a
+        channel), and the operator is told to put it back afterwards. When that last step is missed, every
+        screen in this product says "queued" and nothing runs — so the switch lives where the mistake was
+        made. It changes only this process: the service's own environment still decides what a restart does,
+        which is the honest division — a tap in a chat should not silently reconfigure a deployment.
+        """
+        wanted = (args[0].strip().casefold() if args else "status")
+        if wanted not in {"on", "off", "status", ""}:
+            return [Reply(
+                "`/worker on` runs this service's queue worker, `/worker off` stops it, `/worker status`"
+                " just reports. Nothing is written to your channels either way."
+            )]
+        running = self._worker_is_running()
+        if wanted == "status" or self.worker_switch is None:
+            if wanted != "status" and self.worker_switch is None:
+                return [Reply(
+                    "this service has no worker switch wired up, so I cannot change it from here —"
+                    f" WORKER_ENABLED on the service is the switch, and it says {'on' if running else 'off'}."
+                )]
+            return [Reply(
+                f"queue worker: {'running in this service' if running else 'OFF — jobs are written and never run'}"
+                + ("" if self.worker_switch is not None else " (no switch wired up here)")
+                + ".\n"
+                + "WORKER_ENABLED is what a restarted service comes back with; this tap changes only the"
+                " process that is running now."
+            )]
+        note = await self.worker_switch(wanted == "on")
+        self.worker_running = wanted == "on"
+        if wanted == "off":
+            # Said by the bot and not left to the callback's wording, because "the worker is off" is a state
+            # an operator can walk into by accident and walk out of only if the sentence says how.
+            note += "\n/worker on starts it again; a restarted service obeys WORKER_ENABLED either way."
+        counts = ""
+        try:
+            queue = await self.db.queue_health()
+            if queue:
+                counts = f"\nqueued: {int(queue.get('queued') or 0)}, running: {int(queue.get('running') or 0)}"
+        except Exception:  # noqa: BLE001  - the count is a courtesy, not the answer
+            counts = ""
+        return [Reply(f"{note}{counts}")]
+
+    async def _status(self, update: Update, args: list[str]) -> list[Reply]:
+        lines = [
+            f"mode: {self.settings.mode.value}",
+            f"outbound telegram actions: {self.settings.outbound_enabled}",
+            f"queue worker in this service: {'running' if self._worker_is_running() else 'OFF'}",
+        ]
+        if self.settings.telegram_session_string is not None:
+            lines.append("session: TELEGRAM_SESSION_STRING")
+        elif self.settings.telegram_session_source in ("database", "both"):
+            lines.append("session: read from app.telegram_session (/sessions to list)")
+        # Stated before anything else about the queue, because almost every "nothing happened" in this
+        # project has been this line: a container that cannot reach the database still answers the chat,
+        # so a report that lists queues would look healthy while writing to any of them is impossible.
+        if self.db is None:
+            lines.append("database: this process has no connection at all")
+        elif not getattr(self.db, "connected", False):
+            why = getattr(self.db, "last_error", None)
+            lines.append("database: not connected" + (f" ({str(why)[:120]})" if why else ""))
+        else:
+            lines.append("database: connected")
+        if self.db is not None and getattr(self.db, "connected", False):
+            queue = await self.db.queue_health() or {}
+            state = await self.db.fetchrow(_SERVICE_STATE_SQL)
+            lines.append(
+                "queue: "
+                + ", ".join(
+                    f"{k}={v}"
+                    for k, v in queue.items()
+                    if k in ("queued", "running", "blocked", "failed", "succeeded_1h")
+                )
+            )
+            lines.append(
+                f"paused: {bool(state and state['paused'])}"
+                + (f" ({state['reason']})" if state and state["reason"] else "")
+            )
+            blocked = await self.db.fetch(
+                "select kind, count(*) as n, max(left(coalesce(last_error,''),90)) as why from app.job "
+                "where status = 'blocked' group by kind order by count(*) desc"
+            )
+            if blocked:
+                lines.append("blocked:")
+                for row in blocked:
+                    lines.append(f"  {row['kind']} x{row['n']} — {row['why']}")
+            pending_review = await self.db.fetchval(
+                "select count(*) from app.thumbnail_review where status = 'pending'"
+            )
+            if pending_review:
+                lines.append(f"thumbnails awaiting your decision: {pending_review}")
+            # The noticeboard the operator runs beside every series channel. It is in /status
+            # rather than only in the docs because the two halves of "can we announce" are easy to
+            # satisfy one at a time — a channel named, a box unapproved — and a line that prints
+            # both refuses to look ready when it is not.
+            from .linkprovider import status_line as _updates_status  # noqa: PLC0415
+
+            lines.append(
+                _updates_status(
+                    await self.db.config("updates.channel", ""),
+                    await self.db.config("updates.per_episode", True),
+                )
+            )
+            # The other queue the operator has to drain by hand, grouped by *why*: a
+            # files-only channel parks four hundred candidates for one missing statement,
+            # and "400 × cannot determine Hindi audio" is answered by one /source command,
+            # while 400 separate rows would look like 400 separate problems.
+            parked = await self.db.fetch(
+                "select coalesce(reason, '(no reason recorded)') as why, count(*) as n"
+                "  from app.source_candidate where disposition = 'pending'"
+                " group by why order by count(*) desc limit 3"
+            )
+            if parked:
+                lines.append("files parked, waiting on you:")
+                for row in parked:
+                    lines.append(f"  x{row['n']} — {str(row['why'])[:70]}")
+                if any("Hindi audio" in str(row["why"]) for row in parked):
+                    lines.append(
+                        "  if this channel is a shelf of bare files: /source <@handle> audio hindi"
+                    )
+            # These decide what gets published at all, and the last one decides whether anybody
+            # is contacted at all, so they belong on the one screen the operator reads.
+            settings = await self.db.fetch(
+                "select key, value::text as value from app.config "
+                "where key in ('thumbnail.strict_mode','thumbnail.on_no_clean_candidate',"
+                "'ingest.require_hindi_audio','ingest.include_subbed_only','caption.button_rows',"
+                "'caption.total_episodes_unknown','joinrequest.message','discover.auto') "
+                "order by key"
+            )
+            if settings:
+                lines.append("settings:")
+                for row in settings:
+                    lines.append(f"  {row['key']} = {str(row['value'])[:60]}")
+        else:
+            lines.append("database: NOT CONNECTED — set DATABASE_URL")
+        return [Reply("\n".join(lines))]
+
+    async def _pause(self, update: Update, args: list[str]) -> list[Reply]:
+        reason = " ".join(args)[:200] or "paused from the control bot"
+        await self.db.set_paused(True, reason)
+        return [Reply(f"paused. {reason}\nNothing will be claimed; a job already running finishes its current stage.")]
+
+    async def _resume(self, update: Update, args: list[str]) -> list[Reply]:
+        await self.db.set_paused(False)
+        return [Reply("resumed. The queue loop will claim again on its next poll.")]
+
+    async def _reconcile(self, update: Update, args: list[str]) -> list[Reply]:
+        from .keys import reconciliation_key
+        from .stages import JobKind
+
+        reclaimed = await self.db.release_expired_locks()
+        job = await self.db.enqueue(
+            JobKind.RECONCILIATION.value,
+            f"{reconciliation_key()}:bot:{int(time.time())}",
+            payload={"trigger": "control-bot"},
+            priority=5,
+        )
+        job_id = int((job or {}).get("id") or 0) if isinstance(job, dict) else int(job or 0)
+        note = ""
+        if await self._discover_auto():
+            # Said out loud because the reconcile job is where auto mode does its work: the operator should
+            # be able to tell, from this reply alone, whether their roles were re-read just now or whether
+            # the number above is the only thing that moved.
+            note = "\n\nauto discovery is on, so this run also re-reads your channel roles as it goes."
+        return [Reply(f"reclaimed {reclaimed} stale lease(s); job {job_id} queued{note}")]
+
+    async def _probe(self, update: Update, args: list[str]) -> list[Reply]:
+        if not self.settings.outbound_enabled:
+            return [Reply(self._probe_gate_reply())]
+        if self.background is None:
+            return [Reply("probe is not wired in this build")]
+        self.background(self._probe_task(update.chat_id))
+        return [
+            Reply(
+                "probe started. It asks the bots their menu questions and sends the report here "
+                "when it finishes (usually under two minutes)."
+            )
+        ]
+
+    def _probe_gate_reply(self) -> str:
+        """Name the one thing standing between the operator and a probe, and what a probe costs.
+
+        The probe is the check they want to run *before* trusting the service with their channels, and it
+        is the one read that cannot happen in shadow mode: it sends ``/start`` to the storage bot and to
+        Channel Help from the logged-in account, and app/probe.py owns that policy alone. Saying only
+        "go live" would push them to flip the mode, and flipping the mode starts the queue -- so the
+        refusal carries the half that makes the flip safe. Everything else about a missing session is
+        already refused at boot (``app/config.py``), so the second sentence is the rare one and stays short:
+        a live session whose source moved after boot is reported by name, not diagnosed further.
+        """
+        if self.settings.mode.value != "live":
+            return (
+                "the probe needs a live user session, and only the mode is in the way: this service is "
+                "running in shadow mode, where nothing is sent to Telegram at all.\n\n"
+                "A probe does send. It opens the two bots from the logged-in account and reads their "
+                "menus back, which is why it waits for live mode -- and live mode also starts the job "
+                "queue. So change both halves together in Render:\n"
+                "APP_MODE=live\n"
+                "WORKER_ENABLED=false\n\n"
+                "save, wait for the restart, then send /probe. With the worker off no job is claimed, so "
+                "nothing can reach your channels while the questions are being asked. When the report is "
+                "in your hands, set WORKER_ENABLED back to true.\n\n"
+                "/status shows what the service can see right now."
+            )
+        return (
+            "the probe needs an open user session and cannot get one from this deployment: it sends from "
+            "the logged-in account, so the auth information and a session to use both have to be in place. "
+            "/status names which one is missing, and nothing was sent to the bots."
+        )
+
+    async def _probe_task(self, chat_id: int) -> None:
+        from .telegram_client import probe_once
+
+        try:
+            report = await probe_once(self.settings, self.db, send=False)
+            await self.api.send(chat_id, scrub(format_report_text(report), *self._live_secrets()))
+        except Exception as exc:  # noqa: BLE001 - the operator must hear about it, not find silence
+            await self.api.send(chat_id, scrub(f"probe failed: {type(exc).__name__}: {str(exc)[:200]}"))
+
+
+    _JOINMSG_USAGE = (
+        "usage: /joinmsg [show|options|use <n>|set <text>|clear]\n"
+        "  /joinmsg              what is saved now, and what that does and does not allow\n"
+        "  /joinmsg options      three drafts to pick from, each with what it promises\n"
+        "  /joinmsg use 2        save one of them as the message\n"
+        "  /joinmsg set <text>   save your own words ({name} and {series} are filled in)\n"
+        "  /joinmsg clear        empty it — the app may contact nobody\n\n"
+        "Saving a message does not send one. This command only chooses the words; the sending is a\n"
+        "campaign per channel, started from 📨 Who is waiting (or /joinreq), one person at a time at the\n"
+        "delay set on that campaign, and nobody twice. It never approves or declines a join request."
+    )
+
+    async def _joinmsg(self, update: Update, args: list[str]) -> list[Reply]:
+        """``/joinmsg [show|options|use <n>|set <text>|clear]`` — the join-request wording.
+
+        The operator asked for options in the bot rather than a row to edit by hand, on 2026-08-29:
+        *"jisse mujhe kabhi bhi kuch bhi bolna ho to mai bol paau sabhi se"*. So the setting lives
+        here and the rules live in :mod:`app.joinmsg`, which refuses an invite link in a DM, refuses
+        wording that reads like an approval, and refuses a placeholder it cannot fill.
+
+        What this command pointedly does not do is send. The message is a *setting*; the act of
+        contacting people is the blocked job kind, and the refusal is printed in the same reply as
+        the confirmation, so "saved" can never be misread as "on its way".
+        """
+        from . import joinmsg  # noqa: PLC0415  (one-way import, like .inplace above)
+
+        action = (args[0].strip().casefold() if args else "show")
+        if action in {"help", "?"}:
+            return [Reply(self._JOINMSG_USAGE)]
+
+        if action in {"show", "options"}:
+            current = await self.db.config(joinmsg.CONFIG_KEY, "") if self.db is not None else ""
+            if action == "options":
+                # Three drafts, and now three buttons: the wording is the operator's choice either way,
+                # and a tap on a phone is the difference between picking a message and not bothering.
+                return [Reply(joinmsg.options_text(current), markup=keyboards.joinmsg_choices())]
+            note = joinmsg.status_note(current)
+            body = " ".join(str(current or "").split())
+            if not body:
+                return [Reply(f"{note}\n\n{self._JOINMSG_USAGE}")]
+            return [
+                Reply(
+                    f"{note}\n\nSaved text ({len(body)} chars):\n{body}\n\n"
+                    "Placeholders filled at send time: " + ", ".join(joinmsg.PLACEHOLDERS)
+                )
+            ]
+
+        if self.db is None or not getattr(self.db, "connected", False):
+            return [Reply("the database is not reachable, so I cannot save a message.")]
+
+        if action == "use":
+            if len(args) < 2 or not args[1].strip().isdigit():
+                return [Reply(f"`use` needs a number from the options list.\n{self._JOINMSG_USAGE}")]
+            index = int(args[1].strip())
+            if not 1 <= index <= len(joinmsg.PRESETS):
+                return [
+                    Reply(
+                        f"there are {len(joinmsg.PRESETS)} options, not {index}. "
+                        "Run /joinmsg options to see them."
+                    )
+                ]
+            preset = joinmsg.PRESETS[index - 1]
+            text, note = preset.text, f"\nWhat it promises: {preset.note}"
+        elif action == "set":
+            text = " ".join(args[1:]).strip()
+            note = ""
+            if not text:
+                return [Reply(f"`set` needs the words themselves.\n{self._JOINMSG_USAGE}")]
+        elif action == "clear":
+            if len(args) > 1:
+                return [Reply("`clear` takes no arguments — it is the one that stops everything.")]
+            text, note = "", ""
+        else:
+            return [Reply(f"I do not know `/joinmsg {args[0]}`.\n{self._JOINMSG_USAGE}")]
+
+        if text:
+            problems = joinmsg.refusals(text)
+            if problems:
+                return [Reply("I will not save that:\n" + "\n\n".join(f"• {p}" for p in problems))]
+        import json  # noqa: PLC0415  (only the writer needs the encoder)
+
+        await self.db.execute(
+            "insert into app.config (key, value, description) values ($1, $2::jsonb, $3)"
+            " on conflict (key) do update set value = excluded.value, updated_at = now()",
+            joinmsg.CONFIG_KEY,
+            json.dumps(text),
+            "Set from the control bot with /joinmsg on 2026-08-29; the wording and its rules are "
+            "app/joinmsg.py, and an empty value means the app may contact no requester.",
+        )
+        if not text:
+            return [Reply("cleared. nobody is contacted, and a campaign would have nothing to say.")]
+        return [
+            Reply(
+                f"saved ({len(' '.join(text.split()))} chars). Nobody has been written to yet — this "
+                f"only sets the words, and the sending starts per channel from 📨 Who is waiting "
+                f"(or /joinreq), one person at a time at the delay set on that campaign.{note}"
+            )
+        ]
+
+    async def _sessions(self, update: Update, args: list[str]) -> list[Reply]:
+        rows = await list_sessions(self.db)
+        if not rows:
+            return [Reply("no stored sessions. /login <name> +<phone> to add one.")]
+        lines = ["stored sessions (contents are never shown here):"]
+        for row in rows:
+            marker = "●" if row["active"] else "○"
+            who = f"@{row['username']}" if row.get("username") else f"id={row.get('account_id')}"
+            lines.append(f"  {marker} {row['name']} · {row['kind']} · {who} · {row['length_chars']} chars")
+        return [Reply("\n".join(lines))]
+
+    async def _use(self, update: Update, args: list[str]) -> list[Reply]:
+        from .sessions import activate
+
+        if not args:
+            return [Reply("usage: /use <name>  (see /sessions)")]
+        if not valid_name(args[0]):
+            return [Reply("that is not a session name. /sessions lists what exists.")]
+        ok = await activate(self.db, args[0])
+        if not ok:
+            names = ", ".join(row["name"] for row in await list_sessions(self.db)) or "(none)"
+            return [Reply(f"unknown session name {args[0]!r}. I have: {names}")]
+        return [
+            Reply(
+                f"{args[0]} is now the active session. No restart needed: the next connect reads it."
+            )
+        ]
+
+    async def _forget(self, update: Update, args: list[str]) -> list[Reply]:
+        if not args:
+            rows = await list_sessions(self.db)
+            names = ", ".join(row["name"] for row in rows) or "(none)"
+            return [Reply(f"which session? usage: /forget <name>. I have: {names}")]
+        removed = await forget_session(self.db, args[0])
+        if not removed:
+            return [Reply(f"nothing stored under {args[0]!r}.")]
+        return [
+            Reply(
+                f"deleted {args[0]} from the database.\n\nThat does NOT sign the account out of "
+                "Telegram. To actually revoke it: Telegram → Settings → Privacy and Security → "
+                "Devices → terminate that session (or all devices), then log in again."
+            )
+        ]
+
+    async def _declare(self, update: Update, args: list[str]) -> list[Reply]:
+        """``/declare <series> <season> <count|tba>`` — the owner states a season's length.
+
+        This command exists because of one line in the caption box: ``◎ Total Episodes``.
+        The database column is the only honest source for that number, and nothing can
+        learn it from a source channel — a show on a one-week break looks exactly like a
+        finished one from the inside. So the number is *said*, here, and until it is said
+        the caption prints the hedge and the season batch post does not fire.
+
+        Refuses to guess which series is meant, in both directions: a substring that
+        matches two rows gets listed instead of written, and a season with no episodes yet
+        is created rather than dropped, because declaring "25" before episode 1 arrives is
+        the useful direction for that number to travel in.
+        """
+        if self.db is None or not getattr(self.db, "connected", False):
+            return [Reply("the database is not reachable, so I cannot record a season length.")]
+        if len(args) < 2:
+            return [
+                Reply(
+                    "usage: /declare <series> <season> <episodes>\n"
+                    "  /declare dekin no mogura 1 12\n"
+                    "  /declare dekin no mogura 2 tba   (back to not claiming a length)\n\n"
+                    "Until a season is declared, the caption says TBA and the complete-season "
+                    "batch post stays held — I will not infer a total from the highest episode number."
+                )
+            ]
+        # Series titles contain spaces, so the two numbers are read from the *end*:
+        # count last, season before it, everything else is the title. `/declare bleach 13`
+        # is season 1 with thirteen episodes, because the alternative — refusing until the
+        # operator learns a separator — is a command nobody sends correctly on a phone.
+        count_token = args[-1]
+        season_number, series_words = 1, args[:-1]
+        if len(args) >= 3:
+            trailing = _int_or_none(args[-2])
+            if trailing is not None:
+                season_number, series_words = trailing, args[:-2]
+        series = " ".join(series_words).strip()
+        if not series:
+            return [Reply("which series? usage: /declare <series> <season> <episodes>")]
+        if season_number is None or season_number < 0:
+            return [Reply("the season has to be a number, e.g. /declare bleach 2 13")]
+        from .keys import normalize_title
+
+        slug = normalize_title(series.lstrip("@"))
+        rows = await self.db.fetch(
+            """
+            select id, title, normalized_title from app.series
+             where normalized_title = $1 or normalized_title like '%' || $2 || '%'
+             order by id limit 6
+            """,
+            slug,
+            slug,
+        )
+        if not rows:
+            return [
+                Reply(
+                    f"no series stored that matches {series!r}. I only declare against a series "
+                    "I have already filed episodes for; /status shows what exists."
+                )
+            ]
+        if len(rows) > 1:
+            names = "\n".join(f"  · {row['title']}" for row in rows)
+            return [Reply(f"that matches more than one series, so I am not picking:\n{names}")]
+        series_id = int(rows[0]["id"])
+        clear = count_token.strip().lower() in {"tba", "none", "clear", "-"}
+        count = None if clear else _int_or_none(count_token)
+        if count is not None and count <= 0:
+            count = None
+            clear = True
+        if count is None and not clear:
+            return [Reply(f"{count_token!r} is not a number of episodes. Use /declare {series} {season_number} 12")]
+        declared_first, declared_last = await self._declaration_bounds(series_id, season_number, count)
+        await self.db.execute(
+            """
+            insert into app.season (series_id, season_number, first_episode, last_episode, declared_by)
+            values ($1, $2, $3, $4, 'operator')
+            on conflict (series_id, season_number) do update
+               set first_episode = excluded.first_episode,
+                   last_episode  = excluded.last_episode,
+                   declared_by   = excluded.declared_by,
+                   declared_at   = now(),
+                   updated_at    = now()
+            """,
+            series_id,
+            season_number,
+            declared_first,
+            declared_last,
+        )
+        title = rows[0]["title"]
+        count_label = "tba" if clear else str(count)
+        if clear:
+            return [
+                Reply(
+                    f"{title} season {season_number}: length undeclared again. Captions print the "
+                    "TBA line and no batch post goes out for it."
+                )
+            ]
+        span = "" if clear else f" (season {season_number}, episodes {declared_first}-{declared_last})"
+        return [
+            Reply(
+                f"{title} season {season_number}: declared {count_label} episodes{span}.\n\n"
+                "◎ Total Episodes prints that from the next post, and the season now *counts as "
+                "complete* once every episode in the span has a file behind it. This command "
+                "publishes nothing by itself: turning that eligibility into the permanent batch "
+                "post is the publisher's job, and the publish layer is still unwired, so the post "
+                "will not appear silently ahead of the code that is meant to send it. If the source "
+                f"later delivers episode {count + 1}, I will tell you rather than quietly rewriting "
+                "your number."
+            )
+        ]
+
+    async def _source(self, update: Update, args: list[str]) -> list[Reply]:
+        """``/source <@handle|channel id> [series <name>] [audio <kind>] [season <n>]``.
+
+        For the channels that are a shelf of files rather than a captioned source: each
+        message says ``episode 7`` and nothing else, so the series, the language and the
+        season cannot be read out of anything. The pipeline will not guess them — a guessed
+        series names a 30k-member channel, and a guessed language publishes a subbed file as
+        a Hindi one — so this command is where those three facts come from: stated once per
+        channel instead of once per file.
+
+        The reply also says what this command does *not* do. It re-decides nothing by itself:
+        parked files are re-read on the next scan, decided files are never rewritten.
+        """
+        handle = (args[0].strip() if args else "")
+        if not handle or handle.lower() in {"help", "?"}:
+            # Usage first, and with no database required: someone asking how the command
+            # works must not be answered with an infrastructure error.
+            return [Reply(self._SOURCE_USAGE)]
+        if self.db is None or not getattr(self.db, "connected", False):
+            return [Reply("the database is not reachable, so I cannot record a channel declaration.")]
+
+        # One verb of its own, so that "start watching this channel" is never a side effect of a
+        # command that was asking what a channel carries. That was the whole reason the bot refused
+        # to create rows at all; the operator's answer on 2026-08-29 was that they would not keep
+        # opening a dashboard to click through a form, and they are the owner of the database.
+        if args[1:2] and args[1].strip().casefold() == "add":
+            return await self._source_add(handle, args[2:])
+
+        keys = self._SOURCE_KEYS
+        tokens = args[1:]
+        flips: dict[str, tuple[sourcecfg.Toggle, bool]] = {}
+        wanted: dict[str, object] = {}
+        index = 0
+        while index < len(tokens):
+            key = tokens[index].strip().casefold()
+            if key == "clear":
+                wanted = {name: None for name in keys}
+                index = len(tokens)
+                break
+            toggle = sourcecfg.parse_toggle(key)
+            if toggle is not None:
+                if toggle.name in flips:
+                    return [Reply(f"you gave me `{toggle.name}` twice — which one did you mean?")]
+                word = tokens[index + 1].strip().casefold() if index + 1 < len(tokens) else ""
+                if word in sourcecfg.ON_WORDS:
+                    flips[toggle.name] = (toggle, True)
+                elif word in sourcecfg.OFF_WORDS:
+                    flips[toggle.name] = (toggle, False)
+                else:
+                    return [Reply(
+                        f"`{toggle.name}` needs on or off — I read `{word or 'nothing'}` as neither."
+                        f"\n{self._SOURCE_USAGE}"
+                    )]
+                index += 2
+                continue
+            if key not in keys and key != "title":
+                return [
+                    Reply(
+                        f"I only take {', '.join(keys)}, title, {' / '.join(sourcecfg.TOGGLES)} or clear "
+                        f"after the channel — not `{tokens[index]}`.\n{self._SOURCE_USAGE}"
+                    )
+                ]
+            pieces: list[str] = []
+            index += 1
+            while index < len(tokens) and tokens[index].strip().casefold() not in keys and (
+                sourcecfg.parse_toggle(tokens[index].strip().casefold()) is None
+            ):
+                pieces.append(tokens[index])
+                index += 1
+            if not pieces:
+                return [Reply(f"`{key}` needs a value.\n{self._SOURCE_USAGE}")]
+            if key in wanted:
+                return [Reply(f"you gave me `{key}` twice — which one did you mean?")]
+            wanted[key] = " ".join(pieces).strip()
+
+        rows = await self._find_source_channel(handle)
+        if isinstance(rows, str):  # a message to send instead of a lookup result
+            return [Reply(rows)]
+        if not rows:  # `refuse=False` never returns here; the refusal above always answers first
+            return [Reply(sourcecfg.setup_refusal(handle))]
+        if len(rows) > 1:
+            listed = "\n".join(
+                f"  {row['id']}: @{row['username'] or '?'} — {row['title'] or 'no title'}" for row in rows
+            )
+            return [Reply(f"`{handle}` matches {len(rows)} channels, so I will not pick one:\n{listed}")]
+        channel = rows[0]
+
+        problems = await self._check_declarations(wanted)
+        if problems:
+            return [Reply(problems)]
+
+        # `title` is not a declaration and does not live in a `declared_*` column: it is the row's own
+        # name, the one `/status` prints. It is offered after `add` because `add` refuses to write a
+        # second row for a channel that has one — and a channel added by number arrives with no title at
+        # all, so without this verb the only way to name it would be the dashboard this command exists
+        # to keep people out of.
+        titled = wanted.pop("title", None)
+        if titled is not None:
+            await self.db.execute(
+                "update app.source_channel set title = $2, updated_at = now() where id = $1",
+                int(channel["id"]),
+                str(titled).strip()[:120] or None,
+            )
+        if wanted:
+            columns = [name for name in keys if name in wanted]
+            sets = ", ".join(f"declared_{name} = ${position + 2}" for position, name in enumerate(columns))
+            await self.db.execute(
+                f"update app.source_channel set {sets}, declared_by = 'operator', declared_at = now(),"
+                " updated_at = now() where id = $1",
+                channel["id"],
+                *[wanted[name] for name in columns],
+            )
+        flipped: list[str] = []
+        for toggle, state in flips.values():
+            await sourcecfg.set_flag(self.db, int(channel["id"]), toggle, state)
+            flipped.append(f"  {toggle.name}: {toggle.on_text if state else toggle.off_text}")
+        # The title is folded back in only for the reply, so the header can say what was updated: it
+        # reads as an unchanged screen otherwise, and "nothing happened" is the wrong thing to conclude
+        # from a command that did write.
+        summary = self._source_summary(channel, dict(wanted, title=titled) if titled else wanted)
+        if flipped:
+            summary += "\n\nswitched:\n" + "\n".join(flipped) + "\n"
+            summary += (
+                "each one wrote a single column of that row, and the same words switch it back. the "
+                "file messages themselves were not touched, so nothing that already went out changes."
+            )
+        # The buttons carry the words, so this line and a tap are the same command by construction.
+        # `channel` is the row as it read *before* the write, and that is deliberate: the labels say
+        # where each switch would go from what the operator was just shown, and the fresh state arrives
+        # with the next reply.
+        return [Reply(summary, markup=keyboards.source_switches(handle, channel))]
+
+    async def _source_add(self, handle: str, rest: list[str]) -> list[Reply]:
+        """Create the source-channel row the operator used to be sent to a dashboard for.
+
+        Deliberately not part of `_source`'s normal path: this is the one write in the command that
+        decides something outside the database — from this line forward, files arriving in that channel
+        are something to read. Everything else about the row is a default that can be switched.
+        """
+        series = None
+        title = None
+        index = 0
+        while index < len(rest):
+            word = rest[index].strip().casefold()
+            if word not in {"series", "title"} or index + 1 >= len(rest):
+                return [Reply(
+                    f"`add` takes the channel and, if you want them now, `series <name>` and "
+                    f"`title <text>` — not `{rest[index]}`.\n{self._SOURCE_USAGE}"
+                )]
+            pieces = []
+            index += 1
+            while index < len(rest) and rest[index].strip().casefold() not in {"series", "title"}:
+                pieces.append(rest[index])
+                index += 1
+            value = " ".join(pieces).strip()
+            if not value:
+                return [Reply(f"`{word}` needs a value.\n{self._SOURCE_USAGE}")]
+            if word == "series":
+                series = value
+            else:
+                title = value
+
+        rows = await self._find_source_channel(handle, refuse=False)
+        if isinstance(rows, str):
+            return [Reply(rows)]
+        if rows:
+            row = rows[0]
+            return [Reply(
+                f"that channel is already configured (row {row['id']}, "
+                f"{row.get('title') or row.get('username') or 'no title'}), so I wrote nothing — "
+                "adding it twice would only put two sources in front of the same files.\n\n"
+                f"{sourcecfg.flags_line(row)}\n\n"
+                f"to change any of that: /source {handle} <name> on|off, or /source {handle} "
+                "series <name> to declare what it carries. the switches are under this message too.",
+                markup=keyboards.source_switches(handle, row),
+            )]
+
+        entity, problem = await self._resolve_channel_entity(handle)
+        if entity is None and problem and not handle.lstrip("-").isdigit():
+            # A @handle cannot be inserted without Telegram's answer: the channel number is the only
+            # thing that names the channel, and inventing one from a username is the guess this program
+            # refuses to make. A number the operator typed is allowed through unverified instead, and
+            # `render_plan` says so out loud rather than hiding it.
+            return [Reply(
+                f"I cannot write a row for `{handle}` yet: {problem}\n"
+                "a @handle has no channel number until Telegram says one, and I will not guess it. "
+                "either send me the number (the -100xxxxxxxxxx form your channel's t.me link and "
+                "/status both use) or make this deployment live and send me the handle again."
+            )]
+        plan = sourcecfg.plan_new(handle, entity=entity, title=title, series=series)
+        if isinstance(plan, str):
+            return [Reply(plan)]
+        new_id = await sourcecfg.insert_channel(self.db, plan)
+        if new_id is None:
+            return [Reply(
+                "somebody configured that channel number in the last few seconds — the table holds one "
+                "row per channel, so mine was dropped. /status is the one to read now."
+            )]
+        return [Reply(
+            f"watching it (row {new_id}).\n\n{sourcecfg.render_plan(plan)}\n\n"
+            "next, if you want the rest of the pipeline: /source "
+            f"{handle} series <name> audio <kind>, and /status shows the queue it lands in.\n"
+            "or tap a switch below — a tap is the same command, typed for you.",
+            markup=keyboards.source_switches(handle, plan),
+        )]
+
+    async def _resolve_channel_entity(self, handle: str) -> tuple[dict | None, str | None]:
+        """Ask Telegram who a @handle is. ``({id, username, title}, None)`` or ``(None, why not)``.
+
+        Its own client, for the reason `app.telegram_client.probe_once` gives: a failure here must not
+        be able to take the worker's connection down with it. One call, no menu questions, so this is
+        seconds rather than the minutes a probe costs — and it sends nothing to anyone.
+        """
+        if handle.lstrip("-").isdigit():
+            return None, "you gave me a number, which needs no checking to be written down"
+        if not getattr(self.settings, "outbound_enabled", False):
+            return None, "this deployment is in shadow mode, so it cannot ask Telegram anything"
+        from .telegram_client import TelegramUserClient
+
+        wrapper = TelegramUserClient(settings=self.settings, db=self.db)
+        try:
+            client = await wrapper.start()
+            raw = await client.get_entity(handle.lstrip("@"))
+        except Exception as exc:  # noqa: BLE001 - an entity lookup failing is a fact, not a crash
+            return None, f"Telegram would not answer for `{handle}` ({type(exc).__name__})"
+        finally:
+            await wrapper.stop()
+        checked = sourcecfg.channel_entity(raw)
+        if isinstance(checked, str):
+            return None, checked
+        return checked, None
+
+    # `title` is parsed with these words but is not one of them: it writes `title`, not `declared_title`.
+    _SOURCE_KEYS = ("series", "audio", "season")
+    _SOURCE_USAGE = (
+        "usage: /source <@handle or channel id> [series <name>] [audio <kind>] [season <n>]\n"
+        "  /source @anime_uploads4u add           (start watching it — the row is written here)\n"
+        "  /source @anime_uploads4u add series Bleach   (and say what it carries, in the same line)\n"
+        "  /source @anime_uploads4u series Bleach audio hindi\n"
+        "  /source @anime_uploads4u season 2      (a numbering default, never a season claim)\n"
+        "  /source @anime_uploads4u               (show what is declared and what is switched)\n"
+        "  /source @anime_uploads4u gate off      (switches: gate, subs, watch — each on or off)\n"
+        "  /source @anime_uploads4u title Bleach HQ   (what this bot calls the row, and one series\n"
+        "                                        "
+        "signal when no series is declared)\n"
+        "  /source @anime_uploads4u clear         (stop assuming anything)\n\n"
+        "audio is one of: hindi, dual, multi, subbed, subbed_only, unknown.\n"
+        "the switches write the three columns this program reads: gate is require_hindi_audio, "
+        "subs is include_subbed, watch is mode (on is full, off is ignore). priority and is_joined "
+        "are in the table and have no toggle, because nothing here acts on them."
+    )
+
+    _INPLACE_USAGE = (
+        "usage: /inplace <@handle or channel id> [from <@other>] [plan|off]\n"
+        "  /inplace @naruto_hindi                  caption the files already in that channel\n"
+        "  /inplace @naruto_hindi plan             show the plan, change nothing\n"
+        "  /inplace @naruto_hindi from @uploads4u  also compare with that source, to fill gaps\n"
+        "  /inplace @naruto_hindi off              back to the link route\n\n"
+        "in-place means one thing only: the approved caption is written on the message that "
+        "already holds the file, instead of onto a copy. nothing is deleted, and nothing is "
+        "skipped — storage, the link and the post all still happen, and a destination channel is "
+        "still created when it does not exist, because a channel of bare files is not one."
+    )
+
+    async def _inplace(self, update: Update, args: list[str]) -> list[Reply]:
+        """``/inplace <channel> [from <other>] [plan|off]`` — caption the file messages in place.
+
+        The other shape of this service, for the case the operator described: a channel whose
+        messages already are the posts, each saying nothing but ``episode 7``. This command
+        records the mode and shows the plan it implies. It never touches Telegram, and it says so:
+        the edits themselves are the user session's job, and the publish layer is unwired.
+
+        What this command deliberately does *not* offer is a way out of the rest of the job. The
+        mode adds an act (the caption, on the message that exists) and removes none: the file is
+        still handed to storage, a link still comes back, and a post is still made in the channel
+        named from the series — which is built when missing, since bare files sitting in a channel
+        never make it a destination.
+        """
+        from . import inplace  # noqa: PLC0415  (see the module's import policy: one-way, no cycle)
+
+        handle = (args[0].strip() if args else "")
+        if not handle or handle.lower() in {"help", "?"}:
+            return [Reply(self._INPLACE_USAGE)]
+        if self.db is None or not getattr(self.db, "connected", False):
+            return [Reply("the database is not reachable, so I cannot record a publish mode.")]
+
+        tokens = [token.strip() for token in args[1:]]
+        other = ""
+        if tokens and tokens[0].casefold() == "from":
+            if len(tokens) < 2 or not tokens[1]:
+                return [Reply(f"`from` needs the other channel's @handle or id.\n{self._INPLACE_USAGE}")]
+            other = tokens[1]
+            tokens = tokens[2:]
+        if len(tokens) > 1:
+            return [Reply(f"one of plan or off, not both.\n{self._INPLACE_USAGE}")]
+        flag = tokens[0].casefold() if tokens else ""
+        if flag not in {"", "plan", "off"}:
+            return [Reply(f"I did not understand `{tokens[0]}`.\n{self._INPLACE_USAGE}")]
+
+        rows = await self._find_source_channel(handle)
+        if isinstance(rows, str):
+            return [Reply(rows)]
+        if len(rows) > 1:
+            listed = "\n".join(
+                f"  {row['id']}: @{_col(row, 'username', '?')} — {_col(row, 'title', 'no title')}" for row in rows
+            )
+            return [Reply(f"`{handle}` matches {len(rows)} channels, so I will not pick one:\n{listed}")]
+        channel = rows[0]
+
+        destination = await self.db.fetchrow(
+            """
+            select id, telegram_channel_id, title, series_id, publish_mode,
+                   coalesce(paired_source_channel_id, -1) as paired_source_channel_id
+              from app.destination
+             where id = $1 or ($2::bigint is not null and telegram_channel_id = $2)
+             order by id
+             limit 1
+            """,
+            _col(channel, "destination_id", -1),
+            _col(channel, "telegram_channel_id"),
+        )
+        if destination is not None and "id" not in destination:  # a fake row with no destination
+            destination = None
+
+        plan_rows = await self._inplace_rows(channel, destination)
+        if flag == "off":
+            # Turning the mode off is always allowed and never blocked by a rights check: it asks
+            # for no write at all, and a refusal here would strand a channel in a mode the
+            # operator has just decided against.
+            return await self._inplace_off(channel, destination, handle)
+
+        # "files already posted here" is about the media, not about the row count: a channel of
+        # text posts is not an in-place destination no matter how many messages it has.
+        files_already_there = any(bool(row.get("is_media")) for row in plan_rows)
+        # Rights first, mode second. The operator's rule is that being able to caption in place
+        # never replaces building a destination: if we are a member here, or have never read our
+        # own rights, this channel is a source and the destination is created (or already exists)
+        # — so the command says that and writes nothing, rather than switching a mode that no
+        # publisher could honour.
+        route = inplace.route_for(
+            we_are_admin=_col(channel, "we_are_admin"),
+            files_already_there=files_already_there,
+            destination_exists=destination is not None,
+            series=_col(channel, "declared_series") or _col(channel, "title"),
+        )
+        source_row = None
+        shape = None
+        if other:
+            source_rows = await self._find_source_channel(other)
+            if isinstance(source_rows, str):
+                return [Reply(source_rows)]
+            if len(source_rows) > 1:
+                return [Reply(f"`{other}` matches {len(source_rows)} channels — name one exactly.")]
+            source_row = source_rows[0]
+            shape = await self._inplace_shape(plan_rows, source_row)
+
+        if not route.may_caption:
+            return [Reply(self._inplace_refusal(channel, route))]
+
+        overwrite = str(await self.db.config("inplace.overwrite_notes", "ask") or "ask").casefold()
+        allow_copy = bool(await self.db.config("inplace.copy_missing", True))
+        if plan_rows:
+            decisions = inplace.plan(
+                plan_rows,
+                shape=shape,
+                allow_copy=allow_copy,
+                replace_notes=overwrite == "replace",
+                destination_id=destination["id"] if destination else None,
+            )
+            preview = self._inplace_text(channel, decisions, shape, overwrite=overwrite, route=route)
+        else:
+            # Rights are fine and there is simply nothing read yet. The mode is a setting rather
+            # than a plan, so recording it is right — inventing a count is not. A channel created
+            # before its first scan is the normal case, and this is the reply that says what will
+            # happen to it instead of refusing for lack of a number.
+            preview = (
+                "nothing from this channel has been read into the database yet, so there is no plan "
+                "to show. the mode is still the right thing to record: every file the next scan finds "
+                "gets its caption as it is filed, and /inplace "
+                f"{handle} plan will count them then."
+            )
+
+        if flag == "plan":
+            return [Reply(preview + "\n\n(plan only — nothing was changed.)")]
+
+        await self._inplace_apply(channel, destination, source_row)
+        note = ""
+        if not destination:
+            note = (
+                "\n\nthis channel has no row in app.destination yet, so the mode is recorded on the "
+                "channel itself; the destination row inherits it when it is created or linked, and "
+                "until then nothing here is published either way."
+            )
+        return [Reply(f"in-place captioning is ON for {handle}.\n\n{preview}{note}")]
+
+    async def _inplace_apply(self, channel: Any, destination: Any, source_row: Any) -> None:
+        """Record the mode, on the channel and — when there is one — on the destination row.
+
+        Two writes rather than one because the two rows answer different readers: the pipeline
+        asks its destination what it does, and a channel with no destination row yet still has to
+        know how its own files are treated. Pairing is recorded on the destination side, since a
+        source is only "paired" from the point of view of the channel it feeds.
+        """
+        await self.db.execute(
+            "update app.source_channel set publish_role = $2, updated_at = now() where id = $1",
+            channel["id"],
+            "destination" if source_row is not None else "source_and_destination",
+        )
+        if destination:
+            await self.db.execute(
+                "update app.destination set publish_mode = 'in_place_caption', updated_at = now() "
+                "where id = $1",
+                destination["id"],
+            )
+        if source_row is not None:
+            await self.db.execute(
+                "update app.source_channel set publish_role = 'source', updated_at = now() where id = $1",
+                source_row["id"],
+            )
+            if destination:
+                await self.db.execute(
+                    "update app.destination set paired_source_channel_id = $2, updated_at = now() "
+                    "where id = $1",
+                    destination["id"],
+                    source_row["id"],
+                )
+
+    async def _inplace_off(self, channel: Any, destination: Any, handle: str) -> list[Reply]:
+        """Back to the link route, leaving every already-edited post exactly as it is."""
+        await self.db.execute(
+            "update app.source_channel set publish_role = 'source', updated_at = now() where id = $1",
+            channel["id"],
+        )
+        if destination:
+            await self.db.execute(
+                "update app.destination set publish_mode = 'link_post', updated_at = now() where id = $1",
+                destination["id"],
+            )
+        return [
+            Reply(
+                f"link route again for {handle}: nothing will be written onto the posts that are "
+                "already there. I did not change any message either — an episode that already "
+                "carries our caption keeps it, and /inplace plan lists those."
+            )
+        ]
+
+    async def _inplace_rows(self, channel: Any, destination: Any) -> list:
+        """The channel's own file messages, in the shape ``app.inplace.plan`` reads.
+
+        One query per channel, not per episode: a 400-episode backlog has to be planable in a
+        single round trip, because the plan is what the operator sees before any edit is tried.
+        Every disposition is included — in this mode a file parked for want of an audio claim
+        still has a caption missing, and that is exactly what the mode is for.
+        """
+        import json
+
+        rows = await self.db.fetch(
+            """
+            select c.message_id,
+                   c.episode_number as episode,
+                   c.raw_caption    as caption,
+                   (c.media_type is not null or c.file_name is not null) as is_media,
+                   c.parsed ->> 'audio_kind' as audio_kind,
+                   c.parsed -> 'languages'   as languages,
+                   coalesce(nullif(sc.declared_series, ''), nullif(sr.title, ''), sc.title) as title,
+                   sr.subtitle as subtitle,
+                   c.season_number as season,
+                   s.first_episode as declared_first,
+                   s.last_episode  as declared_episodes,
+                   s.observed_first,
+                   s.observed_last,
+                   dp.caption_previous
+              from app.source_candidate c
+              join app.source_channel sc on sc.id = c.source_channel_id
+              left join app.series sr on sr.id = coalesce($2::bigint, sc.series_id)
+              left join app.season s on s.series_id = sr.id and s.season_number = coalesce(c.season_number, 1)
+              left join app.destination_post dp
+                     on dp.destination_id = $3 and dp.message_id = c.message_id and dp.kind = 'episode'
+             where c.source_channel_id = $1
+             order by c.episode_number nulls last, c.message_id
+            """,
+            channel["id"],
+            destination["series_id"] if destination else None,
+            destination["id"] if destination else None,
+        )
+        unknown = await self.db.config("caption.total_episodes_unknown", "TBA")
+        out = []
+        for row in rows:
+            item = dict(row)
+            languages = item.pop("languages", None)
+            if isinstance(languages, str):
+                try:
+                    languages = json.loads(languages)
+                except ValueError:
+                    languages = None
+            item["languages"] = [str(value) for value in (languages or []) if str(value).strip()]
+            item["unknown_label"] = unknown
+            out.append(item)
+        return out
+
+    async def _inplace_shape(self, plan_rows: list, source_channel: Any) -> Any:
+        """Both channels' episode numbers, as :func:`app.inplace.compare` reads them."""
+        from . import inplace
+
+        theirs = await self.db.fetch(
+            """
+            select distinct episode_number
+              from app.source_candidate
+             where source_channel_id = $1 and episode_number is not null
+             order by episode_number
+            """,
+            source_channel["id"],
+        )
+        return inplace.compare(
+            [row.get("episode") for row in plan_rows],
+            [row["episode_number"] for row in theirs],
+        )
+
+    def _inplace_refusal(self, channel: Any, route: Any) -> str:
+        """"I cannot write here" is not the same as "nothing will happen".
+
+        A refusal that stops at "no rights" is how a season ends up stranded: the operator reads
+        it as a dead end and goes looking for a way to grant access, when the actual answer is
+        that a source channel needs no access at all and a destination needs building. So the
+        reply names the thing that will happen, the name it will use, and the one command that
+        makes the naming safe.
+        """
+        name = route.name or "the destination for this series"
+        lines = ["I did not switch this channel to in-place mode.", ""]
+        lines.append(f"  {route.reason}")
+        lines.append(f"  {route.consequence()}")
+        lines.append("")
+        if route.create_destination:
+            lines.append(
+                f"what happens instead: this channel stays a source, and the destination "
+                f"`{name}` is created — private, with the profile set before anyone is involved, "
+                "@chelpbot added as admin, the one-use invite sent to you, then revoked. that step "
+                "is not skipped because an in-place mode exists, and it is not asked for "
+                "permission first: you already said a channel per finished series is automatic."
+            )
+            lines.append("")
+            lines.append(
+                "to get there, the series has to be named from two agreeing signals, so state it "
+                "once: /source <this channel> series <name> audio hindi"
+            )
+        else:
+            lines.append(
+                "what happens instead: the destination already exists for this series, so posts "
+                "go there through Channel Help, and this channel only feeds it files. nothing to "
+                "create, nothing to caption here."
+            )
+        if not route.rights_verified:
+            lines.append("")
+            lines.append(
+                "(this session has never read its rights in this channel, so I am taking the narrow "
+                "answer. /probe reads them out of the dialog list and records them in "
+                "app.source_channel.we_are_admin — run it and this line goes away by itself. if this "
+                "really is your own channel and you want it asserted before then, set that column to "
+                "true in the dashboard and run this again: I would rather look than guess, and rather "
+                "be told than be wrong.)"
+            )
+        return "\n".join(lines)
+
+    def _inplace_text(self, channel: Any, decisions: list, shape: Any, *, overwrite: str, route: Any = None) -> str:
+        """The plan in the operator's words, with the questions on top instead of buried."""
+        from . import inplace
+
+        lines = [
+            f"what I would do with the {len(decisions)} messages of this channel:",
+            "  " + inplace.summary(decisions),
+            "  " + inplace.shape_note(shape),
+        ]
+        if route is not None:
+            lines.append(f"  mode: {route.mode}, destination created: {route.create_destination}")
+        asks = [decision for decision in decisions if decision.action == inplace.Action.ASK]
+        if asks:
+            lines.append("")
+            lines.append(f"{len(asks)} need you before I touch them:")
+            for decision in asks[:3]:
+                where = f"msg {decision.message_id}" if decision.message_id else "a file with no number on it"
+                lines.append(f"  {where}: {decision.reason}")
+            if len(asks) > 3:
+                lines.append(f"  … and {len(asks) - 3} more like that")
+        overwritten = [
+            decision for decision in decisions if "overwrite_notes" in (decision.reason or "")
+        ]
+        if overwritten:
+            lines.append("")
+            lines.append(
+                f"{len(overwritten)} of these carry a note rather than a label, and "
+                'inplace.overwrite_notes = "replace" is what wrote over it. the text it replaced '
+                "is in app.destination_post.caption_previous, which is the only copy Telegram "
+                "does not have."
+            )
+        elif any("note" in (decision.reason or "") for decision in asks):
+            lines.append("")
+            lines.append(
+                "(if every one of those notes is your own text and you want it gone, set "
+                '"inplace.overwrite_notes" to "replace" in app.config — the old caption is kept '
+                "either way.)"
+            )
+        keys = [
+            str(decision.details.get("dedup_key"))
+            for decision in decisions
+            if decision.details.get("dedup_key")
+        ]
+        if keys:
+            lines.append("")
+            lines.append(
+                f"each edit is its own job, keyed once per message ({keys[0]}): running this twice "
+                "on the same channel cannot edit the same post twice, and a restart in the middle "
+                "resumes at the first message that still needs it."
+            )
+        lines.append("")
+        lines.append(
+            "no new channel, no copy, no deletion, and no buttons under the post: a user session "
+            "cannot attach a keyboard to a video, and there is no link to put in one here, so the "
+            "caption has to stand on its own. it does — the approved box, powered-by line included."
+        )
+        lines.append(
+            "this command changed the plan, not the channel. the edits go out through the user "
+            "session, and while the publish layer is unwired that is the part still missing."
+        )
+        return "\n".join(lines)
+
+    # --- the three things a write job cannot do without ------------------------------------------
+    #
+    # `/card`, `/sticker` and `/campaign` exist because `app/writers.py` refuses to guess the same
+    # three facts: which post a shareable link was made for, which message carries a season's sticker,
+    # and when a campaign of DMs to strangers is allowed to run. Each command writes a row, shows what
+    # it wrote, and never sends anything itself.
+
+    _CARD_USAGE = (
+        "usage: /card <@handle, channel id or title> <message id>\n"
+        "  /card -1001234567890 42      the card post in that destination, message 42\n"
+        "  /card @bleach_hindi 42       same, by the channel's own handle\n"
+        "  /card @bleach_hindi show     what is recorded, and whether a link was ever returned\n"
+        "  /card @bleach_hindi clear    stop announcing that channel\n"
+        "  /card                        every destination and its card state\n\n"
+        "the card is the post we forward to the link bot to get a shareable link; the announcements "
+        "channel carries that link and never the invite itself. The message id is a number inside "
+        "that channel — copy it from Copy Link, where it is the digits after /."
+    )
+
+    async def _find_destination(self, handle: str) -> list | str:
+        """Look a destination channel up by id, title, or the handle of the source paired with it.
+
+        `app.destination` stores no username of its own, so a `@handle` is matched through the source
+        channel that publishes into it — which is how the operator names these channels anyway.
+        """
+        stripped = handle.lstrip("@")
+        # `#21` addresses the row by its own number, which is what a button knows and not what a human types.
+        # A bare number stays the channel id — `app.destination.id` is unique, but a typed `21` means the
+        # Telegram number far more often than it means a row, and the row number has to be asked for by name.
+        row_ref = stripped[1:] if stripped.startswith("#") else None
+        numeric = int(stripped) if stripped.lstrip("-").isdigit() and stripped != "-" else None
+        rows = await self.db.fetch(
+            """
+            select d.id, d.title, d.telegram_channel_id, d.publish_mode, d.card_message_id,
+                   d.announcement_link, d.announcement_link_at, sr.title as series
+              from app.destination d
+              join app.series sr on sr.id = d.series_id
+              left join app.source_channel sc on sc.destination_id = d.id
+             where ($1::bigint is not null and d.telegram_channel_id = $1)
+                or ($2::text is not null and lower(btrim(coalesce(d.title, ''))) = lower($2))
+                or ($2::text is not null and lower(btrim(coalesce(sc.username, ''), '@')) = lower($2))
+                or ($3::int is not null and d.id = $3)
+             order by d.id
+            """,
+            numeric,
+            stripped,
+            int(row_ref) if row_ref and row_ref.isdigit() else None,
+        )
+        if not rows:
+            return (
+                f"`{handle}` matches no destination channel, by its row number (`#21`), its own id, its "
+                "title, or the source channel that publishes into it. /destinations lists what exists, and "
+                "📨 Who is waiting adds a channel this account can post in without leaving the buttons."
+            )
+        return list(rows)
+
+    @staticmethod
+    def _card_line(row: dict) -> str:
+        card = row.get("card_message_id")
+        link = row.get("announcement_link")
+        state = f"card message {card}" if card else "no card message named"
+        got = f", link recorded {link}" if link else ", no link recorded yet"
+        return f"• {row.get('title') or row.get('series')} ({row.get('telegram_channel_id')}): {state}{got}"
+
+    async def _card(self, update: Update, args: list[str]) -> list[Reply]:
+        """``/card <channel> <message id|show|clear>`` — the post the shareable link is made from.
+
+        One number, per destination, chosen by the operator. Everything about the announcement
+        follows from it, and nothing here asks the link bot a second time in the same run: the bot
+        answers once, to the forward, so the link that comes back is stored (`app.destination
+        .announcement_link`) and the job that could not reach it blocks instead of posting the invite.
+        """
+        if self.db is None or not getattr(self.db, "connected", False):
+            return [Reply("the database is not reachable, so I cannot record a card post.")]
+        if not args:
+            rows = await self.db.fetch(
+                "select d.id, d.title, d.telegram_channel_id, d.card_message_id, d.announcement_link,"
+                " d.announcement_link_at, null::text as series from app.destination d order by d.id limit 25"
+            )
+            if not rows:
+                return [Reply("no destination channels exist yet, so there is nothing to name.")]
+            return [Reply("\n".join(self._card_line(row) for row in rows))]
+        if args[0].strip().casefold() in {"help", "-h", "?"}:
+            return [Reply(self._CARD_USAGE)]
+        handle, rest = args[0].strip(), [a.strip() for a in args[1:]]
+        found = await self._find_destination(handle)
+        if isinstance(found, str):
+            return [Reply(f"{found}\n\n{self._CARD_USAGE}")]
+        if len(found) > 1:
+            names = ", ".join(str(row.get("title") or row.get("id")) for row in found)
+            return [Reply(f"`{handle}` matches {len(found)} destinations ({names}). Use the channel id.")]
+        row = found[0]
+        action = (rest[0] if rest else "show").casefold()
+        if action == "show" or not rest:
+            return [Reply(self._card_line(row))]
+        if action == "clear":
+            await self.db.execute(
+                "update app.destination set card_message_id = null, announcement_link = null,"
+                " announcement_link_at = now() where id = $1",
+                int(row["id"]),
+            )
+            return [Reply(
+                "card message cleared for " + str(row.get("title") or row["id"])
+                + ". The stored link is left in place on purpose: deleting is not this program's "
+                "verb, and a link that exists can still be announced until you say otherwise."
+            )]
+        if not action.isdigit():
+            return [Reply(f"`{rest[0]}` is not a message id.\n\n{self._CARD_USAGE}")]
+        await self.db.execute(
+            "update app.destination set card_message_id = $2 where id = $1",
+            int(row["id"]),
+            int(action),
+        )
+        return [Reply(
+            f"card post for {row.get('title') or row['id']} is now message {action}.\n\n"
+            "the next publish for that channel asks @Link_providerobot for a shareable link to it, "
+            "in shadow mode by planning the ask. Nothing was sent just now — this recorded a number."
+        )]
+
+    _STICKER_USAGE = (
+        "usage: /sticker <series> <season> from <@handle or channel id> <message id>\n"
+        "  /sticker Bleach 2 from @anime_uploads4u 8812\n"
+        "  /sticker Bleach 2 show          what is recorded\n"
+        "  /sticker Bleach 2 clear         no sticker for that season\n\n"
+        "Telegram addresses a sticker by the message that carries it, so a pack name or an install "
+        "link is not enough: name one message in one channel and the season sticker is forwarded from "
+        "it, before that season's first episode post."
+    )
+
+    async def _sticker(self, update: Update, args: list[str]) -> list[Reply]:
+        """``/sticker <series> <season> from <peer> <message id>`` — which sticker opens a season.
+
+        The mapping this program will not do for you: which of a pack's stickers means "season 2
+        starts here". The command stores the address and the writer forwards the message; the pack
+        url from `/sticker-pack` stays what the post *links to*, which is a different thing.
+        """
+        from . import keys  # noqa: PLC0415  (the dedup key for the job this queues)
+        from .stages import JobKind  # noqa: PLC0415
+
+        if self.db is None or not getattr(self.db, "connected", False):
+            return [Reply("the database is not reachable, so I cannot record a sticker source.")]
+        text = [a.strip() for a in args if a.strip()]
+        if not text or text[0].casefold() in {"help", "-h", "?"}:
+            return [Reply(self._STICKER_USAGE)]
+        lowered = [a.casefold() for a in text]
+        try:
+            tail = lowered.index("from")
+        except ValueError:
+            tail = -1
+        if tail < 1 or tail + 2 >= len(text):
+            if lowered[-1] in {"show", "clear"} and len(text) >= 2:
+                head, action = text[:-1], lowered[-1]
+                peers = None
+            else:
+                return [Reply(f"that is not a sticker address.\n\n{self._STICKER_USAGE}")]
+        else:
+            head, action, peers = text[:tail], "set", text[tail + 1 : tail + 3]
+
+        *series_words, season_token = head
+        series = " ".join(str(word) for word in series_words).strip()
+        if not series or not season_token.isdigit():
+            return [Reply(f"need a series name and a season number.\n\n{self._STICKER_USAGE}")]
+        season_number = int(season_token)
+        row = await self.db.fetchrow(
+            "select s.id as season_id, s.season_number, s.sticker_source_chat_id, s.sticker_source_message_id,"
+            " s.sticker_posted, sr.title, sr.id as series_id, d.id as destination_id"
+            " from app.season s join app.series sr on sr.id = s.series_id"
+            " left join app.destination d on d.series_id = sr.id"
+            " where lower(sr.title) = lower($1) and s.season_number = $2 order by s.id limit 1",
+            series,
+            season_number,
+        )
+        if row is None:
+            return [Reply(
+                f"no season {season_number} for a series called {series!r} yet. Seasons come from the "
+                "files that arrive (or from /declare); I do not create a season to hold a sticker."
+            )]
+        if action == "show":
+            state = (
+                f"source {row['sticker_source_chat_id']}#{row['sticker_source_message_id']}"
+                if row.get("sticker_source_message_id")
+                else "no source message named"
+            )
+            posted = " already posted" if row.get("sticker_posted") else ""
+            return [Reply(f"{row['title']} S{season_number}: {state}{posted}")]
+        if action == "clear":
+            await self.db.execute(
+                "update app.season set sticker_source_chat_id = null, sticker_source_message_id = null,"
+                " updated_at = now() where id = $1",
+                int(row["season_id"]),
+            )
+            return [Reply(f"sticker source cleared for {row['title']} S{season_number}.")]
+        peer_text, message_id = peers
+        numeric = peer_text.lstrip("@")
+        if not numeric.lstrip("-").isdigit():
+            found = await self.db.fetchrow(
+                "select telegram_channel_id from app.source_channel"
+                " where lower(btrim(coalesce(username, ''), '@')) = lower($1) order by id limit 1",
+                numeric,
+            )
+            if found is None:
+                return [Reply(
+                    f"I do not know a channel called {peer_text!r}, and a sticker must be forwarded "
+                    "from a channel this program already reads or publishes to. Give me the numeric id "
+                    "if the handle is not one of those."
+                )]
+            chat_id = int(found["telegram_channel_id"])
+        else:
+            chat_id = int(numeric)
+        await self.db.execute(
+            "update app.season set sticker_source_chat_id = $2, sticker_source_message_id = $3,"
+            " updated_at = now() where id = $1",
+            int(row["season_id"]),
+            chat_id,
+            int(message_id),
+        )
+        queued = None
+        if row.get("destination_id") is not None:
+            queued = await self.db.enqueue(
+                JobKind.SEASON_STICKER.value,
+                keys.sticker_key(int(row["season_id"])),
+                payload={"season_id": int(row["season_id"]), "destination_id": int(row["destination_id"])},
+                season_id=int(row["season_id"]),
+                destination_id=int(row["destination_id"]),
+            )
+        return [Reply(
+            f"{row['title']} S{season_number} will open with the sticker in {chat_id}#{message_id}."
+            + (
+                "\n\nthe sticker job is queued; in shadow mode it plans the forward and blocks with "
+                "the plan, which is the point of the run."
+                if queued
+                else "\n\nnothing is queued: that series has no destination channel row to post into."
+            )
+        )]
+
+    _CAMPAIGN_USAGE = (
+        "usage: /campaign <channel> [new <name> | text <name> <words…> | plan <name> |"
+        " confirm <name> <code> | gap <name> <seconds> | pause <name> | abort <name>]\n"
+        "  /campaign @bleach_hindi new wave1      draft it from the saved /joinmsg wording\n"
+        "  /campaign @bleach_hindi plan wave1       who would be contacted, and the code\n"
+        "  /campaign @bleach_hindi confirm wave1 4F2A   let it run\n"
+        "  /campaign @bleach_hindi gap wave1 7          how far apart two messages go, in seconds\n\n"
+        "a campaign messages people whose join request is still pending, one message each, at the delay the"
+        " campaign's own row says, and it goes on until the list is empty or `⏸ Stop` is tapped. It is the only job kind here that contacts a stranger, so it "
+        "takes two deliberate steps and an unreadable-by-accident code; aborting leaves every row in "
+        "place, and a contact is never contacted twice."
+    )
+
+    async def _campaign(self, update: Update, args: list[str]) -> list[Reply]:
+        """``/campaign`` — draft, plan, confirm. Two human steps before any DM goes out.
+
+        The plan is computed from the same two sources the sender will use — `app.sender`'s read of the
+        channel's pending requests and `app.joinmsg`'s refusal rules — so what the operator reads is
+        not a promise about the sending but the first half of it. The read is real even in shadow mode,
+        because reading a list is not a write; sending still needs `confirm`, and in shadow mode it
+        plans and blocks until the deployment is live.
+        """
+        from . import joinmsg, writers  # noqa: PLC0415  (the pace number lives with the sender)
+
+        if self.db is None or not getattr(self.db, "connected", False):
+            return [Reply("the database is not reachable, so I cannot draft a campaign.")]
+        text = [a.strip() for a in args if a.strip()]
+        if not text or text[0].casefold() in {"help", "-h", "?"}:
+            return [Reply(self._CAMPAIGN_USAGE)]
+        handle, rest = text[0], text[1:]
+        found = await self._find_destination(handle)
+        if isinstance(found, str):
+            return [Reply(f"{found}\n\n{self._CAMPAIGN_USAGE}")]
+        if len(found) > 1:
+            return [Reply("that handle matches more than one destination; use the channel id.")]
+        destination = found[0]
+        action = (rest[0] if rest else "list").casefold()
+
+        async def _row(name: str) -> dict | None:
+            return await self.db.fetchrow(
+                "select id, name, status, message_template, per_message_delay_seconds,"
+                " confirm_required"
+                " from app.join_campaign where destination_id = $1 and lower(name) = lower($2)",
+                int(destination["id"]),
+                name,
+            )
+
+        if action == "list":
+            from . import writers  # noqa: PLC0415  (the pace default lives with the loop it paces)
+
+            rows = await self.db.fetch(
+                "select c.name, c.status, c.per_message_delay_seconds,"
+                " (select count(*) from app.join_campaign_contact k where k.campaign_id = c.id"
+                "   and k.status = 'sent') as sent"
+                " from app.join_campaign c where c.destination_id = $1 order by c.id",
+                int(destination["id"]),
+            )
+            if not rows:
+                return [Reply(f"no campaigns for {destination.get('title') or destination['id']} yet.")]
+            lines = [
+                f"• {row['name']}: {row['status']}, {row['sent']} sent, one message every"
+                f" {writers.campaign_gap_seconds(row):g} s"
+                for row in rows
+            ]
+            return [Reply("\n".join(lines))]
+
+        if action in {"new", "text"}:
+            if len(rest) < 2:
+                return [Reply(f"`{action}` needs a name.\n\n{self._CAMPAIGN_USAGE}")]
+            name = rest[1]
+            body = " ".join(rest[2:]).strip() if action == "text" else ""
+            if action == "new":
+                body = str(await self.db.config(joinmsg.CONFIG_KEY, "") or "").strip()
+                if not body:
+                    return [Reply(
+                        "there is no saved wording to draft from — /joinmsg options, then /joinmsg use "
+                        "<n> or /joinmsg set <text>. A campaign with no text is not an empty campaign, "
+                        "it is no campaign."
+                    )]
+            problems = joinmsg.refusals(body)
+            if problems:
+                return [Reply("I will not save that:\n" + "\n\n".join(f"• {p}" for p in problems))]
+            existing = await _row(name)
+            if existing is not None and action == "new":
+                return [Reply(
+                    f"`{name}` already exists ({existing['status']}). Use `text {name} <words>` to "
+                    "rewrite it, or pick another name — a campaign is not overwritten by accident."
+                )]
+            if existing is not None:
+                await self.db.execute(
+                    "update app.join_campaign set message_template = $2, updated_at = now()"
+                    " where id = $1",
+                    int(existing["id"]),
+                    body,
+                )
+                campaign_id = int(existing["id"])
+            else:
+                inserted = await self.db.fetchrow(
+                    "insert into app.join_campaign (destination_id, name, message_template, status)"
+                    " values ($1, $2, $3, 'draft') returning id",
+                    int(destination["id"]),
+                    name,
+                    body,
+                )
+                campaign_id = int(inserted["id"])
+            return [Reply(
+                f"campaign `{name}` saved as a draft (id {campaign_id}), {len(body)} chars.\n\n"
+                f"plan it: /campaign {handle} plan {name}"
+            )]
+
+        if action == "gap":
+            # The one number the operator asked to own: how far apart two messages go. It is the campaign's
+            # own `per_message_delay_seconds`, which is what the sender sleeps between two people. It is the
+            # only pace number there is: nothing about it sizes a run or hands a list on, because a campaign
+            # has no queue row — `app/campaignloop.py` works the list until the row says otherwise.
+            if len(rest) < 3:
+                asked = await _row(self._JOINREQ_CAMPAIGN)
+                if asked is None:
+                    return [Reply(
+                        "there is no campaign on that channel yet, so there is no delay to set. `/joinreq"
+                        " open` starts one from the saved wording."
+                    )]
+                question = (
+                    "how far apart should two messages go?\n\nSend the number of seconds on its own — 7 is"
+                    f" seven seconds. Right now it is {writers.campaign_gap_seconds(asked):g} seconds.\n\n"
+                    "One second is the fastest I will write: messages sent back to back are what gets an"
+                    " account restricted, and the account is what has to keep working.\n\n"
+                    "✖ /cancel leaves it as it is."
+                )
+                if update is None:
+                    # No chat to hold a question for, so the number goes on the command instead. The typing
+                    # path and the tap path are the same command either way; only the asking differs.
+                    return [Reply(
+                        f"{question}\n\nor type it out: /campaign {handle} gap {self._JOINREQ_CAMPAIGN} 7"
+                    )]
+                self.console_owed[int(update.chat_id)] = (
+                    "delay",
+                    console.row_ref("d", int(destination["id"])),
+                )
+                return [Reply(question)]
+            name = rest[1]
+            campaign = await _row(name)
+            if campaign is None:
+                return [Reply(
+                    f"there is no campaign `{name}` on {destination.get('title') or destination['id']}, so"
+                    " there is no spacing to set. `/joinreq open` starts one from the saved wording."
+                )]
+            typed = str(rest[2]).strip().lower().removesuffix("s").strip()
+            try:
+                value = float(typed)
+            except ValueError:
+                return [Reply(
+                    f"`{rest[2]}` is not a number of seconds, so nothing was changed. Send just the number"
+                    " — 7"
+                )]
+            if not writers.JOIN_GAP_MIN_SECONDS <= value <= writers.JOIN_GAP_MAX_SECONDS:
+                return [Reply(
+                    f"{value:g} seconds is not something I will write. One second is the floor, because a DM"
+                    f" list sent back to back is what gets an account restricted, and"
+                    f" {writers.JOIN_GAP_MAX_SECONDS:g} is the most this row can hold."
+                )]
+            await self.db.execute(
+                "update app.join_campaign set per_message_delay_seconds = $2, updated_at = now()"
+                " where id = $1",
+                int(campaign["id"]),
+                value,
+            )
+            gap = writers.campaign_gap_seconds({**campaign, "per_message_delay_seconds": value})
+            return [Reply(
+                f"`{name}` on {destination.get('title') or destination['id']}: one message every {gap:g}"
+                " seconds, and the campaign keeps going until you tap ⏸ Stop after this one. Nobody who was"
+                " sent to is sent to again, and the list is worked through page by page — a restart resumes"
+                " it rather than starting over."
+                "\n\nA run that is sending right now keeps the spacing it started with; the next one uses"
+                " this."
+            )]
+
+        if action in {"plan", "confirm", "pause", "abort"}:
+            if len(rest) < 2:
+                return [Reply(f"`{action}` needs a name.\n\n{self._CAMPAIGN_USAGE}")]
+            name = rest[1]
+            campaign = await _row(name)
+            if campaign is None:
+                return [Reply(f"no campaign called `{name}` for that channel. /campaign {handle} list")]
+
+            if action == "plan":
+                total, listed, why = await self._pending_requests(
+                    str(destination.get("telegram_channel_id") or "")
+                )
+                schedule = self._campaign_sending_line(int(campaign["id"]))
+                if total is None:
+                    pending = (
+                        "\n\nthe pending requests could not be read from this account right now: "
+                        f"{why}\nthe job reads them again when it runs, so this plan shows the rules and "
+                        "not the headcount."
+                    )
+                else:
+                    pending = f"\n\n{total} join request(s) are waiting right now"
+                    if listed is not None and listed < total:
+                        pending += (
+                            f" — this look reached {listed} of them, and the sender works through the list a"
+                            " page at a time without stopping"
+                        )
+                code = joinmsg.confirm_code(campaign["id"], campaign["message_template"])
+                return [Reply(
+                    f"campaign `{name}` ({campaign['status']}) on "
+                    f"{destination.get('title') or destination['id']}:\n\n"
+                    f"• text: {campaign['message_template']}\n"
+                    f"• one message every {writers.campaign_gap_seconds(campaign):g} seconds, and it goes"
+                    " on until the list is empty or you tap ⏸ Stop after this one"
+                    f"{schedule}\n"
+                    f"• nobody is contacted twice, and a message never approves or declines the request"
+                    f"{pending}\n\n"
+                    f"to run it: /campaign {handle} confirm {name} {code}\n"
+                    f"the code is that campaign and that exact text; change the wording and it changes."
+                )]
+
+            if action == "confirm":
+                if len(rest) < 3:
+                    return [Reply(f"`confirm` needs the code `plan` printed.\n\n{self._CAMPAIGN_USAGE}")]
+                wanted = joinmsg.confirm_code(campaign["id"], campaign["message_template"])
+                if rest[2].strip().upper() != wanted:
+                    return [Reply(
+                        f"that is not the code for `{name}`. Run /campaign {handle} plan {name} — and "
+                        "no, I will not tell you the code here: the point of typing it is that you read "
+                        "the plan first."
+                    )]
+                problems = joinmsg.refusals(campaign["message_template"])
+                if problems:
+                    return [Reply("that text breaks a rule, so it will not be sent:\n" + "\n".join(f"• {p}" for p in problems))]
+                await self.db.execute(
+                    "update app.join_campaign set status = 'ready', updated_at = now() where id = $1",
+                    int(campaign["id"]),
+                )
+                # The tap that starts a campaign is also the human answer to its oldest stuck state: contacts
+                # an earlier attempt wrote a row for and never messaged, which every later pass had to skip
+                # because a row is the promise that nobody is written to twice. They are owed a message, and
+                # this is the one moment that can be said out loud — the screen just showed the wording and the
+                # count, and the operator tapped ✅. So the release happens here rather than behind a second
+                # button nobody asked for, and `app/writers.py` keeps the rules about what a release is.
+                released = await writers.campaign_release_unsent(self.db, int(campaign["id"]))
+                # Nothing is queued, because a campaign no longer runs through the queue at all:
+                # `app/campaignloop.py` looks at `app.join_campaign` every few seconds and works on whatever
+                # says it is on. That is the whole difference for the operator — no row to be swallowed by a
+                # dedup key, no timer to re-arm, and a restart resumes from the list itself.
+                contacts = int(
+                    await self.db.fetchval(
+                        "select count(*) from app.join_campaign_contact where campaign_id = $1",
+                        int(campaign["id"]),
+                    )
+                    or 0
+                )
+                watch = await self._campaign_watch()
+                return [Reply(
+                    f"`{name}` is on — ready, and sending starts within a few seconds."
+                    + (
+                        f"\n{contacts} person(s) already carry a record under this campaign, and they will"
+                        " not be written to twice."
+                        if contacts
+                        else ""
+                    )
+                    + (
+                        f"\n{released} of them had a row and no message from an earlier attempt. This start"
+                        " says they are owed one, and they are in this run like anybody else."
+                        if released
+                        else ""
+                    )
+                    + "\n\n"
+                    + (
+                        "It sends one message at a time, spaced by the delay on this campaign's own row, and"
+                        " it works the whole list rather than a slice of it — until the list is empty or you"
+                        " tap ⏸ Stop after this one."
+                        if getattr(self.settings, "outbound_enabled", False)
+                        else "In shadow mode each message plans and blocks, which is the read-only version of"
+                        " the same pass."
+                    )
+                    + self._campaign_sending_line(int(campaign["id"]))
+                    + (("\n\n" + "\n".join(watch)) if watch else "")
+                )]
+
+            status = {"pause": "paused", "abort": "aborted"}[action]
+            # Two parameters, not one used twice. `set status = $2 ... case when $2 = 'aborted'` asks
+            # Postgres to make $2 the enum type and a text value at the same time, and it refuses rather
+            # than guessing: the statement never parses, so /campaign pause was dead on arrival. The
+            # explicit cast names the type on the way in, and the flag is a plain boolean.
+            await self.db.execute(
+                "update app.join_campaign set status = $2::app.campaign_status, updated_at = now(),"
+                " finished_at = case when $3 then now() else finished_at end where id = $1",
+                int(campaign["id"]),
+                status,
+                action == "abort",
+            )
+            return [Reply(
+                f"`{name}` is {status}. The sender stops at its next look, which is between two people at the"
+                " most. Contacts already sent stay sent — this program does not un-send a message to a"
+                " stranger, and it does not delete the record of one."
+                + self._campaign_sending_line(int(campaign["id"]))
+            )]
+
+        return [Reply(f"I do not know `/campaign {handle} {rest[0]}`.\n\n{self._CAMPAIGN_USAGE}")]
+
+
+
+    _ARCHIVE_USAGE = (
+        "usage: /archive [<@handle or channel id> add [title <name>]]\n"
+        "  /archive                          which archive rows are recorded, and which one is primary\n"
+        "  /archive @master_archive add title \"Bleach master\"   (start the list)\n\n"
+        "the archive is the private channel every file is copied into first, so it is the one channel "
+        "this program will not choose for you: it holds the only spare copy. The first row added is the "
+        "primary one; a second row waits its turn, because app/writers.py picks the archive by "
+        "`is_primary` and two primaries would make the choice Postgres's to make."
+    )
+
+    async def _archive(self, update: Update, args: list[str]) -> list[Reply]:
+        """``/archive`` to read, ``/archive <channel> add [title <name>]`` to write.
+
+        This is the row `docs/pending-inputs.md` has been asking for by hand. The operator's answer on
+        2026-08-29 was that a form in a database dashboard was not the interface they wanted for the
+        whole setup, and the two rows the pipeline is waiting on are the same shape of row — so both
+        are writable from here now, with the same refusal to invent anything the table needs.
+        """
+        if args and args[0].strip().lower() in {"help", "?"}:
+            return [Reply(self._ARCHIVE_USAGE)]
+        if self.db is None or not getattr(self.db, "connected", False):
+            return [Reply("the database is not reachable, so I cannot read or write the archive list.")]
+
+        rows = await self.db.fetch(
+            "select id, telegram_channel_id, title, is_primary from app.archive_channel order by id"
+        )
+        # With no channel in front of it the command is a read, so it falls through to the list below.
+        handle = args[0].strip() if args else ""
+        if handle.casefold() in {"list", "show"}:
+            handle = ""
+        if handle.casefold() == "add":
+            # The word typed first, which is a guessable mistake and worth one line to correct. An
+            # exact match, not a prefix: `@additional_uploads` is a channel handle, and a bot that
+            # treated it as a stray keyword would be refusing to see a real channel.
+            return [Reply(
+                "`add` comes after the channel: /archive <@handle or channel id> add title <name>.\n"
+                "bare /archive reads the list."
+            )]
+        if not handle:
+            # Reading the list is the same command without a channel in front of it, and it answers
+            # before anything is resolved: the empty case is the one the operator sees first, and it
+            # has to say what is missing in the words the job itself blocks with.
+            if not rows:
+                return [Reply(
+                    "no archive channel is recorded, so the archive job blocks with a refusal rather "
+                    f"than picking one for you.\n{self._ARCHIVE_USAGE}"
+                )]
+            listed = "\n".join(
+                f"  {'primary' if row.get('is_primary') else 'spare  '} {row.get('title') or 'no title'} "
+                f"(`{row['telegram_channel_id']}`)"
+                for row in rows
+            )
+            return [Reply(
+                f"archive channels, in the order the archive job reads them:\n{listed}\n\n"
+                "the job takes the primary row. adding another spare is the same command with a "
+                "different channel; nothing here removes one."
+            )]
+
+        rest = [token.strip() for token in args[1:]]
+        if not rest or rest[0].casefold() != "add":
+            return [Reply(
+                f"`add` comes after the channel, and a name after that: /archive {handle} add "
+                "title <what you call it>.\n"
+                "bare /archive reads the list; it writes nothing."
+            )]
+        rest = rest[1:]
+        title = None
+        if rest:
+            if rest[0].casefold() != "title" or len(rest) < 2:
+                return [Reply(
+                    f"I only take `title <name>` after `add` — not `{rest[0]}`.\n{self._ARCHIVE_USAGE}"
+                )]
+            # Quotes arrive as characters from Telegram, and a title that starts with one is a title
+            # with a quote in it: this row is read out to the operator in /status and in the archive
+            # job's block reason, so it is stored as the words they meant.
+            title = " ".join(rest[1:]).strip().strip("\"'").strip() or None
+        # A missing title is not refused here. When Telegram can answer for the handle it supplies the
+        # title, and `plan_archive` is the one place that knows whether a name arrived from either
+        # side — refusing before the ask would turn a public channel into a command that cannot work.
+
+        entity, problem = await self._resolve_channel_entity(handle)
+        if entity is None and problem and not handle.lstrip("-").isdigit():
+            return [Reply(
+                f"I cannot write an archive row for `{handle}` yet: {problem}\n"
+                "the channel number is the only thing that addresses a *private* channel, and a "
+                "@handle that Telegram will not resolve leaves me guessing. send the -100xxxxxxxxxx "
+                "number instead. For a private channel that number is the `c/<digits>` part of any of its "
+                "message links (`t.me/c/2575861262/5` is channel -1002575861262), which is how "
+                "Telegram marks it everywhere else too."
+            )]
+        plan = sourcecfg.plan_archive(handle, entity=entity, title=title, primary=not rows)
+        if isinstance(plan, str):
+            return [Reply(plan)]
+        # By channel number, which is the only key two listings of one channel share: matching on the
+        # title would call "Bleach master" and "bleach master" two archives, and matching on nothing
+        # would let the same channel be listed twice for the same files.
+        clash = next(
+            (row for row in rows if row.get("telegram_channel_id") == plan["telegram_channel_id"]), None
+        )
+        if clash is not None:
+            return [Reply(
+                f"that channel is already the archive (row {clash['id']}, "
+                f"{clash.get('title') or 'no title'}), so I wrote nothing — a second row for it would "
+                "not make a second copy, it would only make the job choose between two spellings."
+            )]
+        new_id = await sourcecfg.insert_archive(self.db, plan)
+        if new_id is None:
+            return [Reply(
+                "that channel number is already in the archive list — somebody added it a moment ago, "
+                "and the table keeps one row per channel, so mine was dropped."
+            )]
+        return [Reply(
+            f"archive row {new_id} written.\n\n{sourcecfg.render_archive_plan(plan)}\n\n"
+            "the archive job reads this row on its next run. "
+            "Nothing was copied or deleted by writing it — the first copy is a job, and jobs only run "
+            "when the worker is enabled."
+        )]
+
+    # ------------------------------------------------------------------ the console
+    #
+    # Screens are `app/console.py`'s business; this section is the two things it cannot do: read the
+    # database and run a command. The keys below are the screens a button may open, and a test
+    # (tests/test_console.py) holds this tuple against `console.NAV` in both directions, so neither a
+    # screen nobody can reach nor a button that leads nowhere can survive a refactor.
+    _CONSOLE_SCREENS = (
+        "main",
+        "sources",
+        "discover",
+        "destinations",
+        "joinreq",
+        "queue",
+        "bots",
+        "sessions",
+        "joinmsg",
+        "help",
+    )
+
+    _CONSOLE_SOURCE_SQL = (
+        "select id, username, title, telegram_channel_id, destination_id, mode, active, "
+        "require_hindi_audio, include_subbed, coalesce(declared_series, '') as declared_series, "
+        "coalesce(declared_audio, '') as declared_audio, "
+        "coalesce(declared_season, -1) as declared_season from app.source_channel "
+    )
+
+    # The destination rows the screens print. The series title is joined, not subselected, because a
+    # subselect that names `app.series` in the `from` position is a second way to ask the same question —
+    # and the destination half of `/card` already joins it this way, so both readers keep one shape.
+    _CONSOLE_DEST_SQL = (
+        "select d.id, d.title, d.telegram_channel_id, d.publish_mode, d.card_message_id, "
+        "d.announcement_link, d.announcement_link_at, d.channel_help_added, d.owner_promoted, "
+        "sr.title as series from app.destination d "
+        "join app.series sr on sr.id = d.series_id "
+    )
+
+    async def _console_row(self, kind: str, row_id: int) -> dict | None:
+        """One row, read by the table letter a payload carries — the tap's whole point, in one place.
+
+        `console.TABLES` owns the letters and this owns the SQL; nothing else gets to pair them, because the
+        failure of doing it in two places is a destination tap updating a source row — a wrong write, not a
+        wrong screen.
+        """
+        where = "where d.id = $1" if kind == "d" else "where id = $1"
+        rows = await self._console_rows(kind, where=where, args=(row_id,))
+        return rows[0] if rows else None
+
+    async def _console_screen_rows(self, kind: str) -> tuple[list, bool]:
+        """One page of a list, and whether there is more behind it.
+
+        The screen is told, not left to imply it: `app/console.py` prints the cap when the flag is set, and a
+        list that quietly stopped at 50 is the silent truncation this project refuses everywhere else.
+        """
+        rows = await self._console_rows(kind, limit=f" limit {console.LIST_LIMIT + 1}")
+        return rows[: console.LIST_LIMIT], len(rows) > console.LIST_LIMIT
+
+    async def _console_rows(
+        self, kind: str, *, where: str = "", limit: str = "", args: tuple = ()
+    ) -> list:
+        """The list form of the same read, so a screen and a command never disagree about a column."""
+        base = self._CONSOLE_DEST_SQL if kind == "d" else self._CONSOLE_SOURCE_SQL
+        order = "order by d.id" if kind == "d" else "order by id"
+        return list(await self.db.fetch(f"{base}{where} {order}{limit}", *args))
+
+    async def _console_tap(self, update: Update, payload: str) -> list[Reply]:
+        """One tap, dispatched by the prefix `app/console.py` puts on it.
+
+        Every branch here ends in either a screen or a command — never a third kind of action. The
+        pending prompt is cleared on any tap except the one that arms the next question, because a
+        button pressed after a question was asked is the operator moving on, and a stale question left
+        open would quietly hijack their next message.
+        """
+        chat = update.chat_id
+        unreadable = [
+            Reply(
+                "the database is not reachable, so this bot can show you a screen and change nothing. "
+                "that is a deployment fault, not a button fault — /status names the reason."
+            )
+        ]
+        if payload.startswith(console.PROMPT_PREFIX):
+            if self.db is None or not getattr(self.db, "connected", False):
+                return unreadable
+            parsed = console.parse_prompt(payload)
+            if parsed is None:
+                return [Reply("that button asked for something this bot no longer knows how to ask.")]
+            slot, ref = parsed
+            row = None
+            if ref is not None:
+                kind, row_id = console.parse_ref(ref) or ("s", 0)
+                row = await self._console_row(kind, row_id)
+                if row is None:
+                    return [Reply(self._console_gone(row_id, kind))]
+            self.console_owed[chat] = (slot, ref)
+            text, mark = console.waiting_screen(slot, row)
+            return [Reply(text, markup=mark)]
+
+        # Any other tap abandons a question that was left open.
+        self.console_owed.pop(chat, None)
+
+        if payload.startswith("/"):
+            # A button that carries a bare command, which is what `app/keyboards.py` has been emitting
+            # since the round before the console existed. Accepted, not upgraded: a console that broke
+            # those buttons to add a prefix of its own would be a downgrade wearing a redesign, and the
+            # prefix buys nothing here that the router does not already enforce.
+            return await self._console_run(update, payload)
+
+        if payload.startswith(console.NAV_PREFIX):
+            key = payload[len(console.NAV_PREFIX) :].strip().casefold()
+            if key not in self._CONSOLE_SCREENS:
+                return [Reply("that screen does not exist in this build. /help lists what does.")]
+            return await self._console_screen(key)
+
+        if payload.startswith(console.RUN_PREFIX):
+            return await self._console_run(update, payload[len(console.RUN_PREFIX) :])
+
+        parsed = console.parse_row(payload)
+        if parsed is None:
+            return [Reply("that button is not one this bot can read, so nothing was changed.")]
+        if self.db is None or not getattr(self.db, "connected", False):
+            return unreadable
+        kind, row_id, verb, arg = parsed
+        row = await self._console_row(kind, row_id)
+        if row is None:
+            return [Reply(self._console_gone(row_id, kind))]
+        if verb == "open":
+            text, mark = self._console_row_screen(kind, row)
+            return [Reply(text, markup=mark)]
+        if verb == "dest":
+            # The one button that crosses between the two tables, and it crosses on a stored
+            # `destination_id` rather than on a name match: which channel a source publishes into is a fact
+            # the ingest side recorded, and re-deriving it from a title here would be a second answer.
+            linked = row.get("destination_id")
+            if linked in (None, "", 0):
+                return [Reply(
+                    "this channel's files are not linked to a destination row yet, so there is nothing to "
+                    "open. The link is written when the series' own channel is created or named; until then "
+                    "/destination lists what exists and /status shows what the queue is doing."
+                )]
+            found = await self._console_row("d", int(linked))
+            if found is None:
+                return [Reply(self._console_gone(linked, "d"))]
+            text, mark = console.destination_screen(
+                found,
+                note=console.screen_note(f"/destination {found.get('telegram_channel_id')}"),
+            )
+            return [Reply(text, markup=mark)]
+        command = self._console_command(kind, row, verb, arg)
+        if command is None:
+            return [Reply(self._console_no_command(kind, row, verb))]
+        replies = await self._console_run(update, command)
+        # Re-read the row rather than describing the write: the screen the operator is shown is the
+        # database's answer, not this command's intention.
+        after = await self._console_row(kind, row_id)
+        note = console.screen_note(command, replies[0].text if replies else None)
+        if after:
+            text, mark = self._console_row_screen(kind, after, note)
+            return [*replies, Reply(text, markup=mark)]
+        return replies
+
+    def _console_row_screen(
+        self, kind: str, row: Mapping[str, Any], note: str | None = None
+    ) -> tuple[str, dict | None]:
+        """The per-row screen, chosen by the table letter. One call site for the tapped and typed views."""
+        if kind == "d":
+            return console.destination_screen(row, note=note)
+        return console.source_screen(row, note=note)
+
+    @staticmethod
+    def _console_no_command(kind: str, row: Mapping[str, Any], verb: str) -> str:
+        """Why a tap could not be turned into words, said about the row it was pressed on."""
+        where = "destination" if kind == "d" else "source"
+        if kind == "d" and row.get("telegram_channel_id") in (None, "", 0):
+            return (
+                "this series has a destination row but no channel yet, so there is nothing to point a card "
+                "or a campaign at. The channel is built by the pipeline when the first episode is ready — "
+                "/status shows that job, and it is not something to name by hand."
+            )
+        if kind == "s" and verb == "episodes":
+            return (
+                "I cannot say how many episodes a season has for this channel, because no series name is set "
+                "on it yet. Tap 🎬 Series name first — the count belongs to a series, not to a row."
+            )
+        return (
+            f"I could not turn that tap into a command, so nothing was written. `{verb}` is not something I "
+            f"know how to do to a {where} channel — the screen under it lists what I do."
+        )
+
+    async def _console_answer(self, update: Update, text: str) -> list[Reply]:
+        """The one free-text answer a screen asked for, turned back into a command.
+
+        The text is never interpreted here: it becomes the argument of a `/source` or `/joinmsg` line and
+        runs through the same refusals a typed command would hit, so the console cannot accept a value the
+        keyboard would reject.
+        """
+        slot, ref = self.console_owed.pop(update.chat_id, ("add", None))
+        value = " ".join(str(text or "").split())
+        if not value:
+            return [Reply("an empty answer changes nothing, and I did not write one.")]
+        if slot in {"archive", "archive_title"}:
+            return await self._console_archive_answer(update, slot, value)
+        if slot == "joinmsg":
+            from . import joinmsg  # noqa: PLC0415  (the module owns its own key and presets)
+
+            replies = await self._console_run(update, f"/joinmsg set {value}")
+            saved = str(await self.db.config(joinmsg.CONFIG_KEY, "") or "") if self.db is not None else ""
+            screen, mark = console.joinmsg_screen(
+                current=saved,
+                presets=[{"name": preset.name} for preset in joinmsg.PRESETS],
+                note=console.screen_note(f"/joinmsg set {value}", replies[0].text if replies else None),
+            )
+            return [*replies, Reply(screen, markup=mark)]
+        if slot == "add":
+            # A row created by an answer has no screen of its own to land on, so the list is returned:
+            # naming the new channel and setting its switches is what an operator does next, and reading the
+            # list back is also how they see a refusal was honoured.
+            replies = await self._console_run(update, f"/source {value} add")
+            # The list, capped and said to be capped exactly as the screen itself would be: an answer that
+            # lands on a shorter-looking page than the button it came from is a page that got read wrong.
+            rows, extra = await self._console_screen_rows("s")
+            screen, mark = console.sources_screen(
+                rows,
+                truncated=extra,
+                note=console.screen_note(f"/source {value} add", replies[0].text if replies else None),
+            )
+            return [*replies, Reply(screen, markup=mark)]
+        if slot == "delay":
+            # `⏱ Set delay` asked for a number and this is it. The answer is not interpreted here: it becomes
+            # the argument of the same `/campaign … gap` line a typed path runs, so the tap meets the same
+            # refusals the keyboard would, and the screen that comes back is the one they were on, with the
+            # new spacing printed on it.
+            kind, row_id = console.parse_ref(ref or "") or ("d", 0)
+            replies = await self._console_run(
+                update, f"/campaign #{row_id} gap {self._JOINREQ_CAMPAIGN} {value}"
+            )
+            return [*replies, *await self._console_run(update, f"/joinreq open #{row_id}")]
+        kind, row_id = console.parse_ref(ref or "") or ("s", 0)
+        row = await self._console_row(kind, row_id)
+        if row is None:
+            return [Reply(self._console_gone(row_id, kind))]
+        command = self._console_command(kind, row, slot, value)
+        if command is None:
+            return [Reply(self._console_no_command(kind, row, slot))]
+        replies = await self._console_run(update, command)
+        after = await self._console_row(kind, row_id)
+        if after:
+            text, mark = self._console_row_screen(kind, after, console.screen_note(command))
+            return [*replies, Reply(text, markup=mark)]
+        return replies
+
+    async def _console_archive_answer(self, update: Update, slot: str, value: str) -> list[Reply]:
+        """The two archive answers, which address no row of their own.
+
+        `/archive` takes a channel, and the channel to name is either the one being pointed at now or the
+        one already recorded — so the prompt carries no row reference and this half reads the archive row
+        itself. Naming is refused before it reaches `/archive` when there is no archive to name, because
+        "which one?" is a question the operator can only answer if we ask it.
+        """
+        if slot == "archive":
+            # The channel and what to call it, off one line. `/archive` refuses to record a row nobody can
+            # name — it is the one channel no message is read from, so nothing else gives it a title — and
+            # asking twice would leave a half-answer on disk between the two questions. A line with no name
+            # on it goes to the command anyway, so the operator reads that refusal in its own words.
+            words = value.split(maxsplit=1)
+            ref, title = (words[0], words[1].strip()) if len(words) > 1 else (value, "")
+            command = f"/archive {ref} add title {title}" if title else f"/archive {ref} add"
+        else:
+            rows = await self.db.fetch(
+                "select id, telegram_channel_id, title, is_primary from app.archive_channel order by id limit 1"
+            )
+            if not rows:
+                return [Reply(
+                    "there is no archive channel recorded yet, so there is nothing to name. Tap "
+                    "📦 Point at an archive first — that one takes the channel, and this one only renames it."
+                )]
+            current = rows[0]
+            ref = str(current.get("telegram_channel_id") or "").strip()
+            if not ref:
+                return [Reply(
+                    "the archive row has no channel id stored, so I cannot address it to rename it. "
+                    f"`/archive` shows what is recorded (row {current.get('id')})."
+                )]
+            command = f"/archive {ref} title {value}"
+        replies = await self._console_run(update, command)
+        rows = await self.db.fetch(
+            "select id, telegram_channel_id, title, is_primary from app.archive_channel order by id limit 1"
+        )
+        screen, mark = console.bots_screen(
+            storage=await self.db.config("bots.storage_username", "") or None,
+            help_bot=await self.db.config("bots.channel_help_username", "") or None,
+            link=await self.db.config("bots.link_provider_username", "") or None,
+            archive=rows[0] if rows else None,
+            note=console.screen_note(command, replies[0].text if replies else None),
+        )
+        return [*replies, Reply(screen, markup=mark)]
+
+    @staticmethod
+    def _console_command(
+        kind: str, row: Mapping[str, Any] | None, verb: str, arg: str | None
+    ) -> str | None:
+        """Turn a tap on a row into the exact line the operator could have typed.
+
+        A source is addressed by `@handle` when it has one and by its number when it does not, because those
+        are the two things `_find_source_channel` answers to. A destination has no username of its own, so it
+        is addressed by number — which is also how `_find_destination` matches it, alongside a title or the
+        handle of the source paired with it.
+
+        Every value is re-checked against the module that owns the vocabulary, never against a copy: a
+        button built from a stale list would run a command that refuses, and "refused" arriving after a tap
+        is what makes an operator stop trusting taps.
+        """
+        if not row:
+            return None
+        from .normalize import DECLARED_AUDIO  # noqa: PLC0415  (the vocabulary lives in one place)
+
+        value = " ".join(str(arg or "").split())
+        if kind == "d":
+            ref = str(row.get("telegram_channel_id") or "").strip()
+            if not ref or ref in {"0", "None"}:
+                return None
+            if verb == "card":
+                target = value.casefold()
+                if target in {"show", "clear"} or target.isdigit():
+                    return f"/destination {ref} card {target}"
+                return None
+            if verb == "campaigns" and not value:
+                return f"/destination {ref} campaigns"
+            if verb == "campaign" and value:
+                return f"/destination {ref} campaign new {value}"
+            if verb == "episodes" and value:
+                return f"/destination {ref} episodes {value}"
+            return ControlBot._console_inplace(ref, verb, value)
+        handle = str(row.get("username") or "").strip().lstrip("@")
+        ref = f"@{handle}" if handle else str(row.get("telegram_channel_id") or "")
+        if not ref or ref == "@":
+            return None
+        if verb in sourcecfg.TOGGLES:
+            target = str(arg or "").strip().casefold()
+            if target not in {"on", "off"}:
+                return None
+            return f"/source {ref} {verb} {target}"
+        if verb == "audio":
+            word = value.casefold()
+            if word not in DECLARED_AUDIO:
+                return None
+            return f"/source {ref} audio {word}"
+        if verb in {"series", "title", "season"}:
+            return f"/source {ref} {verb} {value}" if value else None
+        if verb == "episodes":
+            # `/declare` is addressed by series, not by row, so the row only supplies the name it already
+            # carries. A row with no series declared has nothing to declare about — `_console_no_command`
+            # says that out loud instead of sending an empty title at the parser.
+            series = str(row.get("declared_series") or "").strip()
+            return f"/declare {series} {value}" if series and value else None
+        return ControlBot._console_inplace(ref, verb, value)
+
+    @staticmethod
+    def _console_inplace(ref: str, verb: str, value: str) -> str | None:
+        """The three in-place taps, on either table's row. One command, two doors into it.
+
+        `on` is the bare command and not a word the operator has to know: `/inplace <channel>` already means
+        "do it", and inventing `/inplace <channel> on` would put a word in the console that a typed line
+        rejects — which is the collision this project has been burned by before.
+        """
+        if verb != "inplace":
+            return None
+        target = value.casefold()
+        if target == "on":
+            return f"/inplace {ref}"
+        if target in {"plan", "off"}:
+            return f"/inplace {ref} {target}"
+        return None
+
+    @staticmethod
+    def _console_gone(row_id: Any, kind: str = "s") -> str:
+        """What a tap on a row that is not there answers with — and it writes nothing.
+
+        The list to re-read and the button to start over are different per table, so the letter is carried
+        into the message: telling someone to read the source list because a *destination* row went away sends
+        them to the one screen that cannot show them what happened.
+        """
+        if kind == "d":
+            return (
+                f"that destination is not stored any more (no row {row_id}), so nothing was changed.\n"
+                "the screen you tapped was drawn against a row that has since gone. /destination is the list "
+                "to read now, or tap 📤 Destinations on the menu."
+            )
+        return (
+            f"that channel is not configured any more (no row {row_id}), so nothing was changed.\n"
+            "the screen you tapped was drawn against a row that has since gone. /sources is the list to read "
+            "now — or start over with ➕ Add a channel."
+        )
+
+    async def _console_run(self, update: Update, command: str) -> list[Reply]:
+        """Run a command string the way the router runs one, from a tap.
+
+        Same method, same args, same refusals, and no second implementation of any of them: that identity is
+        the entire safety argument for having a console at all. A refreshed screen is added by the caller
+        when it is the better last thing to read.
+        """
+        parts = str(command or "").strip().split()
+        if not parts or not parts[0].startswith("/"):
+            return [Reply("that button did not carry a command, so nothing ran.")]
+        name = parts[0][1:].split("@", 1)[0].casefold()
+        method = _ROUTES.get(name)
+        if method is None:
+            return [Reply(
+                f"`{command}` is not a command this build takes any more, so nothing ran. "
+                "/help lists the ones it does."
+            )]
+        return await getattr(self, method)(update, parts[1:])
+
+    async def _console_screen(self, key: str, note: str | None = None) -> list[Reply]:
+        """Render one screen, from data read now rather than cached earlier."""
+        if key == "help":
+            text, mark = console.help_screen(HELP, note=note)
+            return [Reply(text, markup=mark)]
+        if self.db is None or not getattr(self.db, "connected", False):
+            return [Reply(
+                "the database is not reachable, so there is nothing to show yet. `/status` names the "
+                "reason, and it is usually `DATABASE_URL` pointing at the transaction pooler."
+            )]
+        if key == "sources":
+            rows, extra = await self._console_screen_rows("s")
+            text, mark = console.sources_screen(rows, note=note, truncated=extra)
+            return [Reply(text, markup=mark)]
+        if key == "discover":
+            return await self._discover(None, [])
+        if key == "joinreq":
+            # The screen and the command are the same code on purpose: the tap on 📨 has to show exactly
+            # what `/joinreq` would print, including the rights read that decides which channels are offered.
+            return await self._joinreq(None, [])
+        if key == "destinations":
+            rows, extra = await self._console_screen_rows("d")
+            text, mark = console.destinations_screen(rows, note=note, truncated=extra)
+            return [Reply(text, markup=mark)]
+        if key == "sessions":
+            rows = list(await list_sessions(self.db))
+            extra = len(rows) > console.LIST_LIMIT
+            text, mark = console.sessions_screen(
+                rows[: console.LIST_LIMIT], note=note, truncated=extra
+            )
+            return [Reply(text, markup=mark)]
+        if key == "main":
+            text, mark = console.main_screen(await self._console_facts())
+            return [Reply(text, markup=mark)]
+        if key == "queue":
+            state = await self.db.fetchrow(_SERVICE_STATE_SQL)
+            queue = await self.db.queue_health() or {}
+            ready = queue.get("queued", "?")
+            paused = None if state is None else bool(state.get("paused"))
+            text, mark = console.queue_screen(
+                paused=paused,
+                reason=(state or {}).get("reason") or None,
+                ready="?" if ready is None else int(ready),
+                note=note,
+            )
+            return [Reply(text, markup=mark)]
+        if key == "bots":
+            archive = await self.db.fetch(
+                "select id, telegram_channel_id, title, is_primary from app.archive_channel order by id limit 1"
+            )
+            text, mark = console.bots_screen(
+                storage=await self.db.config("bots.storage_username", "") or None,
+                help_bot=await self.db.config("bots.channel_help_username", "") or None,
+                link=await self.db.config("bots.link_provider_username", "") or None,
+                archive=archive[0] if archive else None,
+                note=note,
+            )
+            return [Reply(text, markup=mark)]
+        from . import joinmsg  # noqa: PLC0415  (the module owns its own vocabulary, see _joinmsg)
+
+        current = await self.db.config(joinmsg.CONFIG_KEY, "") or ""
+        text, mark = console.joinmsg_screen(
+            current=current,
+            presets=[{"name": preset.name} for preset in joinmsg.PRESETS],
+            note=note,
+        )
+        return [Reply(text, markup=mark)]
+
+    async def _console_facts(self) -> dict[str, Any]:
+        """The four numbers the main screen prints, and `?` for each one it could not read.
+
+        A dash would be a zero dressed up as a fact. Every count here is a query that can fail — a
+        container that cannot reach the database still answers the chat, which is the bug that made this
+        rule necessary in the first place.
+        """
+        facts: dict[str, Any] = {
+            "mode": self.settings.mode.value,
+            "outbound": "on" if self.settings.outbound_enabled else "off",
+        }
+        # The same two reads `/status` uses, so a number cannot disagree between the menu and the
+        # report under it. `queue_health` is the db's own tally, and a count of my own here would be a
+        # second answer to the same question.
+        try:
+            facts["sources"] = await self.db.fetchval("select count(*) from app.source_channel")
+            facts["destinations"] = await self.db.fetchval("select count(*) from app.destination")
+            queue = await self.db.queue_health() or {}
+            facts["ready"] = queue.get("queued")
+            facts["blocked"] = queue.get("blocked")
+            facts["sessions"] = len(await list_sessions(self.db)) if getattr(self.db, "connected", False) else None
+        except Exception as exc:  # noqa: BLE001 - a count that fails is a `?`, never a crash in a DM
+            log.info("console counts unread: %s", str(exc)[:120])
+        for key in ("sources", "destinations", "ready", "blocked", "sessions"):
+            if facts.get(key) is None:
+                facts[key] = "?"
+            elif str(facts.get(key)).isdigit():
+                facts[key] = int(facts[key])
+        state = await self.db.fetchrow(_SERVICE_STATE_SQL)
+        if state is not None:
+            facts["paused"] = bool(state.get("paused"))
+            facts["pause_reason"] = state.get("reason") or None
+        return facts
+
+    async def _find_source_channel(self, handle: str, *, refuse: bool = True) -> list | str:
+        """Look a source channel up by @handle or numeric Telegram id.
+
+        Both, because the operator reads handles in Telegram and the database keys on the
+        numeric id, and the one case where a numeric-looking handle is actually a username
+        (`@1000hours`) is handled by matching the text form too. A stored ``@`` is trimmed on
+        our side as well: these rows are also edited by hand in the dashboard, and a row saved
+        as ``@some_channel`` must still answer to ``/source @some_channel``.
+
+        ``refuse=False`` returns an empty list instead of the "not configured" message, because the
+        ``add`` path has to be able to tell "no row yet" from "a row I may not write" — and it is the
+        caller that decides whether an absent row is an invitation.
+        """
+        stripped = handle.lstrip("@")
+        # Negative on purpose: every Telegram channel id the operator will copy out of a
+        # t.me link or a dashboard row is -100xxxxxxxxxx, and `str.isdigit()` calls that a
+        # string. The lookup matches the text form too, so `@1000hours` is still found.
+        numeric = int(stripped) if stripped.lstrip("-").isdigit() and stripped != "-" else None
+        rows = await self.db.fetch(
+            """
+            select id, username, title, telegram_channel_id, series_id, destination_id,
+                   mode, active, require_hindi_audio, include_subbed,
+                   we_are_admin, publish_role,
+                   coalesce(declared_series, '') as declared_series,
+                   coalesce(declared_audio, '') as declared_audio,
+                   coalesce(declared_season, -1) as declared_season
+              from app.source_channel
+             where ($1::text is not null and (lower(btrim(coalesce(username, ''), '@')) = lower($1)
+                                              or lower(coalesce(title, '')) = lower($1)))
+                or ($2::bigint is not null and telegram_channel_id = $2)
+             order by id
+            """,
+            stripped,
+            numeric,
+        )
+        if not rows:
+            if not refuse:
+                return []
+            return sourcecfg.setup_refusal(handle)
+        return list(rows)
+
+    async def _check_declarations(self, wanted: dict[str, object]) -> str | None:
+        """Validate before writing. A half-recorded declaration is worse than none."""
+        from .normalize import DECLARED_AUDIO, declared_audio_kind
+        from .seasons import MAX_PLAUSIBLE_SEASON
+
+        if "series" in wanted and wanted["series"] is not None:
+            text = str(wanted["series"]).strip()
+            if not text:
+                return "an empty series name would put us back to guessing from the channel title."
+            wanted["series"] = text
+        if "title" in wanted and wanted["title"] is not None:
+            # Normalised here and truncated where it is written, because the same column is filled from
+            # `add` too, and one of those two places deciding the rule is how they drift.
+            wanted["title"] = str(wanted["title"]).strip()
+        if "audio" in wanted and wanted["audio"] is not None:
+            try:
+                declared_audio_kind(str(wanted["audio"]))
+            except ValueError as error:
+                return f"I cannot record that audio value. {error}"
+            wanted["audio"] = str(wanted["audio"]).strip().casefold().replace("-", "_")
+        if "season" in wanted and wanted["season"] is not None:
+            value = _int_or_none(str(wanted["season"]))
+            if value is None or value < 0 or value > MAX_PLAUSIBLE_SEASON:
+                return (
+                    f"the season default has to be a number between 0 and {MAX_PLAUSIBLE_SEASON}. "
+                    "It is a numbering default only — it can never open a season; /declare is the "
+                    "command that states things about seasons."
+                )
+            wanted["season"] = value
+        if "audio" in wanted and wanted["audio"] is not None and str(wanted["audio"]) not in DECLARED_AUDIO:
+            return f"audio must be one of: {', '.join(sorted(DECLARED_AUDIO))}"
+        return None
+
+    def _source_summary(self, channel, wanted: dict[str, object]) -> str:
+        """What is declared now, and — the part that matters — what it does and does not unlock."""
+        current = {
+            "series": channel["declared_series"] or None,
+            "audio": channel["declared_audio"] or None,
+            # -1 is the sentinel for NULL, because a row of a fake db has no type info
+            "season": None if int(channel["declared_season"]) < 0 else int(channel["declared_season"]),
+        }
+        for name in self._SOURCE_KEYS:
+            if name in wanted:
+                current[name] = wanted[name]
+        label = channel["title"] or f"@{channel['username'] or channel['telegram_channel_id']}"
+        lines = [f"{label}: {'declarations updated' if wanted else 'as they stand'}"]
+        for name in self._SOURCE_KEYS:
+            value = current[name]
+            lines.append(f"  {name}: {value if value not in (None, '') else 'not declared'}")
+        lines.append("")
+        lines.append("switches:")
+        lines.append(sourcecfg.flags_line(channel))
+        lines.append(
+            "  `/source %s <name> on|off` flips one — gate, subs or watch."
+            % (channel.get("username") or channel["telegram_channel_id"])
+        )
+        lines.append("")
+        if current["audio"]:
+            lines.append(
+                "bare files here count as carrying that audio, and the caption's Audio line prints it "
+                "as *your* statement — recorded as audio_source = channel_declaration, so a month from "
+                "now you can tell 'the file said Hindi' from 'you told me to assume it'. A file whose "
+                "own text says otherwise keeps its own wording, and a subbed one is still rejected."
+            )
+        else:
+            lines.append(
+                'with no audio declared, a file whose text says nothing about language parks as "cannot '
+                "determine whether the file carries Hindi audio\u201d. That is deliberate: it waits for you "
+                "rather than choosing a scope for you."
+            )
+        lines.append("")
+        if current["series"]:
+            lines.append("the series name is yours, so a destination channel may be named from it.")
+        else:
+            lines.append(
+                "with no series declared, this channel's own title is one signal where the spec wants two: "
+                "files will archive, but I will ask before naming a destination after a channel name."
+            )
+        if wanted:
+            lines.append(
+                "\nThis command re-decides nothing by itself: files still parked are re-read on the next "
+                "scan of this channel, and files already decided are left alone."
+            )
+        return "\n".join(lines)
+
+    async def _declaration_bounds(
+        self, series_id: int, season_number: int, count: int | None
+    ) -> tuple[int | None, int | None]:
+        """Translate "twelve episodes" into the span the schema declares.
+
+        A season numbered 3..14 (a cour split, or a source that starts at 0) means the
+        count has to be added to whatever the season *starts* at, not to 1 — so the start
+        is read from the season row when one exists. If nothing has been filed yet, the
+        ordinary case holds and the season starts at 1.
+        """
+        if count is None:
+            return None, None
+        first = 1
+        rows = await self.db.fetch(
+            "select first_episode from app.season where series_id = $1 and season_number = $2",
+            series_id,
+            season_number,
+        )
+        if rows and rows[0].get("first_episode"):
+            first = int(rows[0]["first_episode"])
+        return first, first + count - 1
+
+    # ------------------------------------------------------------------ login
+    async def _login(self, update: Update, args: list[str]) -> list[Reply]:
+        if not self.allow_login:
+            return [Reply("login is disabled (BOT_ALLOW_LOGIN=0). Set it to 1, redeploy, and try again.")]
+        if self.transport is None:
+            return [
+                Reply(
+                    "the login machinery needs TELEGRAM_API_ID and TELEGRAM_API_HASH "
+                    "(my.telegram.org → API development tools). Those are not secrets, but the "
+                    "service cannot start a login without them."
+                )
+            ]
+        if not args:
+            return [Reply("usage: /login <name> +<country><number>\ne.g. /login spare +919876543210")]
+        name = args[0].casefold()
+        if not valid_name(name):
+            # Checked before anything is sent: fetching a code that is then thrown
+            # away because the name was unusable costs the account a rate-limit hit.
+            return [
+                Reply(
+                    "a session name is up to 40 characters of letters, numbers, '-' and '_' "
+                    "(e.g. /login spare +919876543210)."
+                )
+            ]
+        if len(args) >= 2:
+            return await self._start_code(update, name, args[1])
+        self.pending[update.chat_id] = _Pending(name=name, stage="phone")
+        return [
+            Reply(
+                f"which phone number belongs to {name}? Reply with it in international format — "
+                "digits only, starting with the country code, e.g. +919876543210. I delete that "
+                "message as soon as I have used it, so keep the number to hand.",
+            )
+        ]
+
+    async def _start_code(self, update: Update, name: str, phone: str) -> list[Reply]:
+        phone = "".join(ch for ch in phone if ch.isdigit() or ch == "+")
+        if not phone.startswith("+") or not phone[1:].isdigit() or len(phone) < 8:
+            if self.pending.get(update.chat_id) is None:
+                self.pending[update.chat_id] = _Pending(name=name, stage="phone")
+            return [
+                Reply(
+                    "that number did not look right. Use international format with a leading +, "
+                    "digits only — e.g. +919876543210."
+                )
+            ]
+        if self._throttled(update.chat_id):
+            self.pending.pop(update.chat_id, None)
+            return [
+                Reply(
+                    f"too many login attempts ({MAX_ATTEMPTS_PER_WINDOW} per "
+                    f"{int(ATTEMPT_WINDOW_SECONDS // 60)} minutes). Wait before trying again — "
+                    "rapid code requests are what gets an account limited, not a wrong guess."
+                )
+            ]
+        self.pending[update.chat_id] = _Pending(name=name, phone=phone, stage="code")
+        try:
+            code_hash = await self.transport.send_code(phone)
+        except Exception as exc:  # noqa: BLE001 - the reason is useful, the raw text is not
+            self.pending.pop(update.chat_id, None)
+            # Close the half-finished attempt on the way out. `MTProtoLogin` does this itself now,
+            # and so does the transport here, because a login client that stays connected in a
+            # free-tier container is a connection nobody will ever use or close.
+            discard = getattr(self.transport, "discard", None)
+            if callable(discard):
+                await discard(phone)
+            return [
+                Reply(
+                    f"could not send a code: {scrub(str(exc), phone)[:220]}\n\n"
+                    "Nothing was stored. /cancel is not needed.",
+                    delete_prompt_too=True,
+                )
+            ]
+        pending = self.pending[update.chat_id]
+        pending.code_hash = str(code_hash or "")
+        return [
+            Reply(
+                f"code sent to {mask_phone(phone)} for session {name!r}.\n"
+                f"Reply with /code 123456 (or just the digits). This attempt expires in "
+                f"{int(self.login_ttl_seconds // 60)} minutes.",
+                delete_prompt_too=True,
+            )
+        ]
+
+    async def _code(self, update: Update, args: list[str]) -> list[Reply]:
+        pending = self._pending_valid(update.chat_id)
+        if pending is None:
+            return [Reply("no login in progress. /login <name> +<phone> first.")]
+        if not args:
+            return [Reply("usage: /code 123456 — the digits Telegram sent you.")]
+        return await self._submit_code(update, pending, args[0])
+
+    async def _submit_code(self, update: Update, pending: _Pending, code: str) -> list[Reply]:
+        cleaned = code.strip().upper()
+        if len(cleaned) < 3:
+            return [Reply("that is too short to be a code. Reply with the digits Telegram sent.")]
+        pending.code = cleaned
+        return await self._finish(update, pending)
+
+    async def _password(self, update: Update, args: list[str]) -> list[Reply]:
+        pending = self._pending_valid(update.chat_id)
+        if pending is None:
+            return [Reply("no login in progress.")]
+        if pending.stage != "password":
+            return [Reply("this account did not ask for a password. Send the code first.")]
+        if not args:
+            return [Reply("usage: /password <your 2FA password>")]
+        return await self._submit_password(update, pending, " ".join(args))
+
+    async def _submit_password(self, update: Update, pending: _Pending, password: str) -> list[Reply]:
+        if pending.stage != "password":
+            return [Reply("this account did not ask for a password. Send the code first.")]
+        pending.password = password
+        return await self._finish(update, pending)
+
+    async def _finish(self, update: Update, pending: _Pending) -> list[Reply]:
+        """One sign-in attempt, and exactly one place where the password is used.
+
+        The password is cleared in a ``finally`` so a failure cannot leave it
+        sitting in memory next to a phone number.
+        """
+        phone = pending.phone
+        try:
+            result = await self.transport.sign_in(
+                phone, pending.code or "", pending.code_hash, password=pending.password
+            )
+        except NeedsPassword:
+            pending.stage = "password"
+            pending.code = None  # the code is spent; keeping it reusable is pointless and risky
+            return [
+                Reply(
+                    "this account has 2FA. Reply with /password <your password>. Your code message is "
+                    "deleted now, and your password message as soon as it is used — I never store the "
+                    "password and never repeat it.",
+                    delete_prompt_too=True,
+                )
+            ]
+        except LoginUnstored as exc:
+            # The account is in. No code try is spent and nothing is retried: the next step is on the
+            # account (terminate the stray session), not in this chat, and asking for the code again over
+            # a code Telegram has already burned is how an account gets rate-limited for no reason.
+            self.pending.pop(update.chat_id, None)
+            return [
+                Reply(
+                    f"{scrub(str(exc), phone, pending.password or '')[:400]}\n\nNothing was stored, so "
+                    "this service cannot use the account yet.",
+                    delete_prompt_too=True,
+                )
+            ]
+        except Exception as exc:  # noqa: BLE001 - a wrong code is a normal event, not a crash
+            detail = scrub(str(exc), phone, pending.password or "", pending.code or "")[:200]
+            pending.tries += 1
+            pending.code = None
+            fatal = any(word in detail.upper() for word in ("CODE_EXPIRED", "PHONE_CODE_INVALID", "SESSION_WAITED"))
+            if fatal or pending.tries >= MAX_CODE_TRIES:
+                self.pending.pop(update.chat_id, None)
+                reason = (
+                    "that code was rejected"
+                    if fatal
+                    else f"{MAX_CODE_TRIES} attempts in a row were wrong"
+                )
+                return [
+                    Reply(
+                        f"{reason}: {detail}\n\nThis attempt is closed, so nothing more is sent to "
+                        "Telegram. Start again with /login when you have the code in hand.",
+                        delete_prompt_too=True,
+                    )
+                ]
+            left = MAX_CODE_TRIES - pending.tries
+            return [
+                Reply(
+                    f"sign-in failed: {detail}\n\n{left} attempt(s) left in this flow. Reply with "
+                    "the code again, or /cancel.",
+                    delete_prompt_too=True,
+                )
+            ]
+        finally:
+            password, pending.password = pending.password, None
+
+        # A second login must not silently move the whole pipeline onto a different
+        # account: the first session becomes active because there is nothing to
+        # displace, and any later one waits for an explicit /use.
+        from .sessions import active_session_string
+
+        try:
+            already_live = await active_session_string(self.db) is not None
+            stored = await store_session(
+                self.db,
+                name=pending.name,
+                session_string=result.session_string,
+                account_id=result.account_id,
+                username=result.username,
+                note="logged in via the control bot" + (" with 2FA" if password else ""),
+                activate=not already_live,
+            )
+        except Exception as exc:  # noqa: BLE001 - a login we cannot store must be said out loud
+            self.pending.pop(update.chat_id, None)
+            return [
+                Reply(
+                    "Telegram accepted the code but I could not store the session: "
+                    f"{scrub(str(exc), phone)[:180]}\n\nNothing is usable yet, and the code is spent — "
+                    "check DATABASE_URL (session-mode pooler, port 5432) and that the migrations "
+                    "(app.telegram_session) are applied, then run /login again.",
+                    delete_prompt_too=True,
+                )
+            ]
+        self.pending.pop(update.chat_id, None)
+        who = result.username or result.account_id or "unknown"
+        state = "not active — /use " + pending.name + " to switch to it" if already_live else "active"
+        handoff = "This service has no writer to hand it to, so nothing writes until APP_MODE=live."
+        if self.on_session_stored is not None:
+            # Hand the account to the connection that writes, so a login takes effect without a redeploy —
+            # and wait for it, because the one place the operator learns whether that worked is this
+            # reply. Awaiting costs a couple of seconds on the poll loop; guessing costs a silent queue
+            # that says "stored" over a session nobody adopted.
+            try:
+                note = await asyncio.wait_for(self.on_session_stored(), timeout=_ADOPT_TIMEOUT)
+                handoff = str(note) if note else "The service took this session for its writes."
+            except asyncio.TimeoutError:
+                handoff = (
+                    f"the writer did not answer within {int(_ADOPT_TIMEOUT)}s. The session is stored and "
+                    "will be read at the next connect; /status shows what it thinks it has"
+                )
+            except Exception as exc:  # noqa: BLE001 - the storage is the success, this is the footnote
+                log.warning("the session is stored but could not be handed to the writer", exc_info=True)
+                handoff = (
+                    f"the session is stored, but this service could not start using it yet "
+                    f"({type(exc).__name__}: {str(exc)[:120]})"
+                )
+        return [
+            Reply(
+                f"connected as @{who}, stored as {pending.name!r} "
+                f"({stored.get('length_chars') or len(result.session_string)} chars, {state}).\n\n"
+                "The session string was never shown in this chat and cannot be read back from it. "
+                f"/sessions lists what is stored. {handoff}.",
+                delete_prompt_too=True,
+            )
+        ]
+
+    async def _cancel(self, update: Update, args: list[str]) -> list[Reply]:
+        owed = self.console_owed.pop(update.chat_id, None)
+        pending = self.pending.pop(update.chat_id, None)
+        if pending is None:
+            # A question one of the screens asked is dropped here as well. `nothing pending` while the next
+            # number typed into this chat was still being read as an answer to it would be the worse lie.
+            if owed is None:
+                return [Reply("nothing pending.")]
+            return [Reply(
+                "nothing pending — the question that screen asked is dropped, and nothing was changed."
+            )]
+        discard = getattr(self.transport, "discard", None)
+        if callable(discard):
+            try:
+                await discard(pending.phone)
+            except Exception:  # noqa: BLE001 - a failed cleanup is not the operator's problem
+                log.debug("login transport cleanup failed", exc_info=True)
+        return [
+            Reply(
+                f"cancelled. Nothing was stored for {pending.name!r}.",
+                delete_prompt_too=True,
+            )
+        ]
+
+    # ------------------------------------------------------------- transport
+    async def dispatch(self, update: Update) -> list[Reply]:
+        """Handle one update and carry out its side effects on the chat.
+
+        Deletion happens here rather than in ``handle`` so that ``handle`` stays a
+        pure decision function that tests can call without a fake network, and only
+        ever removes the operator's spent message — never the reply that tells them
+        what to do next.
+        """
+        try:
+            replies = await self.handle(update)
+        except Exception as exc:  # noqa: BLE001 - a chat command that fails has to say so
+            # Silence here was misread as a bot that ignored its owner, and the one failure it hid was a
+            # database the container cannot reach. The reason is worth a message even when it is a type
+            # name; the secrets are scrubbed out of it first, like every other line we send.
+            log.exception("control command failed")
+            replies = [
+                Reply(
+                    "this command could not finish: "
+                    f"{type(exc).__name__}: {str(exc)[:200]}\n\n"
+                    "Nothing was changed. If the line above mentions the database, check DATABASE_URL "
+                    "(it has to be the session-mode pooler on port 5432 — the transaction pooler on 6543 "
+                    "refuses the prepared statements this service uses) and that the migrations ran."
+                )
+            ]
+        for reply in replies:
+            await self.api.send(
+                update.chat_id, scrub(reply.text, *self._live_secrets()), markup=reply.markup
+            )
+            if (
+                self.delete_sensitive
+                and reply.delete_prompt_too
+                and update.message_id
+                and update.kind != "callback"
+            ):
+                # The spent secret goes; the reply above it stays. Never for a tap: a callback's
+                # `message_id` is the message the button sits in, which here is the screen itself, so
+                # deleting it would erase the console to remove a secret that was never typed there.
+                await self.api.delete(update.chat_id, update.message_id)
+        if update.kind == "callback" and update.callback_id:
+            await self.api.answer_callback(update.callback_id)
+        return replies
+
+    async def run_once(self) -> int:
+        """One poll cycle. Exposed because a loop you cannot call once is a loop you
+        cannot test; returns how many updates were handled."""
+        updates = await self.api.get_updates()
+        for update in updates:
+            await self.dispatch(update)
+        return len(updates)
+
+    async def run(self) -> None:
+        """Long-poll until stopped.
+
+        Polling rather than a webhook because it needs no new inbound route, no
+        certificate, and nothing for the operator to configure — and a bot that
+        briefly cannot reach Telegram (a redeploy) simply resumes where it left off,
+        because the offset lives in the client.
+        """
+        announced = False
+        while not self._stop.is_set():
+            try:
+                if not announced:
+                    me = await self.api.get_me()
+                    announced = True
+                    log.info("control bot online as @%s (id=%s)", me.get("username"), me.get("id"))
+                handled = await self.run_once()
+                if handled:
+                    continue
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - the loop must survive a bad response
+                announced = False
+                log.warning("control bot poll error: %s", scrub(str(exc))[:200])
+                await asyncio.sleep(5.0)
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def _live_secrets(self) -> tuple[str, ...]:
+        """Anything currently in memory that must never reach a message."""
+        secrets: list[str] = []
+        for entry in self.pending.values():
+            secrets.extend((entry.phone, entry.password or "", entry.code or ""))
+        reveal = getattr(self.settings, "reveal", None)
+        if callable(reveal):
+            for field_name in ("telegram_bot_token", "telegram_session_string", "telegram_api_hash"):
+                value = reveal(field_name)
+                if value:
+                    secrets.append(value)
+        return tuple(item for item in secrets if item)
+
+
+def format_report_text(report: Any) -> str:
+    """Render a probe report as the one message the operator was supposed to get.
+
+    ``app.probe.format_report`` *is* the renderer for the dict ``probe_once`` returns, and ``probe``
+    already stores its output under the ``report`` key of that dict. So: take the text that was written
+    for a human, and only fall back to formatting it here when there is none.
+
+    The version this replaces walked the dict and printed every value, which is how the first live
+    ``/probe`` reached its operator as ``account: {'id': 8992934034, 'username': 'Turvei', 'restricted'…``
+    — the answers were in that message, in repr form, each field cut at 300 characters, with the human
+    summary last where the transport's 4096 limit ate it mid-sentence. A dict is not a report.
+    """
+    from .probe import format_report
+
+    if isinstance(report, dict):
+        written = report.get("report")
+        if isinstance(written, str) and written:
+            return written
+        return format_report(report)
+    return str(report)

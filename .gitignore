@@ -1,0 +1,33 @@
+# --- secrets and local config (never commit) -------------------------------
+.env
+.env.*
+!.env.example
+*.session
+*.session-journal
+*.sent
+.tdata/
+session_string*
+
+# --- python -----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# --- local runtime artifacts ------------------------------------------------
+*.log
+data/
+storage/
+.pgdata/
+supabase/.temp/
+
+# --- editors / os -----------------------------------------------------------
+.DS_Store
+.idea/
+.vscode/
